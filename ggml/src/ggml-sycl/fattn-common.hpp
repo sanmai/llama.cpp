@@ -923,6 +923,7 @@ void launch_fattn(
 
     ggml_sycl_pool & pool = ctx.fattn_pool();
 
+    // Keep GGML_SYCL_FATTN_POOL_MAX_BUFFERS in sync with these temp allocation sites.
     ggml_sycl_pool_alloc<sycl::half>   K_f16(pool);
     ggml_sycl_pool_alloc<sycl::half>   V_f16(pool);
     ggml_sycl_pool_alloc<int>          KV_max(pool);

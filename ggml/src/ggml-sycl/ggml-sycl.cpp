@@ -1477,7 +1477,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
 
 struct ggml_sycl_pool_fattn : public ggml_sycl_pool_leg {
     explicit ggml_sycl_pool_fattn(queue_ptr qptr, int device) :
-        ggml_sycl_pool_leg(qptr, device, 3, "fattn") {}
+        ggml_sycl_pool_leg(qptr, device, GGML_SYCL_FATTN_POOL_MAX_BUFFERS, "fattn") {}
 
     size_t get_alloc_size(size_t size) const override {
         return (size_t) (1.25 * size) + 1024 * 1024;

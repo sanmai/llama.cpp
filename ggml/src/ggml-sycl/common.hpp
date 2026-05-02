@@ -248,6 +248,8 @@ struct ggml_sycl_pool {
     virtual void free(void * ptr, size_t size) = 0;
 };
 
+static constexpr int GGML_SYCL_FATTN_POOL_MAX_BUFFERS = 5;
+
 template<typename T>
 struct ggml_sycl_pool_alloc {
     ggml_sycl_pool * pool = nullptr;
