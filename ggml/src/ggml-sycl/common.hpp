@@ -410,7 +410,9 @@ struct ggml_backend_sycl_context {
 
     static std::unique_ptr<ggml_sycl_pool> new_pool_for_device(queue_ptr qptr, int device);
 
-    static std::unique_ptr<ggml_sycl_pool> new_pool_for_device(queue_ptr qptr, int device, int max_buffers, float look_ahead, const char * label = nullptr);
+    static std::unique_ptr<ggml_sycl_pool> new_pool_for_device(queue_ptr qptr, int device, int max_buffers, const char * label = nullptr);
+
+    static std::unique_ptr<ggml_sycl_pool> new_pool_for_fattn(queue_ptr qptr, int device);
 
     static std::unique_ptr<ggml_sycl_pool> new_pool_for_host(queue_ptr qptr, int device);
 
@@ -427,7 +429,7 @@ struct ggml_backend_sycl_context {
 
     ggml_sycl_pool & fattn_pool(int device) {
         if (fattn_pools[device] == nullptr) {
-            fattn_pools[device] = new_pool_for_device(stream(device, 0), device, 8, 1.25f, "fattn");
+            fattn_pools[device] = new_pool_for_fattn(stream(device, 0), device);
         }
         return *fattn_pools[device];
     }
