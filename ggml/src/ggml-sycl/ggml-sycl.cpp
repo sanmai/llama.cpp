@@ -1284,6 +1284,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
     size_t n_cache = 0;
     size_t n_evict = 0;
     size_t n_free = 0;
+    size_t n_log_events = 0;
 
     explicit ggml_sycl_pool_leg(queue_ptr qptr_, int device_, int max_buffers_ = 256, const char * label_ = nullptr) :
         device(device_), qptr(qptr_), max_buffers(max_buffers_), label(label_), buffer_pool(max_buffers_) {}
@@ -1311,8 +1312,11 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         return total == 0 ? 0.0 : 100.0 * n_hits / total;
     }
 
-    void log_stats(const char * event) const {
+    void log_stats(const char * event) {
         if (!label) {
+            return;
+        }
+        if (++n_log_events % 256 != 0) {
             return;
         }
         GGML_LOG_INFO("%s pool[%d]: %s; hits=%zu misses=%zu hit_rate=%.1f%% cache=%zu evict=%zu free=%zu cached=%.2f MiB in %d/%d slots\n",
@@ -1391,9 +1395,11 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         n_misses++;
         const size_t cached = cached_size();
         if (label && cached > 0) {
+#ifdef DEBUG_SYCL_POOL
             GGML_LOG_INFO("%s pool[%d]: no cached buffer fits request %.2f MiB, cached %.2f MiB in %d/%d slots\n",
                           label, device, size / 1024.0 / 1024.0, cached / 1024.0 / 1024.0,
                           cached_buffers(), max_buffers);
+#endif
             log_stats("miss");
         }
         void * ptr;
@@ -1443,8 +1449,10 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         }
         if (size > buffer_pool[ismall].size) {
             ggml_sycl_buffer & b = buffer_pool[ismall];
+#ifdef DEBUG_SYCL_POOL
             GGML_LOG_INFO("%s pool[%d]: evict cached buffer %.2f MiB for returned buffer %.2f MiB\n",
                           label ? label : "sycl", device, b.size / 1024.0 / 1024.0, size / 1024.0 / 1024.0);
+#endif
             SYCL_CHECK(CHECK_TRY_ERROR(qptr->wait()));
             SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(b.ptr, *qptr)));
             pool_size -= b.size;
@@ -1455,8 +1463,10 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
             log_stats("evict");
             return;
         }
+#ifdef DEBUG_SYCL_POOL
         GGML_LOG_WARN("WARNING: %s%s pool[%d]: full, freeing %.2f MiB returned buffer; increase max_buffers\n",
                       label ? label : "", label ? " sycl buffer" : "sycl buffer", device, size / 1024.0 / 1024.0);
+#endif
         SYCL_CHECK(CHECK_TRY_ERROR(qptr->wait()));
         SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(ptr, *qptr)));
         pool_size -= size;
@@ -1467,7 +1477,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
 
 struct ggml_sycl_pool_fattn : public ggml_sycl_pool_leg {
     explicit ggml_sycl_pool_fattn(queue_ptr qptr, int device) :
-        ggml_sycl_pool_leg(qptr, device, 2, "fattn") {}
+        ggml_sycl_pool_leg(qptr, device, 3, "fattn") {}
 
     size_t get_alloc_size(size_t size) const override {
         return (size_t) (1.25 * size) + 1024 * 1024;
