@@ -1285,6 +1285,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
     size_t n_evict = 0;
     size_t n_free = 0;
     size_t n_log_events = 0;
+    static constexpr size_t LOG_INTERVAL = 256;
 
     explicit ggml_sycl_pool_leg(queue_ptr qptr_, int device_, int max_buffers_ = 256, const char * label_ = nullptr) :
         device(device_), qptr(qptr_), max_buffers(max_buffers_), label(label_), buffer_pool(max_buffers_) {}
@@ -1316,7 +1317,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         if (!label) {
             return;
         }
-        if (++n_log_events % 256 != 0) {
+        if (++n_log_events % LOG_INTERVAL != 0) {
             return;
         }
         GGML_LOG_INFO("%s pool[%d]: %s; hits=%zu misses=%zu hit_rate=%.1f%% cache=%zu evict=%zu free=%zu cached=%.2f MiB in %d/%d slots\n",
@@ -1365,6 +1366,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
                             b.ptr = nullptr;
                             b.size = 0;
                             n_hits++;
+                            log_stats("hit");
 #ifdef DEBUG_SYCL_POOL
                             if (label) {
                                 GGML_LOG_INFO("%s pool[%d]: reuse exact cached buffer %.2f MiB for request %.2f MiB\n",
@@ -1384,6 +1386,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
             b.ptr = nullptr;
             b.size = 0;
             n_hits++;
+            log_stats("hit");
 #ifdef DEBUG_SYCL_POOL
             if (label) {
                 GGML_LOG_INFO("%s pool[%d]: reuse cached buffer %.2f MiB for request %.2f MiB\n",
@@ -1393,6 +1396,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
             return ptr;
         }
         n_misses++;
+        log_stats("miss");
         const size_t cached = cached_size();
         if (label && cached > 0) {
 #ifdef DEBUG_SYCL_POOL
@@ -1400,7 +1404,6 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
                           label, device, size / 1024.0 / 1024.0, cached / 1024.0 / 1024.0,
                           cached_buffers(), max_buffers);
 #endif
-            log_stats("miss");
         }
         void * ptr;
         size_t look_ahead_size = get_alloc_size(size);
@@ -1432,6 +1435,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
                 b.ptr = ptr;
                 b.size = size;
                 n_cache++;
+                log_stats("cache");
 #ifdef DEBUG_SYCL_POOL
                 if (label) {
                     GGML_LOG_INFO("%s pool[%d]: cache returned buffer %.2f MiB in slot %d/%d\n",
