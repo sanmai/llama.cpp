@@ -930,6 +930,15 @@ void launch_fattn(
     ggml_sycl_pool_alloc<float>        dst_tmp(pool);
     ggml_sycl_pool_alloc<sycl::float2> dst_tmp_meta(pool);
 
+// #define MEM_FAULT_FATTN_POOL
+#ifdef MEM_FAULT_FATTN_POOL
+    ggml_sycl_pool_alloc<float> rogue(pool);
+    const size_t rogue_n = K->ne[1] * 65536;
+    rogue.alloc(rogue_n);
+    main_stream->memset(rogue.ptr, 0xAB, rogue_n * sizeof(float)).wait();
+#endif
+
+
     const char * K_data = (const char *) K->data;
     size_t nb11 = K->nb[1];
     size_t nb12 = K->nb[2];
