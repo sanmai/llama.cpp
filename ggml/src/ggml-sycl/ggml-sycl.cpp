@@ -1290,6 +1290,15 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
     explicit ggml_sycl_pool_leg(queue_ptr qptr_, int device_, int max_buffers_ = 256, const char * label_ = nullptr) :
         device(device_), qptr(qptr_), max_buffers(max_buffers_), label(label_), buffer_pool(max_buffers_) {}
 
+    size_t free_memory() {
+        size_t free_memory;
+        size_t total_memory;
+
+        ggml_backend_sycl_get_device_memory(device, &free_memory, &total_memory);
+
+        return free_memory;
+    }
+
     virtual size_t get_alloc_size(size_t size) const {
         return (size_t) (1.05 * size);
     }
@@ -1313,6 +1322,11 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
                 b.size = 0;
             }
         }
+
+#ifdef DEBUG_SYCL_POOL
+        GGML_LOG_INFO("pool[%d]: free memory after attempted clear_pool %.2f MiB\n",
+              device, free_memory() / 1024.0 / 1024.0);
+#endif
     }
 
     double hit_rate() const {
@@ -1415,8 +1429,18 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         void * ptr = nullptr;
         size_t look_ahead_size = get_alloc_size(size);
 
+#ifdef DEBUG_SYCL_POOL
+        if (look_ahead_size > free_memory()) {
+            GGML_LOG_INFO("pool[%d]: attempting alloc=%.2f free=%.2f MiB\n",
+                  device, look_ahead_size / 1024.0 / 1024.0, free_memory() / 1024.0 / 1024.0);
+        }
+#endif
+
         try {
-            ptr = (void *) sycl::malloc_device(look_ahead_size, *qptr);
+            // do not check the memory limit for everything under 1 MB
+            if (look_ahead_size < 1ull << 20 || look_ahead_size < free_memory()) {
+                ptr = (void *) sycl::malloc_device(look_ahead_size, *qptr);
+            }
         } catch (sycl::exception const & e) {
             // only treat OOM as recoverable; other SYCL errors are fatal as before.
             if (e.code() != sycl::errc::memory_allocation) {
@@ -1429,6 +1453,13 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
                            label ? label : "sycl", device,
                            look_ahead_size / 1024.0 / 1024.0, cached_size() / 1024.0 / 1024.0);
             clear_pool();
+
+            if (look_ahead_size > free_memory()) {
+                GGML_LOG_ERROR("%s: can't allocate %lu Bytes of memory on device/GPU after flushing pool\n",
+                               __func__, look_ahead_size);
+                GGML_ABORT("sycl pool exhausted");
+            }
+
             SYCL_CHECK(CHECK_TRY_ERROR(ptr = (void *) sycl::malloc_device(look_ahead_size, *qptr)));
             if (ptr == nullptr) {
                 GGML_LOG_ERROR("%s: can't allocate %lu Bytes of memory on device/GPU after flushing pool\n",
