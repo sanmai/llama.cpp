@@ -1285,7 +1285,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
     size_t n_evict = 0;
     size_t n_free = 0;
     size_t n_log_events = 0;
-    static constexpr size_t LOG_INTERVAL = 256;
+    static constexpr size_t LOG_INTERVAL = 256 * 32;
 
     explicit ggml_sycl_pool_leg(queue_ptr qptr_, int device_, int max_buffers_ = 256, const char * label_ = nullptr) :
         device(device_), qptr(qptr_), max_buffers(max_buffers_), label(label_), buffer_pool(max_buffers_) {}
