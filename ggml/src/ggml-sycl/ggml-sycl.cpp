@@ -1330,10 +1330,11 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         return free_memory;
     }
 
-    static constexpr double OVER_ALLOC_FACTOR = 1.05;
+    static constexpr size_t OVER_ALLOC_THRESHOLD = 8ull << 20;  // 8 MiB
+    static constexpr size_t OVER_ALLOC_PAD       = 1ull << 20;  // 1 MiB
 
     virtual size_t get_alloc_size(size_t size) const {
-        return (size_t) (OVER_ALLOC_FACTOR * size);
+        return size > OVER_ALLOC_THRESHOLD ? size + OVER_ALLOC_PAD : size;
     }
 
     ~ggml_sycl_pool_leg() {
@@ -1377,11 +1378,39 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         if (n_log_events % interval != 0) {
             return;
         }
-        GGML_LOG_INFO("%s pool[%d]: %s; hits=%zu misses=%zu hit_rate=%.1f%% cache=%zu evict=%zu free=%zu cached=%.2f MiB in %d/%d slots; req(n=%zu)=%.2f+/-%.2f MiB p90=%.2f p99.7=%.2f max=%.2f MiB\n",
-                      label, device, event, n_hits, n_misses, hit_rate(), n_cache, n_evict, n_free,
+        const double probe_mib = get_alloc_size(10ull << 20) / (1024.0 * 1024.0);
+        GGML_LOG_INFO("%s pool[%d] alloc(10MiB)=%.2f: %s; hits=%zu misses=%zu hit_rate=%.1f%% cache=%zu evict=%zu free=%zu cached=%.2f MiB in %d/%d slots; req(n=%zu)=%.2f+/-%.2f MiB p90=%.2f p99.7=%.2f max=%.2f MiB\n",
+                      label, device, probe_mib,
+                      event, n_hits, n_misses, hit_rate(), n_cache, n_evict, n_free,
                       cached_size() / 1024.0 / 1024.0, cached_buffers(), max_buffers,
                       req_size_mib.count, req_size_mib.mean, req_size_mib.stddev(),
                       req_size_mib.p90(), req_size_mib.p99_7(), req_size_mib.max);
+        log_slot_sizes();
+    }
+
+    // Sorted MiB sizes of every populated slot — eyeball the distribution to
+    // judge how tight an over-alloc factor would still cover the working set.
+    void log_slot_sizes() const {
+        std::vector<double> sizes;
+        sizes.reserve(max_buffers);
+        for (int i = 0; i < max_buffers; ++i) {
+            if (buffer_pool[i].ptr != nullptr) {
+                sizes.push_back(buffer_pool[i].size / 1024.0 / 1024.0);
+            }
+        }
+        if (sizes.empty()) {
+            return;
+        }
+        std::sort(sizes.begin(), sizes.end());
+        std::string line;
+        line.reserve(sizes.size() * 8);
+        char buf[32];
+        for (size_t i = 0; i < sizes.size(); ++i) {
+            if (i > 0) line += '/';
+            snprintf(buf, sizeof(buf), "%.2f", sizes[i]);
+            line += buf;
+        }
+        GGML_LOG_INFO("%s pool[%d] slots MiB: %s\n", label, device, line.c_str());
     }
 
     size_t cached_size() const {
@@ -1587,7 +1616,7 @@ struct ggml_sycl_pool_fattn : public ggml_sycl_pool_leg {
     // and route its free back through legacy. Otherwise legacy's best-fit
     // can hand back a non-fattn caller's bigger cached buffer, and routing
     // by size alone would orphan that buffer in the wrong pool on free.
-    static constexpr size_t REQUEST_THRESHOLD = 128ull << 20; // 128 MiB
+    static constexpr size_t REQUEST_THRESHOLD = 16ull << 20; // 16 MiB
 
     ggml_sycl_pool & legacy_pool;
     std::unordered_set<void *> delegated;
