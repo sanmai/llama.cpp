@@ -1574,13 +1574,14 @@ struct ggml_sycl_pool_fattn : public ggml_sycl_pool_leg {
     // larger working set and absorbs them with high hit rate. Larger requests
     // (the K_f16/V_f16 buffers that scale with KV) stay in this pool's own
     // slots and are dropped at end of graph.
+    //
+    // Free routing also keys on this threshold. The two size distributions
+    // don't overlap: legacy-routed actual_size <= 1.05 * SMALL_THRESHOLD,
+    // fattn-routed actual_size >= 1.25 * SMALL_THRESHOLD + 1 MiB. So free's
+    // (ptr, size) is enough to pick the right pool without per-ptr tracking.
     static constexpr size_t SMALL_THRESHOLD = 32ull << 20; // 32 MiB
 
     ggml_sycl_pool & legacy_pool;
-
-    // Pointers we routed to the legacy pool, with their actual_size so we can
-    // return them correctly in free(). At most a handful are in flight at once.
-    std::unordered_map<void *, size_t> legacy_allocs;
 
     explicit ggml_sycl_pool_fattn(queue_ptr qptr, int device, ggml_sycl_pool & legacy) :
         ggml_sycl_pool_leg(qptr, device, GGML_SYCL_FATTN_POOL_MAX_BUFFERS, "fattn"),
@@ -1592,17 +1593,13 @@ struct ggml_sycl_pool_fattn : public ggml_sycl_pool_leg {
 
     void * alloc(size_t size, size_t * actual_size) override {
         if (size < SMALL_THRESHOLD) {
-            void * ptr = legacy_pool.alloc(size, actual_size);
-            legacy_allocs[ptr] = *actual_size;
-            return ptr;
+            return legacy_pool.alloc(size, actual_size);
         }
         return ggml_sycl_pool_leg::alloc(size, actual_size);
     }
 
     void free(void * ptr, size_t size) override {
-        auto it = legacy_allocs.find(ptr);
-        if (it != legacy_allocs.end()) {
-            legacy_allocs.erase(it);
+        if (size < SMALL_THRESHOLD) {
             legacy_pool.free(ptr, size);
             return;
         }
