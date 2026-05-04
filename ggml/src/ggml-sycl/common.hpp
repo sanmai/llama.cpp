@@ -418,7 +418,7 @@ struct ggml_backend_sycl_context {
 
     static std::unique_ptr<ggml_sycl_pool> new_pool_for_device(queue_ptr qptr, int device, int max_buffers, const char * label = nullptr);
 
-    static std::unique_ptr<ggml_sycl_pool> new_pool_for_fattn(queue_ptr qptr, int device);
+    static std::unique_ptr<ggml_sycl_pool> new_pool_for_fattn(queue_ptr qptr, int device, ggml_sycl_pool & legacy);
 
     static std::unique_ptr<ggml_sycl_pool> new_pool_for_host(queue_ptr qptr, int device);
 
@@ -435,7 +435,10 @@ struct ggml_backend_sycl_context {
 
     ggml_sycl_pool & fattn_pool(int device) {
         if (fattn_pools[device] == nullptr) {
-            fattn_pools[device] = new_pool_for_fattn(stream(device, 0), device);
+            // Touch pool() first so the legacy pool is constructed and we can
+            // pass a stable reference for delegating small fattn allocations.
+            ggml_sycl_pool & legacy = pool(device);
+            fattn_pools[device] = new_pool_for_fattn(stream(device, 0), device, legacy);
         }
         return *fattn_pools[device];
     }

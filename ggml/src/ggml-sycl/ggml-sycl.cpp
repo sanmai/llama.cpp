@@ -1311,7 +1311,6 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
     size_t n_evict = 0;
     size_t n_free = 0;
     size_t n_log_events = 0;
-    static constexpr size_t LOG_INTERVAL = 1000;
 
     // Distribution of allocation request sizes in MiB (workload demand).
     welford req_size_mib;
@@ -1338,6 +1337,8 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
     }
 
     void clear_pool() {
+        log_stats("clear");
+
         if (pool_size == 0) {
             return;
         }
@@ -1362,7 +1363,11 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         if (!label) {
             return;
         }
-        if (++n_log_events % LOG_INTERVAL != 0) {
+        ++n_log_events;
+        const size_t interval = n_log_events < 100  ? 10
+                              : n_log_events < 1000 ? 100
+                                                    : 1000;
+        if (n_log_events % interval != 0) {
             return;
         }
         GGML_LOG_INFO("%s pool[%d]: %s; hits=%zu misses=%zu hit_rate=%.1f%% cache=%zu evict=%zu free=%zu cached=%.2f MiB in %d/%d slots; req(n=%zu)=%.2f+/-%.2f MiB p90=%.2f p99.7=%.2f MiB\n",
@@ -1565,15 +1570,47 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
 };
 
 struct ggml_sycl_pool_fattn : public ggml_sycl_pool_leg {
-    explicit ggml_sycl_pool_fattn(queue_ptr qptr, int device) :
-        ggml_sycl_pool_leg(qptr, device, GGML_SYCL_FATTN_POOL_MAX_BUFFERS, "fattn") {}
+    // Requests below this go to the legacy (general) pool, which has a much
+    // larger working set and absorbs them with high hit rate. Larger requests
+    // (the K_f16/V_f16 buffers that scale with KV) stay in this pool's own
+    // slots and are dropped at end of graph.
+    static constexpr size_t SMALL_THRESHOLD = 32ull << 20; // 32 MiB
+
+    ggml_sycl_pool & legacy_pool;
+
+    // Pointers we routed to the legacy pool, with their actual_size so we can
+    // return them correctly in free(). At most a handful are in flight at once.
+    std::unordered_map<void *, size_t> legacy_allocs;
+
+    explicit ggml_sycl_pool_fattn(queue_ptr qptr, int device, ggml_sycl_pool & legacy) :
+        ggml_sycl_pool_leg(qptr, device, GGML_SYCL_FATTN_POOL_MAX_BUFFERS, "fattn"),
+        legacy_pool(legacy) {}
 
     size_t get_alloc_size(size_t size) const override {
         return (size_t) (1.25 * size) + 1024 * 1024;
     }
 
-    // Experiment: drop every cached slot at end of graph. If this works, the
-    // next iteration is a smarter trim (e.g. size-based threshold or LRU).
+    void * alloc(size_t size, size_t * actual_size) override {
+        if (size < SMALL_THRESHOLD) {
+            void * ptr = legacy_pool.alloc(size, actual_size);
+            legacy_allocs[ptr] = *actual_size;
+            return ptr;
+        }
+        return ggml_sycl_pool_leg::alloc(size, actual_size);
+    }
+
+    void free(void * ptr, size_t size) override {
+        auto it = legacy_allocs.find(ptr);
+        if (it != legacy_allocs.end()) {
+            legacy_allocs.erase(it);
+            legacy_pool.free(ptr, size);
+            return;
+        }
+        ggml_sycl_pool_leg::free(ptr, size);
+    }
+
+    // Experiment: drop every cached large-slot at end of graph. Small-slot
+    // working set lives in the legacy pool and is left alone.
     void on_compute_end() override {
         clear_pool();
     }
@@ -1670,8 +1707,8 @@ std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_pool_for_device(q
    return std::unique_ptr<ggml_sycl_pool>(new ggml_sycl_pool_leg(qptr, device, max_buffers, label));
 }
 
-std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_pool_for_fattn(queue_ptr qptr, int device) {
-   return std::unique_ptr<ggml_sycl_pool>(new ggml_sycl_pool_fattn(qptr, device));
+std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_pool_for_fattn(queue_ptr qptr, int device, ggml_sycl_pool & legacy) {
+   return std::unique_ptr<ggml_sycl_pool>(new ggml_sycl_pool_fattn(qptr, device, legacy));
 }
 
 // TBD pool with virtual memory management
