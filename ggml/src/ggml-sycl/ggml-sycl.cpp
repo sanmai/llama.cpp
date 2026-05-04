@@ -1311,12 +1311,12 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
     size_t n_evict = 0;
     size_t n_free = 0;
     size_t n_log_events = 0;
-    static constexpr size_t LOG_INTERVAL = 10000;
+    static constexpr size_t LOG_INTERVAL = 1000;
 
     // Distribution of allocation request sizes in MiB (workload demand).
     welford req_size_mib;
 
-    explicit ggml_sycl_pool_leg(queue_ptr qptr_, int device_, int max_buffers_ = 256, const char * label_ = nullptr) :
+    explicit ggml_sycl_pool_leg(queue_ptr qptr_, int device_, int max_buffers_ = 256, const char * label_ = "legacy") :
         device(device_), qptr(qptr_), max_buffers(max_buffers_), label(label_), buffer_pool(max_buffers_) {}
 
     size_t free_memory() {
@@ -1521,7 +1521,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
                 b.size = size;
                 n_cache++;
                 log_stats("cache");
-#ifdef DEBUG_SYCL_POOL
+#ifdef DEBUG_SYCL_POOL_VERBOSE
                 if (label) {
                     GGML_LOG_INFO("%s pool[%d]: cache returned buffer %.2f MiB in slot %d/%d\n",
                                   label, device, size / 1024.0 / 1024.0, i + 1, max_buffers);
@@ -1538,7 +1538,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         }
         if (size > buffer_pool[ismall].size) {
             ggml_sycl_buffer & b = buffer_pool[ismall];
-#ifdef DEBUG_SYCL_POOL
+#ifdef DEBUG_SYCL_POOL_VERBOSE
             GGML_LOG_INFO("%s pool[%d]: evict cached buffer %.2f MiB for returned buffer %.2f MiB\n",
                           label ? label : "sycl", device, b.size / 1024.0 / 1024.0, size / 1024.0 / 1024.0);
 #endif
