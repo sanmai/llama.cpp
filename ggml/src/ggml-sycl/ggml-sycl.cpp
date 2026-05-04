@@ -1696,7 +1696,7 @@ std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_pool_for_host(que
 }
 
 std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_pool_for_device(queue_ptr qptr, int device) {
-    return new_pool_for_device(qptr, device, 256);
+    return new_pool_for_device(qptr, device, 256, "legacy");
 }
 
 std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_pool_for_device(queue_ptr qptr, int device, int max_buffers, const char * label) {
