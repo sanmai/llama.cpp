@@ -1270,6 +1270,7 @@ struct welford {
     size_t count = 0;
     double mean  = 0.0;
     double m2    = 0.0;
+    double max   = 0.0;
 
     void update(double x) {
         ++count;
@@ -1277,6 +1278,7 @@ struct welford {
         mean               += delta / count;
         const double delta2 = x - mean;
         m2                 += delta * delta2;
+        if (x > max) max = x;
     }
 
     double variance() const { return count < 2 ? 0.0 : m2 / count; }
@@ -1374,11 +1376,11 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         if (n_log_events % interval != 0) {
             return;
         }
-        GGML_LOG_INFO("%s pool[%d]: %s; hits=%zu misses=%zu hit_rate=%.1f%% cache=%zu evict=%zu free=%zu cached=%.2f MiB in %d/%d slots; req(n=%zu)=%.2f+/-%.2f MiB p90=%.2f p99.7=%.2f MiB\n",
+        GGML_LOG_INFO("%s pool[%d]: %s; hits=%zu misses=%zu hit_rate=%.1f%% cache=%zu evict=%zu free=%zu cached=%.2f MiB in %d/%d slots; req(n=%zu)=%.2f+/-%.2f MiB p90=%.2f p99.7=%.2f max=%.2f MiB\n",
                       label, device, event, n_hits, n_misses, hit_rate(), n_cache, n_evict, n_free,
                       cached_size() / 1024.0 / 1024.0, cached_buffers(), max_buffers,
                       req_size_mib.count, req_size_mib.mean, req_size_mib.stddev(),
-                      req_size_mib.p90(), req_size_mib.p99_7());
+                      req_size_mib.p90(), req_size_mib.p99_7(), req_size_mib.max);
     }
 
     size_t cached_size() const {
@@ -1580,12 +1582,12 @@ struct ggml_sycl_pool_fattn : public ggml_sycl_pool_leg {
     // buffers that scale with KV) stay in this pool's own slots and are
     // dropped at end of graph.
     //
-    // Free routes by actual_size, which sits in one of two non-overlapping
-    // bands: legacy-returned actual_size <= OVER_ALLOC_FACTOR * REQUEST_THRESHOLD,
-    // fattn-returned actual_size >= 1.25 * REQUEST_THRESHOLD + 1 MiB. Picking
-    // the upper bound of the legacy band as the cutoff lets free dispatch on
-    // (ptr, size) alone, no per-ptr tracking required.
-    static constexpr size_t REQUEST_THRESHOLD  = 32ull << 20; // 32 MiB
+    // Free routes by actual_size against LEGACY_MAX_ACTUAL. Set well above
+    // REQUEST_THRESHOLD so legacy-best-fit returns (which can hand back any
+    // cached size, since legacy is shared with non-fattn callers of arbitrary
+    // request size) still get freed back into legacy. Only allocations larger
+    // than this bound stay in the fattn pool's own slots.
+    static constexpr size_t REQUEST_THRESHOLD  = 128ull << 20; // 128 MiB
     static constexpr size_t LEGACY_MAX_ACTUAL  = (size_t) (OVER_ALLOC_FACTOR * REQUEST_THRESHOLD);
 
     ggml_sycl_pool & legacy_pool;
