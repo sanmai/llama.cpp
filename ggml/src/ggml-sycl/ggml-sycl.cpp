@@ -1327,8 +1327,10 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         return free_memory;
     }
 
+    static constexpr double OVER_ALLOC_FACTOR = 1.05;
+
     virtual size_t get_alloc_size(size_t size) const {
-        return (size_t) (1.05 * size);
+        return (size_t) (OVER_ALLOC_FACTOR * size);
     }
 
     ~ggml_sycl_pool_leg() {
@@ -1364,9 +1366,11 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
             return;
         }
         ++n_log_events;
-        const size_t interval = n_log_events < 100  ? 10
-                              : n_log_events < 1000 ? 100
-                                                    : 1000;
+        const size_t interval = n_log_events < 100    ? 10
+                              : n_log_events < 1000   ? 100
+                              : n_log_events < 10000  ? 1000
+                              : n_log_events < 100000 ? 10000
+                                                      : 100000;
         if (n_log_events % interval != 0) {
             return;
         }
@@ -1570,16 +1574,19 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
 };
 
 struct ggml_sycl_pool_fattn : public ggml_sycl_pool_leg {
-    // Requests below this go to the legacy (general) pool, which has a much
-    // larger working set and absorbs them with high hit rate. Larger requests
-    // (the K_f16/V_f16 buffers that scale with KV) stay in this pool's own
-    // slots and are dropped at end of graph.
+    // Alloc routes by request size: anything below REQUEST_THRESHOLD goes to
+    // the legacy (general) pool, which has 256 slots and absorbs the small
+    // working set at near-100% hit rate. Larger requests (the K_f16/V_f16
+    // buffers that scale with KV) stay in this pool's own slots and are
+    // dropped at end of graph.
     //
-    // Free routing also keys on this threshold. The two size distributions
-    // don't overlap: legacy-routed actual_size <= 1.05 * SMALL_THRESHOLD,
-    // fattn-routed actual_size >= 1.25 * SMALL_THRESHOLD + 1 MiB. So free's
-    // (ptr, size) is enough to pick the right pool without per-ptr tracking.
-    static constexpr size_t SMALL_THRESHOLD = 32ull << 20; // 32 MiB
+    // Free routes by actual_size, which sits in one of two non-overlapping
+    // bands: legacy-returned actual_size <= OVER_ALLOC_FACTOR * REQUEST_THRESHOLD,
+    // fattn-returned actual_size >= 1.25 * REQUEST_THRESHOLD + 1 MiB. Picking
+    // the upper bound of the legacy band as the cutoff lets free dispatch on
+    // (ptr, size) alone, no per-ptr tracking required.
+    static constexpr size_t REQUEST_THRESHOLD  = 32ull << 20; // 32 MiB
+    static constexpr size_t LEGACY_MAX_ACTUAL  = (size_t) (OVER_ALLOC_FACTOR * REQUEST_THRESHOLD);
 
     ggml_sycl_pool & legacy_pool;
 
@@ -1592,14 +1599,14 @@ struct ggml_sycl_pool_fattn : public ggml_sycl_pool_leg {
     }
 
     void * alloc(size_t size, size_t * actual_size) override {
-        if (size < SMALL_THRESHOLD) {
+        if (size < REQUEST_THRESHOLD) {
             return legacy_pool.alloc(size, actual_size);
         }
         return ggml_sycl_pool_leg::alloc(size, actual_size);
     }
 
     void free(void * ptr, size_t size) override {
-        if (size < SMALL_THRESHOLD) {
+        if (size <= LEGACY_MAX_ACTUAL) {
             legacy_pool.free(ptr, size);
             return;
         }
