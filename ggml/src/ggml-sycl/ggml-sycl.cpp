@@ -1264,8 +1264,34 @@ ggml_backend_buffer_type_t ggml_backend_sycl_host_buffer_type() {
     return &ggml_backend_sycl_buffer_type_host;
 }
 
+// Welford's online algorithm for mean/variance over a stream of samples.
+// Numerically stable; constant memory; no history retained.
+struct welford {
+    size_t count = 0;
+    double mean  = 0.0;
+    double m2    = 0.0;
+
+    void update(double x) {
+        ++count;
+        const double delta  = x - mean;
+        mean               += delta / count;
+        const double delta2 = x - mean;
+        m2                 += delta * delta2;
+    }
+
+    double variance() const { return count < 2 ? 0.0 : m2 / count; }
+    double stddev()   const { return std::sqrt(variance()); }
+
+    // Gaussian-approx one-sided percentile bounds (mean + k*sigma).
+    double p90()   const { return mean + 1.2816 * stddev(); }
+    double p99_7() const { return mean + 3.0    * stddev(); }
+};
+
 // buffer pool for sycl (legacy)
-// #define DEBUG_SYCL_POOL
+#define DEBUG_SYCL_POOL
+// Per-alloc / per-free chatter; flip on only when investigating slot-level
+// behaviour. The aggregated picture is in log_stats() already.
+// #define DEBUG_SYCL_POOL_VERBOSE
 struct ggml_sycl_pool_leg : public ggml_sycl_pool {
     int device;
     queue_ptr qptr;
@@ -1285,7 +1311,10 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
     size_t n_evict = 0;
     size_t n_free = 0;
     size_t n_log_events = 0;
-    static constexpr size_t LOG_INTERVAL = 256 * 32;
+    static constexpr size_t LOG_INTERVAL = 10000;
+
+    // Distribution of allocation request sizes in MiB (workload demand).
+    welford req_size_mib;
 
     explicit ggml_sycl_pool_leg(queue_ptr qptr_, int device_, int max_buffers_ = 256, const char * label_ = nullptr) :
         device(device_), qptr(qptr_), max_buffers(max_buffers_), label(label_), buffer_pool(max_buffers_) {}
@@ -1322,11 +1351,6 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
                 b.size = 0;
             }
         }
-
-#ifdef DEBUG_SYCL_POOL
-        GGML_LOG_INFO("pool[%d]: free memory after attempted clear_pool %.2f MiB\n",
-              device, free_memory() / 1024.0 / 1024.0);
-#endif
     }
 
     double hit_rate() const {
@@ -1341,9 +1365,11 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         if (++n_log_events % LOG_INTERVAL != 0) {
             return;
         }
-        GGML_LOG_INFO("%s pool[%d]: %s; hits=%zu misses=%zu hit_rate=%.1f%% cache=%zu evict=%zu free=%zu cached=%.2f MiB in %d/%d slots\n",
+        GGML_LOG_INFO("%s pool[%d]: %s; hits=%zu misses=%zu hit_rate=%.1f%% cache=%zu evict=%zu free=%zu cached=%.2f MiB in %d/%d slots; req(n=%zu)=%.2f+/-%.2f MiB p90=%.2f p99.7=%.2f MiB\n",
                       label, device, event, n_hits, n_misses, hit_rate(), n_cache, n_evict, n_free,
-                      cached_size() / 1024.0 / 1024.0, cached_buffers(), max_buffers);
+                      cached_size() / 1024.0 / 1024.0, cached_buffers(), max_buffers,
+                      req_size_mib.count, req_size_mib.mean, req_size_mib.stddev(),
+                      req_size_mib.p90(), req_size_mib.p99_7());
     }
 
     size_t cached_size() const {
@@ -1363,6 +1389,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
     }
 
     void * alloc(size_t size, size_t * actual_size) override {
+        req_size_mib.update(size / (1024.0 * 1024.0));
 #ifdef DEBUG_sycl_MALLOC
         int nnz = 0;
         size_t max_size = 0;
@@ -1388,7 +1415,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
                             b.size = 0;
                             n_hits++;
                             log_stats("hit");
-#ifdef DEBUG_SYCL_POOL
+#ifdef DEBUG_SYCL_POOL_VERBOSE
                             if (label) {
                                 GGML_LOG_INFO("%s pool[%d]: reuse exact cached buffer %.2f MiB for request %.2f MiB\n",
                                               label, device, *actual_size / 1024.0 / 1024.0, size / 1024.0 / 1024.0);
@@ -1408,7 +1435,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
             b.size = 0;
             n_hits++;
             log_stats("hit");
-#ifdef DEBUG_SYCL_POOL
+#ifdef DEBUG_SYCL_POOL_VERBOSE
             if (label) {
                 GGML_LOG_INFO("%s pool[%d]: reuse cached buffer %.2f MiB for request %.2f MiB\n",
                               label, device, *actual_size / 1024.0 / 1024.0, size / 1024.0 / 1024.0);
@@ -1420,7 +1447,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         log_stats("miss");
         const size_t cached = cached_size();
         if (label && cached > 0) {
-#ifdef DEBUG_SYCL_POOL
+#ifdef DEBUG_SYCL_POOL_VERBOSE
             GGML_LOG_INFO("%s pool[%d]: no cached buffer fits request %.2f MiB, cached %.2f MiB in %d/%d slots\n",
                           label, device, size / 1024.0 / 1024.0, cached / 1024.0 / 1024.0,
                           cached_buffers(), max_buffers);
@@ -1453,6 +1480,11 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
                            label ? label : "sycl", device,
                            look_ahead_size / 1024.0 / 1024.0, cached_size() / 1024.0 / 1024.0);
             clear_pool();
+
+#ifdef DEBUG_SYCL_POOL
+            GGML_LOG_INFO("pool[%d]: free vram after attempted clear_pool %.2f MiB\n",
+                  device, free_memory() / 1024.0 / 1024.0);
+#endif
 
             if (look_ahead_size > free_memory()) {
                 GGML_LOG_ERROR("%s: can't allocate %lu Bytes of memory on device/GPU after flushing pool\n",
@@ -1538,6 +1570,12 @@ struct ggml_sycl_pool_fattn : public ggml_sycl_pool_leg {
 
     size_t get_alloc_size(size_t size) const override {
         return (size_t) (1.25 * size) + 1024 * 1024;
+    }
+
+    // Experiment: drop every cached slot at end of graph. If this works, the
+    // next iteration is a smarter trim (e.g. size-based threshold or LRU).
+    void on_compute_end() override {
+        clear_pool();
     }
 };
 
@@ -4753,6 +4791,8 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         GGML_ASSERT(ok);
     }
+
+    sycl_ctx->trim_fattn_pool();
 }
 
 #ifdef GGML_SYCL_GRAPH

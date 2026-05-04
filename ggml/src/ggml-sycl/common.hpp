@@ -246,6 +246,10 @@ struct ggml_sycl_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
+
+    // Called at the end of a graph compute. Pools may use this to trim cached
+    // buffers that no longer match the working-set size of recent allocations.
+    virtual void on_compute_end() {}
 };
 
 static constexpr int GGML_SYCL_FATTN_POOL_MAX_BUFFERS = 5;
@@ -438,6 +442,15 @@ struct ggml_backend_sycl_context {
 
     ggml_sycl_pool & fattn_pool() {
         return fattn_pool(device);
+    }
+
+    // Notify the current device's fattn pool that a graph compute just ended,
+    // so it can trim cached buffers whose size no longer reflects demand.
+    // No-op if the fattn pool was never instantiated.
+    void trim_fattn_pool() {
+        if (fattn_pools[device] != nullptr) {
+            fattn_pools[device]->on_compute_end();
+        }
     }
 
 #ifdef GGML_SYCL_GRAPH
