@@ -1379,11 +1379,18 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
             return;
         }
         const double probe_mib = get_alloc_size(10ull << 20) / (1024.0 * 1024.0);
-        GGML_LOG_INFO("%s pool[%d] alloc(10MiB)=%.2f: %s; hits=%zu misses=%zu hit_rate=%.1f%% cache=%zu evict=%zu free=%zu cached=%.2f MiB in %d/%d slots; req(n=%zu)=%.2f+/-%.2f MiB p90=%.2f p99.7=%.2f max=%.2f MiB\n",
+        const size_t cached_b = cached_size();
+        const size_t used_b   = pool_size - cached_b;
+        char extra[64] = {0};
+        if (n_evict || n_free) {
+            snprintf(extra, sizeof(extra), " evict=%zu free=%zu", n_evict, n_free);
+        }
+        GGML_LOG_INFO("%s pool[%d] alloc(10MiB)=%.2f %s: misses=%zu hits=%zu (%.1f%%)%s cached=%.2f MiB in %d/%d slots, used=%.2f MiB; req=%.2f+/-%.2f p90=%.2f p99.7=%.2f max=%.2f MiB\n",
                       label, device, probe_mib,
-                      event, n_hits, n_misses, hit_rate(), n_cache, n_evict, n_free,
-                      cached_size() / 1024.0 / 1024.0, cached_buffers(), max_buffers,
-                      req_size_mib.count, req_size_mib.mean, req_size_mib.stddev(),
+                      event, n_misses, n_hits, hit_rate(), extra,
+                      cached_b / 1024.0 / 1024.0, cached_buffers(), max_buffers,
+                      used_b / 1024.0 / 1024.0,
+                      req_size_mib.mean, req_size_mib.stddev(),
                       req_size_mib.p90(), req_size_mib.p99_7(), req_size_mib.max);
         log_slot_sizes();
     }
