@@ -1331,7 +1331,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
     }
 
     static constexpr size_t OVER_ALLOC_THRESHOLD = 8ull << 20;  // 8 MiB
-    static constexpr size_t OVER_ALLOC_PAD       = 1ull << 20;  // 1 MiB
+    static constexpr size_t OVER_ALLOC_PAD       = 2ull << 20;  // 2 MiB
 
     virtual size_t get_alloc_size(size_t size) const {
         return size > OVER_ALLOC_THRESHOLD ? size + OVER_ALLOC_PAD : size;
