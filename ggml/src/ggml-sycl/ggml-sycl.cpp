@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <regex>
+#include <unordered_set>
 
 #include <sycl/sycl.hpp>
 #if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
@@ -1582,15 +1583,14 @@ struct ggml_sycl_pool_fattn : public ggml_sycl_pool_leg {
     // buffers that scale with KV) stay in this pool's own slots and are
     // dropped at end of graph.
     //
-    // Free routes by actual_size against LEGACY_MAX_ACTUAL. Set well above
-    // REQUEST_THRESHOLD so legacy-best-fit returns (which can hand back any
-    // cached size, since legacy is shared with non-fattn callers of arbitrary
-    // request size) still get freed back into legacy. Only allocations larger
-    // than this bound stay in the fattn pool's own slots.
-    static constexpr size_t REQUEST_THRESHOLD  = 128ull << 20; // 128 MiB
-    static constexpr size_t LEGACY_MAX_ACTUAL  = (size_t) (OVER_ALLOC_FACTOR * REQUEST_THRESHOLD);
+    // Free routes by provenance: we track every ptr we delegated to legacy
+    // and route its free back through legacy. Otherwise legacy's best-fit
+    // can hand back a non-fattn caller's bigger cached buffer, and routing
+    // by size alone would orphan that buffer in the wrong pool on free.
+    static constexpr size_t REQUEST_THRESHOLD = 128ull << 20; // 128 MiB
 
     ggml_sycl_pool & legacy_pool;
+    std::unordered_set<void *> delegated;
 
     explicit ggml_sycl_pool_fattn(queue_ptr qptr, int device, ggml_sycl_pool & legacy) :
         ggml_sycl_pool_leg(qptr, device, GGML_SYCL_FATTN_POOL_MAX_BUFFERS, "fattn"),
@@ -1602,13 +1602,15 @@ struct ggml_sycl_pool_fattn : public ggml_sycl_pool_leg {
 
     void * alloc(size_t size, size_t * actual_size) override {
         if (size < REQUEST_THRESHOLD) {
-            return legacy_pool.alloc(size, actual_size);
+            void * ptr = legacy_pool.alloc(size, actual_size);
+            delegated.insert(ptr);
+            return ptr;
         }
         return ggml_sycl_pool_leg::alloc(size, actual_size);
     }
 
     void free(void * ptr, size_t size) override {
-        if (size <= LEGACY_MAX_ACTUAL) {
+        if (delegated.erase(ptr) > 0) {
             legacy_pool.free(ptr, size);
             return;
         }
