@@ -1338,6 +1338,27 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
     }
 
     ~ggml_sycl_pool_leg() {
+#ifdef DEBUG_SYCL_POOL
+        {
+            std::vector<double> sizes_mib;
+            for (int i = 0; i < max_buffers; ++i) {
+                if (buffer_pool[i].ptr != nullptr) {
+                    sizes_mib.push_back(buffer_pool[i].size / 1024.0 / 1024.0);
+                }
+            }
+            std::sort(sizes_mib.begin(), sizes_mib.end());
+            GGML_LOG_INFO("%s: %d cached buffers, cached = %.2f MB\n", __func__,
+                cached_buffers(), cached_size() / 1024.0 / 1024.0);
+            std::string slots;
+            char buf[32];
+            for (size_t i = 0; i < sizes_mib.size(); ++i) {
+                if (i) slots += "/";
+                snprintf(buf, sizeof(buf), "%.2f", sizes_mib[i]);
+                slots += buf;
+            }
+            GGML_LOG_INFO("%s: slots MiB: %s\n", __func__, slots.c_str());
+        }
+#endif
         clear_pool();
         GGML_ASSERT(pool_size == 0);
     }
