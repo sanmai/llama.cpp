@@ -248,55 +248,6 @@ struct ggml_sycl_pool {
     virtual void free(void * ptr, size_t size) = 0;
 };
 
-// Per-context flash-attention scratch buffers. One named slot per role; each
-// slot grows on demand and is freed only when the SYCL context is destroyed.
-// K_f16 and V_f16 carry a 16 MiB floor so the prefill ramp doesn't churn the
-// allocator on every batch boundary.
-struct ggml_sycl_fattn_buffers {
-    struct slot {
-        void * ptr = nullptr;
-        size_t capacity = 0;
-        size_t min_bytes = 0;
-    };
-
-    static constexpr size_t LARGE_MIN = 16ull << 20;
-
-    slot K_f16        { nullptr, 0, LARGE_MIN };
-    slot V_f16        { nullptr, 0, LARGE_MIN };
-    slot KV_max;
-    slot dst_tmp;
-    slot dst_tmp_meta;
-
-    ggml_sycl_fattn_buffers(queue_ptr q, int device) : q(q), device(device) {}
-    ~ggml_sycl_fattn_buffers();
-
-    ggml_sycl_fattn_buffers(const ggml_sycl_fattn_buffers &) = delete;
-    ggml_sycl_fattn_buffers & operator=(const ggml_sycl_fattn_buffers &) = delete;
-
-    void * ensure(slot & s, size_t need_bytes);
-
-private:
-    queue_ptr q = nullptr;
-    int       device = 0;
-};
-
-// Typed view over a single slot. Mirrors the call-site shape of
-// ggml_sycl_pool_alloc<T>: bind once, then alloc(n_elements) and read .ptr.
-// The view does not own the buffer; the underlying slot persists across calls.
-template <typename T>
-struct ggml_sycl_fattn_slot_view {
-    ggml_sycl_fattn_buffers &       fbuf;
-    ggml_sycl_fattn_buffers::slot & s;
-    T *                             ptr = nullptr;
-
-    ggml_sycl_fattn_slot_view(ggml_sycl_fattn_buffers & fbuf, ggml_sycl_fattn_buffers::slot & s)
-        : fbuf(fbuf), s(s) {}
-
-    void alloc(size_t n_elements) {
-        ptr = (T *) fbuf.ensure(s, n_elements * sizeof(T));
-    }
-};
-
 template<typename T>
 struct ggml_sycl_pool_alloc {
     ggml_sycl_pool * pool = nullptr;
@@ -453,17 +404,11 @@ struct ggml_backend_sycl_context {
     std::unique_ptr<ggml_sycl_pool> pools[GGML_SYCL_MAX_DEVICES];
     std::unordered_map<sycl::queue *, std::unique_ptr<ggml_sycl_pool_alloc<uint8_t>>> scratchpad_map;
 
-    std::unique_ptr<ggml_sycl_fattn_buffers> fattn_bufs[GGML_SYCL_MAX_DEVICES];
-
     std::unique_ptr<ggml_sycl_pool> host_pools[GGML_SYCL_MAX_DEVICES];
 
     static std::unique_ptr<ggml_sycl_pool> new_pool_for_device(queue_ptr qptr, int device);
 
-    static std::unique_ptr<ggml_sycl_pool> new_pool_for_device(queue_ptr qptr, int device, int max_buffers, const char * label = nullptr);
-
     static std::unique_ptr<ggml_sycl_pool> new_pool_for_host(queue_ptr qptr, int device);
-
-    static std::unique_ptr<ggml_sycl_fattn_buffers> new_fattn_buffers(queue_ptr qptr, int device);
 
     ggml_sycl_pool & pool(int device) {
         if (pools[device] == nullptr) {
@@ -474,17 +419,6 @@ struct ggml_backend_sycl_context {
 
     ggml_sycl_pool & pool() {
         return pool(device);
-    }
-
-    ggml_sycl_fattn_buffers & fattn_buffers(int device) {
-        if (fattn_bufs[device] == nullptr) {
-            fattn_bufs[device] = new_fattn_buffers(stream(device, 0), device);
-        }
-        return *fattn_bufs[device];
-    }
-
-    ggml_sycl_fattn_buffers & fattn_buffers() {
-        return fattn_buffers(device);
     }
 
 #ifdef GGML_SYCL_GRAPH

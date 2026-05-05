@@ -917,20 +917,16 @@ void launch_fattn(
 
     GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
 
+    ggml_sycl_pool & pool = ctx.pool();
     dpct::queue_ptr  main_stream = ctx.stream();
     const int id  = ggml_sycl_get_device();
     const int nsm = ggml_sycl_info().devices[id].nsm;
 
-    ggml_sycl_fattn_buffers & fbuf = ctx.fattn_buffers();
-
-    // Bind one typed view per role. Each view's .ptr stays nullptr until
-    // .alloc() is called, so the kernel still sees nullptr for unused roles.
-    ggml_sycl_fattn_slot_view<sycl::half>   K_f16(fbuf, fbuf.K_f16);
-    ggml_sycl_fattn_slot_view<sycl::half>   V_f16(fbuf, fbuf.V_f16);
-    ggml_sycl_fattn_slot_view<int>          KV_max(fbuf, fbuf.KV_max);
-    ggml_sycl_fattn_slot_view<float>        dst_tmp(fbuf, fbuf.dst_tmp);
-    ggml_sycl_fattn_slot_view<sycl::float2> dst_tmp_meta(fbuf, fbuf.dst_tmp_meta);
-
+    ggml_sycl_pool_alloc<sycl::half>   K_f16(pool);
+    ggml_sycl_pool_alloc<sycl::half>   V_f16(pool);
+    ggml_sycl_pool_alloc<int>    KV_max(pool);
+    ggml_sycl_pool_alloc<float>  dst_tmp(pool);
+    ggml_sycl_pool_alloc<sycl::float2> dst_tmp_meta(pool);
 
     const char * K_data = (const char *) K->data;
     size_t nb11 = K->nb[1];
@@ -1061,7 +1057,7 @@ void launch_fattn(
         blocks_num.z = 1;
 
         if (ntiles_total % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
-            dst_tmp_meta.alloc(size_t(blocks_num.x) * ncols * (2 + DV/2));
+            dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
         }
     } else {
         const int ntiles_KQ = (K->ne[1] + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by tensor size.
@@ -1098,8 +1094,8 @@ void launch_fattn(
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
 
         if (parallel_blocks > 1) {
-            dst_tmp.alloc(size_t(parallel_blocks) * ggml_nelements(KQV));
-            dst_tmp_meta.alloc(size_t(parallel_blocks) * ggml_nrows(KQV));
+            dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
+            dst_tmp_meta.alloc(parallel_blocks*ggml_nrows(KQV));
         }
     }
 
@@ -1129,7 +1125,7 @@ void launch_fattn(
     lauch_kernel<fattn_kernel, warp_size>(
         blocks_num, block_dim, main_stream, (unsigned int) nbytes_shared, (const char *) Q->data, K_data, V_data,
         mask ? ((const char *) mask->data) : nullptr, sinks ? ((const char *) sinks->data) : nullptr, KV_max.ptr,
-        !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr, scale, max_bias, m0, m1,
+        !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, (sycl::float2 *)dst_tmp_meta.ptr, scale, max_bias, m0, m1,
         n_head_log2, logit_softcap, Q->ne[0], ne01, Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->ne[0],
         K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13, nb21, nb22, nb23, mask ? mask->ne[1] : 0,
         mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0,
