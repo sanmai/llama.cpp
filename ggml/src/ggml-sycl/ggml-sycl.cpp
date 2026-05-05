@@ -1495,6 +1495,9 @@ std::unique_ptr<ggml_sycl_fattn_buffers> ggml_backend_sycl_context::new_fattn_bu
     return std::unique_ptr<ggml_sycl_fattn_buffers>(new ggml_sycl_fattn_buffers(qptr, device));
 }
 
+/**
+ * Ensures the slot has a sufficient device memory buffer.
+ */
 void * ggml_sycl_fattn_buffers::ensure(slot & s, size_t need_bytes) {
     if (s.capacity >= need_bytes) {
         return s.ptr;
@@ -1516,7 +1519,7 @@ void * ggml_sycl_fattn_buffers::ensure(slot & s, size_t need_bytes) {
                         cap, *qptr)));
 
     if (s.ptr == nullptr) {
-        GGML_LOG_ERROR("%s: can't allocate %lu bytes on device\n", __func__, cap);
+        GGML_LOG_ERROR("%s: can't allocate %lu Bytes of memory on device\n", __func__, cap);
         GGML_ABORT("fattn buffer alloc failed");
     }
     s.capacity = cap;

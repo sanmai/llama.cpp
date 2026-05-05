@@ -255,6 +255,7 @@ struct ggml_sycl_fattn_buffers {
         size_t min_bytes = 0;
     };
 
+    // Allocation floor to minimize early reallocations
     static constexpr size_t PREFILL_FLOOR = 16ull << 20; // 16 MiB
 
     slot K_f16        { nullptr, 0, PREFILL_FLOOR };
