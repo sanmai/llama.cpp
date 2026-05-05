@@ -1496,51 +1496,42 @@ std::unique_ptr<ggml_sycl_fattn_buffers> ggml_backend_sycl_context::new_fattn_bu
 }
 
 /**
- * Ensures the slot has a sufficient device memory buffer.
+ * Ensures the buffer has sufficient device memory.
  */
-void * ggml_sycl_fattn_buffers::ensure(slot & s, size_t need_bytes) {
-    if (s.capacity >= need_bytes) {
-        return s.ptr;
+void * ggml_sycl_fattn_buffers::buffer::ensure_bytes(size_t need_bytes) {
+    if (capacity >= need_bytes) {
+        return ptr;
     }
-    if (s.ptr) {
-        SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(s.ptr, *qptr)));
-        s.ptr = nullptr;
-        s.capacity = 0;
+    if (ptr) {
+        SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(ptr, *qptr)));
+        ptr = nullptr;
+        capacity = 0;
     }
     // Next requested buffer will be 1.25 larger + 1 MiB
     size_t cap = need_bytes + need_bytes / 4 + (1ull << 20);
 
-    if (cap < s.min_bytes) {
-        cap = s.min_bytes;
+    if (cap < PREFILL_FLOOR) {
+        cap = PREFILL_FLOOR;
     }
 
     SYCL_CHECK(
-        CHECK_TRY_ERROR(s.ptr = (void *)sycl::malloc_device(
+        CHECK_TRY_ERROR(ptr = (void *)sycl::malloc_device(
                         cap, *qptr)));
 
-    if (s.ptr == nullptr) {
+    if (ptr == nullptr) {
         GGML_LOG_ERROR("%s: can't allocate %lu Bytes of memory on device\n", __func__, cap);
         GGML_ABORT("fattn buffer alloc failed");
     }
-    s.capacity = cap;
-    return s.ptr;
+    capacity = cap;
+    return ptr;
 }
 
-ggml_sycl_fattn_buffers::~ggml_sycl_fattn_buffers() {
+ggml_sycl_fattn_buffers::buffer::~buffer() {
 #ifdef DEBUG_SYCL_POOL
-    const double mib = 1024.0 * 1024.0;
-    const size_t total = K_f16.capacity + V_f16.capacity;
-    GGML_LOG_INFO("fattn_buffers[%d]: K_f16=%.2f V_f16=%.2f MiB (total=%.2f MiB)\n",
-                  device,
-                  K_f16.capacity / mib, V_f16.capacity / mib,
-                  total / mib);
+    GGML_LOG_INFO("fattn_buffer[%d]: %.2f MiB\n", device, capacity / 1024.0 / 1024.0);
 #endif
-
-    slot * slots[] = { &K_f16, &V_f16 };
-    for (slot * s : slots) {
-        if (s->ptr) {
-            SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(s->ptr, *qptr)));
-        }
+    if (ptr) {
+        SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(ptr, *qptr)));
     }
 }
 

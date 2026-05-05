@@ -249,42 +249,51 @@ struct ggml_sycl_pool {
 };
 
 struct ggml_sycl_fattn_buffers {
-    struct slot {
-        void * ptr = nullptr;
-        size_t capacity = 0;
-        size_t min_bytes = 0;
-    };
-
     // Allocation floor to minimize early reallocations
     static constexpr size_t PREFILL_FLOOR = 16ull << 20; // 16 MiB
 
-    slot K_f16        { nullptr, 0, PREFILL_FLOOR };
-    slot V_f16        { nullptr, 0, PREFILL_FLOOR };
+    struct buffer {
+        buffer(queue_ptr qptr_, int device_) : qptr(qptr_), device(device_) {}
+        ~buffer();
 
-    ggml_sycl_fattn_buffers(queue_ptr qptr_, int device_) : qptr(qptr_), device(device_) {}
-    ~ggml_sycl_fattn_buffers();
+        buffer(const buffer &) = delete;
+        buffer & operator=(const buffer &) = delete;
+
+        template <typename T>
+        T * ensure(size_t n_elems) {
+            return static_cast<T *>(ensure_bytes(n_elems * sizeof(T)));
+        }
+
+    private:
+        void * ensure_bytes(size_t need_bytes);
+
+        void *    ptr      = nullptr;
+        size_t    capacity = 0;
+        queue_ptr qptr     = nullptr;
+        int       device   = 0;
+    };
+
+    buffer K;
+    buffer V;
+
+    ggml_sycl_fattn_buffers(queue_ptr qptr, int device) : K(qptr, device), V(qptr, device) {}
 
     ggml_sycl_fattn_buffers(const ggml_sycl_fattn_buffers &) = delete;
     ggml_sycl_fattn_buffers & operator=(const ggml_sycl_fattn_buffers &) = delete;
-
-    void * ensure(slot & s, size_t need_bytes);
-
-private:
-    queue_ptr qptr = nullptr;
-    int       device = 0;
 };
 
+/**
+ * A wrapper to fake the `ggml_sycl_pool_alloc` interface to keep downstream code unchanged.
+ */
 template <typename T>
-struct ggml_sycl_fattn_buffer {
-    ggml_sycl_fattn_buffers &       fbufs;
-    ggml_sycl_fattn_buffers::slot & slot;
-    T *                             ptr = nullptr;
+struct ggml_sycl_fattn_view {
+    ggml_sycl_fattn_buffers::buffer & buf;
+    T *                               ptr = nullptr;
 
-    ggml_sycl_fattn_buffer(ggml_sycl_fattn_buffers & fbufs_, ggml_sycl_fattn_buffers::slot & slot_)
-        : fbufs(fbufs_), slot(slot_) {}
+    explicit ggml_sycl_fattn_view(ggml_sycl_fattn_buffers::buffer & buf_) : buf(buf_) {}
 
     void alloc(size_t n_elems) {
-        ptr = static_cast<T *>(fbufs.ensure(slot, n_elems * sizeof(T)));
+        ptr = buf.ensure<T>(n_elems);
     }
 };
 
