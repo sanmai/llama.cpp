@@ -1500,16 +1500,21 @@ void * ggml_sycl_fattn_buffers::ensure(slot & s, size_t need_bytes) {
         return s.ptr;
     }
     if (s.ptr) {
-        SYCL_CHECK(CHECK_TRY_ERROR(q->wait()));
-        SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(s.ptr, *q)));
+        SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(s.ptr, *qptr)));
         s.ptr = nullptr;
         s.capacity = 0;
     }
+    // Next requested buffer will be 1.25 larger + 1 MiB
     size_t cap = need_bytes + need_bytes / 4 + (1ull << 20);
+
     if (cap < s.min_bytes) {
         cap = s.min_bytes;
     }
-    SYCL_CHECK(CHECK_TRY_ERROR(s.ptr = (void *) sycl::malloc_device(cap, *q)));
+
+    SYCL_CHECK(
+        CHECK_TRY_ERROR(s.ptr = (void *)sycl::malloc_device(
+                        cap, *qptr)));
+
     if (s.ptr == nullptr) {
         GGML_LOG_ERROR("%s: can't allocate %lu bytes on device\n", __func__, cap);
         GGML_ABORT("fattn buffer alloc failed");
@@ -1532,8 +1537,7 @@ ggml_sycl_fattn_buffers::~ggml_sycl_fattn_buffers() {
     slot * slots[] = { &K_f16, &V_f16, &KV_max, &dst_tmp, &dst_tmp_meta };
     for (slot * s : slots) {
         if (s->ptr) {
-            SYCL_CHECK(CHECK_TRY_ERROR(q->wait()));
-            SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(s->ptr, *q)));
+            SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(s->ptr, *qptr)));
         }
     }
 }

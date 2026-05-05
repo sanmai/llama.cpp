@@ -922,11 +922,11 @@ void launch_fattn(
     const int id  = ggml_sycl_get_device();
     const int nsm = ggml_sycl_info().devices[id].nsm;
 
-    ggml_sycl_fattn_slot_view<sycl::half>   K_f16(fbuf, fbuf.K_f16);
-    ggml_sycl_fattn_slot_view<sycl::half>   V_f16(fbuf, fbuf.V_f16);
-    ggml_sycl_fattn_slot_view<int>          KV_max(fbuf, fbuf.KV_max);
-    ggml_sycl_fattn_slot_view<float>        dst_tmp(fbuf, fbuf.dst_tmp);
-    ggml_sycl_fattn_slot_view<sycl::float2> dst_tmp_meta(fbuf, fbuf.dst_tmp_meta);
+    ggml_sycl_fattn_buffer<sycl::half>   K_f16(fbuf, fbuf.K_f16);
+    ggml_sycl_fattn_buffer<sycl::half>   V_f16(fbuf, fbuf.V_f16);
+    ggml_sycl_fattn_buffer<int>          KV_max(fbuf, fbuf.KV_max);
+    ggml_sycl_fattn_buffer<float>        dst_tmp(fbuf, fbuf.dst_tmp);
+    ggml_sycl_fattn_buffer<sycl::float2> dst_tmp_meta(fbuf, fbuf.dst_tmp_meta);
 
     const char * K_data = (const char *) K->data;
     size_t nb11 = K->nb[1];
