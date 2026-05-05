@@ -1290,9 +1290,9 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
                 bytes_cached += buffer_pool[i].size;
             }
         }
-        GGML_LOG_INFO("%s: %d cached buffers, cached = %.2f MiB\n", __func__,
+        GGML_LOG_INFO("%s: %d buffers, cached = %.2f MiB\n", __func__,
                       n_cached, bytes_cached / 1024.0 / 1024.0);
-        const std::string slots = format_slots_mib();
+        const auto slots = format_slots_alloc_order();
         if (!slots.empty()) {
             GGML_LOG_INFO("%s: slots MiB: %s\n", __func__, slots.c_str());
         }
@@ -1309,9 +1309,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
     }
 
 #ifdef DEBUG_SYCL_POOL
-    // Slot order = free() order, so this preserves the timing signal of how
-    // the working set evolved over the run.
-    std::string format_slots_mib() const {
+    std::string format_slots_alloc_order() const {
         std::string line;
         char buf[32];
         bool first = true;
@@ -1319,7 +1317,9 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
             if (buffer_pool[i].ptr == nullptr) {
                 continue;
             }
-            if (!first) line += '/';
+            if (!first) {
+                line += '/';
+            }
             first = false;
             snprintf(buf, sizeof(buf), "%.2f", buffer_pool[i].size / 1024.0 / 1024.0);
             line += buf;
