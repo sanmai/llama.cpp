@@ -1507,7 +1507,7 @@ void * ggml_sycl_fattn_buffers::buffer::ensure_bytes(size_t need_bytes) {
         ptr = nullptr;
         capacity = 0;
     }
-    // Next requested buffer will be 1.25 larger + 1 MiB
+    // Next requested buffer will be 25% larger + 1 MiB
     size_t cap = need_bytes + need_bytes / 4 + (1ull << 20);
 
     if (cap < PREFILL_FLOOR) {
