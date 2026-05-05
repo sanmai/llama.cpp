@@ -260,9 +260,6 @@ struct ggml_sycl_fattn_buffers {
 
     slot K_f16        { nullptr, 0, PREFILL_FLOOR };
     slot V_f16        { nullptr, 0, PREFILL_FLOOR };
-    slot KV_max;
-    slot dst_tmp;
-    slot dst_tmp_meta;
 
     ggml_sycl_fattn_buffers(queue_ptr qptr_, int device_) : qptr(qptr_), device(device_) {}
     ~ggml_sycl_fattn_buffers();

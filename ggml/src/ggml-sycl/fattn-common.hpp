@@ -917,6 +917,7 @@ void launch_fattn(
 
     GGML_ASSERT(!mask || mask->type == GGML_TYPE_F16);
 
+    ggml_sycl_pool & pool = ctx.pool();
     ggml_sycl_fattn_buffers & fbuf = ctx.fattn_buffers();
     dpct::queue_ptr  main_stream = ctx.stream();
     const int id  = ggml_sycl_get_device();
@@ -924,9 +925,9 @@ void launch_fattn(
 
     ggml_sycl_fattn_buffer<sycl::half>   K_f16(fbuf, fbuf.K_f16);
     ggml_sycl_fattn_buffer<sycl::half>   V_f16(fbuf, fbuf.V_f16);
-    ggml_sycl_fattn_buffer<int>          KV_max(fbuf, fbuf.KV_max);
-    ggml_sycl_fattn_buffer<float>        dst_tmp(fbuf, fbuf.dst_tmp);
-    ggml_sycl_fattn_buffer<sycl::float2> dst_tmp_meta(fbuf, fbuf.dst_tmp_meta);
+    ggml_sycl_pool_alloc<int>    KV_max(pool);
+    ggml_sycl_pool_alloc<float>  dst_tmp(pool);
+    ggml_sycl_pool_alloc<sycl::float2> dst_tmp_meta(pool);
 
     const char * K_data = (const char *) K->data;
     size_t nb11 = K->nb[1];
