@@ -1500,17 +1500,8 @@ std::unique_ptr<ggml_sycl_fattn_buffers> ggml_backend_sycl_context::new_fattn_bu
  */
 void * ggml_sycl_fattn_buffers::buffer::ensure_bytes(size_t need_bytes) {
     if (capacity >= need_bytes) {
-#ifdef DEBUG_SYCL_POOL
-        const double mib = 1024.0 * 1024.0;
-        GGML_LOG_INFO("fattn_buffer[%d].%s hit: req=%.2f cap=%.2f slack=%.2f MiB\n",
-                      device, name,
-                      need_bytes / mib, capacity / mib, (capacity - need_bytes) / mib);
-#endif
         return ptr;
     }
-#ifdef DEBUG_SYCL_POOL
-    const size_t old_capacity = capacity;
-#endif
     if (ptr) {
         SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(ptr, *qptr)));
         ptr = nullptr;
@@ -1531,19 +1522,12 @@ void * ggml_sycl_fattn_buffers::buffer::ensure_bytes(size_t need_bytes) {
         GGML_ABORT("fattn buffer alloc failed");
     }
     capacity = cap;
-#ifdef DEBUG_SYCL_POOL
-    const double mib = 1024.0 * 1024.0;
-    GGML_LOG_INFO("fattn_buffer[%d].%s %s: req=%.2f cap=%.2f (was %.2f) MiB\n",
-                  device, name,
-                  old_capacity == 0 ? "alloc" : "regrow",
-                  need_bytes / mib, cap / mib, old_capacity / mib);
-#endif
     return ptr;
 }
 
 ggml_sycl_fattn_buffers::buffer::~buffer() {
 #ifdef DEBUG_SYCL_POOL
-    GGML_LOG_INFO("fattn_buffer[%d].%s: final %.2f MiB\n", device, name, capacity / 1024.0 / 1024.0);
+    GGML_LOG_INFO("fattn_buffer[%d]: %.2f MiB\n", device, capacity / 1024.0 / 1024.0);
 #endif
     if (ptr) {
         SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(ptr, *qptr)));
