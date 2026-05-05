@@ -1296,6 +1296,8 @@ struct welford {
 // behaviour. The aggregated picture is in log_stats() already.
 // #define DEBUG_SYCL_POOL_VERBOSE
 struct ggml_sycl_pool_leg : public ggml_sycl_pool {
+    static const int MAX_SYCL_BUFFERS = 256;
+
     int device;
     queue_ptr qptr;
     int max_buffers;
@@ -1306,7 +1308,8 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         size_t size = 0;
     };
 
-    std::vector<ggml_sycl_buffer> buffer_pool;
+    ggml_sycl_buffer buffer_pool[MAX_SYCL_BUFFERS] = {};
+
     size_t pool_size = 0;
     size_t n_hits = 0;
     size_t n_misses = 0;
@@ -1319,7 +1322,10 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
     welford req_size_mib;
 
     explicit ggml_sycl_pool_leg(queue_ptr qptr_, int device_, int max_buffers_ = 256, const char * label_ = "legacy") :
-        device(device_), qptr(qptr_), max_buffers(max_buffers_), label(label_), buffer_pool(max_buffers_) {}
+        device(device_), qptr(qptr_), max_buffers(max_buffers_), label(label_) {
+
+        GGML_ASSERT(max_buffers <= MAX_SYCL_BUFFERS);
+    }
 
     size_t free_memory() {
         size_t free_memory;
@@ -1339,25 +1345,9 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
 
     ~ggml_sycl_pool_leg() {
 #ifdef DEBUG_SYCL_POOL
-        {
-            std::vector<double> sizes_mib;
-            for (int i = 0; i < max_buffers; ++i) {
-                if (buffer_pool[i].ptr != nullptr) {
-                    sizes_mib.push_back(buffer_pool[i].size / 1024.0 / 1024.0);
-                }
-            }
-            std::sort(sizes_mib.begin(), sizes_mib.end());
-            GGML_LOG_INFO("%s: %d cached buffers, cached = %.2f MB\n", __func__,
-                cached_buffers(), cached_size() / 1024.0 / 1024.0);
-            std::string slots;
-            char buf[32];
-            for (size_t i = 0; i < sizes_mib.size(); ++i) {
-                if (i) slots += "/";
-                snprintf(buf, sizeof(buf), "%.2f", sizes_mib[i]);
-                slots += buf;
-            }
-            GGML_LOG_INFO("%s: slots MiB: %s\n", __func__, slots.c_str());
-        }
+        GGML_LOG_INFO("%s: %d cached buffers, cached = %.2f MiB\n", __func__,
+            cached_buffers(), cached_size() / 1024.0 / 1024.0);
+        GGML_LOG_INFO("%s: slots MiB: %s\n", __func__, format_slots_mib().c_str());
 #endif
         clear_pool();
         GGML_ASSERT(pool_size == 0);
@@ -1416,27 +1406,28 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         log_slot_sizes();
     }
 
-    // Sorted MiB sizes of every populated slot — eyeball the distribution to
-    // judge how tight an over-alloc factor would still cover the working set.
-    void log_slot_sizes() const {
-        std::vector<double> sizes;
-        sizes.reserve(max_buffers);
-        for (int i = 0; i < max_buffers; ++i) {
-            if (buffer_pool[i].ptr != nullptr) {
-                sizes.push_back(buffer_pool[i].size / 1024.0 / 1024.0);
-            }
-        }
-        if (sizes.empty()) {
-            return;
-        }
-        std::sort(sizes.begin(), sizes.end());
+    // MiB sizes of every populated slot in slot order (= free() order) — preserves
+    // the timing signal so you can see how the working set evolves over a run.
+    std::string format_slots_mib() const {
         std::string line;
-        line.reserve(sizes.size() * 8);
         char buf[32];
-        for (size_t i = 0; i < sizes.size(); ++i) {
-            if (i > 0) line += '/';
-            snprintf(buf, sizeof(buf), "%.2f", sizes[i]);
+        bool first = true;
+        for (int i = 0; i < max_buffers; ++i) {
+            if (buffer_pool[i].ptr == nullptr) {
+                continue;
+            }
+            if (!first) line += '/';
+            first = false;
+            snprintf(buf, sizeof(buf), "%.2f", buffer_pool[i].size / 1024.0 / 1024.0);
             line += buf;
+        }
+        return line;
+    }
+
+    void log_slot_sizes() const {
+        const std::string line = format_slots_mib();
+        if (line.empty()) {
+            return;
         }
         GGML_LOG_INFO("%s pool[%d] slots MiB: %s\n", label, device, line.c_str());
     }
