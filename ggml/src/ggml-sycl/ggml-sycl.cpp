@@ -1509,7 +1509,7 @@ void * ggml_sycl_fattn_buffers::buffer::ensure_bytes(size_t need_bytes) {
     }
 
     size_t cap = 0;
-    while (cap < need_bytes) {
+    while (cap <= need_bytes) {
         cap += CHUNK_SIZE;
     }
 
