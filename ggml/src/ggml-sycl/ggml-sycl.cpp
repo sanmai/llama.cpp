@@ -1281,6 +1281,23 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
     explicit ggml_sycl_pool_leg(queue_ptr qptr_, int device_) : device(device_), qptr(qptr_) {}
 
     ~ggml_sycl_pool_leg() {
+#ifdef DEBUG_SYCL_POOL
+        int    n_cached    = 0;
+        size_t bytes_cached = 0;
+        for (int i = 0; i < MAX_SYCL_BUFFERS; ++i) {
+            if (buffer_pool[i].ptr != nullptr) {
+                ++n_cached;
+                bytes_cached += buffer_pool[i].size;
+            }
+        }
+        GGML_LOG_INFO("%s: %d cached buffers, cached = %.2f MiB\n", __func__,
+                      n_cached, bytes_cached / 1024.0 / 1024.0);
+        const std::string slots = format_slots_mib();
+        if (!slots.empty()) {
+            GGML_LOG_INFO("%s: slots MiB: %s\n", __func__, slots.c_str());
+        }
+#endif
+
         for (int i = 0; i < MAX_SYCL_BUFFERS; ++i) {
             ggml_sycl_buffer & b = buffer_pool[i];
             if (b.ptr != nullptr) {
@@ -1290,6 +1307,26 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         }
         GGML_ASSERT(pool_size == 0);
     }
+
+#ifdef DEBUG_SYCL_POOL
+    // Slot order = free() order, so this preserves the timing signal of how
+    // the working set evolved over the run.
+    std::string format_slots_mib() const {
+        std::string line;
+        char buf[32];
+        bool first = true;
+        for (int i = 0; i < MAX_SYCL_BUFFERS; ++i) {
+            if (buffer_pool[i].ptr == nullptr) {
+                continue;
+            }
+            if (!first) line += '/';
+            first = false;
+            snprintf(buf, sizeof(buf), "%.2f", buffer_pool[i].size / 1024.0 / 1024.0);
+            line += buf;
+        }
+        return line;
+    }
+#endif
 
     void * alloc(size_t size, size_t * actual_size) override {
 #ifdef DEBUG_sycl_MALLOC
@@ -1452,6 +1489,53 @@ std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_pool_for_device(q
     //     return std::unique_ptr<ggml_sycl_pool>(new ggml_sycl_pool_vmm(device));
     // }
    return std::unique_ptr<ggml_sycl_pool>(new ggml_sycl_pool_leg(qptr, device));
+}
+
+std::unique_ptr<ggml_sycl_fattn_buffers> ggml_backend_sycl_context::new_fattn_buffers(queue_ptr qptr, int device) {
+    return std::unique_ptr<ggml_sycl_fattn_buffers>(new ggml_sycl_fattn_buffers(qptr, device));
+}
+
+void * ggml_sycl_fattn_buffers::ensure(slot & s, size_t need_bytes) {
+    if (s.capacity >= need_bytes) {
+        return s.ptr;
+    }
+    if (s.ptr) {
+        SYCL_CHECK(CHECK_TRY_ERROR(q->wait()));
+        SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(s.ptr, *q)));
+        s.ptr = nullptr;
+        s.capacity = 0;
+    }
+    size_t cap = need_bytes + need_bytes / 4 + (1ull << 20);
+    if (cap < s.min_bytes) {
+        cap = s.min_bytes;
+    }
+    SYCL_CHECK(CHECK_TRY_ERROR(s.ptr = (void *) sycl::malloc_device(cap, *q)));
+    if (s.ptr == nullptr) {
+        GGML_LOG_ERROR("%s: can't allocate %lu bytes on device\n", __func__, cap);
+        GGML_ABORT("fattn buffer alloc failed");
+    }
+    s.capacity = cap;
+    return s.ptr;
+}
+
+ggml_sycl_fattn_buffers::~ggml_sycl_fattn_buffers() {
+#ifdef DEBUG_SYCL_POOL
+    const double mib = 1024.0 * 1024.0;
+    const size_t total = K_f16.capacity + V_f16.capacity + KV_max.capacity + dst_tmp.capacity + dst_tmp_meta.capacity;
+    GGML_LOG_INFO("fattn_buffers[%d]: K_f16=%.2f V_f16=%.2f KV_max=%.2f dst_tmp=%.2f dst_tmp_meta=%.2f MiB (total=%.2f MiB)\n",
+                  device,
+                  K_f16.capacity / mib, V_f16.capacity / mib, KV_max.capacity / mib,
+                  dst_tmp.capacity / mib, dst_tmp_meta.capacity / mib,
+                  total / mib);
+#endif
+
+    slot * slots[] = { &K_f16, &V_f16, &KV_max, &dst_tmp, &dst_tmp_meta };
+    for (slot * s : slots) {
+        if (s->ptr) {
+            SYCL_CHECK(CHECK_TRY_ERROR(q->wait()));
+            SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(s->ptr, *q)));
+        }
+    }
 }
 
 // TBD pool with virtual memory management
