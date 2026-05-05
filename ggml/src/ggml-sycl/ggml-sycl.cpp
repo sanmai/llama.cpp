@@ -1491,14 +1491,12 @@ std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_pool_for_device(q
    return std::unique_ptr<ggml_sycl_pool>(new ggml_sycl_pool_leg(qptr, device));
 }
 
-std::unique_ptr<ggml_sycl_fattn_buffers> ggml_backend_sycl_context::new_fattn_buffers(queue_ptr qptr, int device) {
-    return std::unique_ptr<ggml_sycl_fattn_buffers>(new ggml_sycl_fattn_buffers(qptr, device));
+std::unique_ptr<ggml_sycl_fattn_kv_buffers> ggml_backend_sycl_context::new_fattn_kv_buffers(queue_ptr qptr, int device) {
+    return std::unique_ptr<ggml_sycl_fattn_kv_buffers>(new ggml_sycl_fattn_kv_buffers(qptr, device));
 }
 
-/**
- * Ensures the buffer has sufficient device memory.
- */
-void * ggml_sycl_fattn_buffers::buffer::ensure_bytes(size_t need_bytes) {
+sycl::half * ggml_sycl_fattn_kv_buffers::buffer::ensure_half(size_t n_elems) {
+    const size_t need_bytes = n_elems * sizeof(sycl::half);
     if (capacity >= need_bytes) {
         return ptr;
     }
@@ -1509,23 +1507,26 @@ void * ggml_sycl_fattn_buffers::buffer::ensure_bytes(size_t need_bytes) {
     }
 
     size_t cap = 0;
-    while (cap <= need_bytes) {
+    while (cap < need_bytes) {
         cap += CHUNK_SIZE;
     }
 
+    void * dev_ptr;
     SYCL_CHECK(
-        CHECK_TRY_ERROR(ptr = (void *)sycl::malloc_device(
+        CHECK_TRY_ERROR(dev_ptr = sycl::malloc_device(
                         cap, *qptr)));
 
-    if (ptr == nullptr) {
+    if (!dev_ptr) {
         GGML_LOG_ERROR("%s: can't allocate %lu Bytes of memory on device\n", __func__, cap);
         GGML_ABORT("fattn buffer alloc failed");
     }
+
+    ptr = static_cast<sycl::half *>(dev_ptr);
     capacity = cap;
     return ptr;
 }
 
-ggml_sycl_fattn_buffers::buffer::~buffer() {
+ggml_sycl_fattn_kv_buffers::buffer::~buffer() {
 #ifdef DEBUG_SYCL_POOL
     GGML_LOG_INFO("fattn_buffer[%d]: %.2f MiB\n", device, capacity / 1024.0 / 1024.0);
 #endif

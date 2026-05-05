@@ -248,7 +248,7 @@ struct ggml_sycl_pool {
     virtual void free(void * ptr, size_t size) = 0;
 };
 
-struct ggml_sycl_fattn_buffers {
+struct ggml_sycl_fattn_kv_buffers {
     // buffers grow in chunks of this size
     static constexpr size_t CHUNK_SIZE = 16ull << 20; // 16 MiB
 
@@ -259,41 +259,36 @@ struct ggml_sycl_fattn_buffers {
         buffer(const buffer &) = delete;
         buffer & operator=(const buffer &) = delete;
 
-        template <typename T>
-        T * ensure(size_t n_elems) {
-            return static_cast<T *>(ensure_bytes(n_elems * sizeof(T)));
-        }
+        sycl::half * ensure_half(size_t n_elems);
 
     private:
-        void * ensure_bytes(size_t need_bytes);
-
-        void *    ptr      = nullptr;
-        size_t    capacity = 0;
-        queue_ptr qptr     = nullptr;
-        int       device   = 0;
+        sycl::half * ptr      = nullptr;
+        size_t       capacity = 0;
+        queue_ptr    qptr     = nullptr;
+        int          device   = 0;
     };
 
     buffer K;
     buffer V;
 
-    ggml_sycl_fattn_buffers(queue_ptr qptr, int device) : K(qptr, device), V(qptr, device) {}
+    ggml_sycl_fattn_kv_buffers(queue_ptr qptr, int device) : K(qptr, device), V(qptr, device) {}
 
-    ggml_sycl_fattn_buffers(const ggml_sycl_fattn_buffers &) = delete;
-    ggml_sycl_fattn_buffers & operator=(const ggml_sycl_fattn_buffers &) = delete;
+    ggml_sycl_fattn_kv_buffers(const ggml_sycl_fattn_kv_buffers &) = delete;
+    ggml_sycl_fattn_kv_buffers & operator=(const ggml_sycl_fattn_kv_buffers &) = delete;
 };
 
 /**
- * A wrapper to fake the `ggml_sycl_pool_alloc` interface to keep downstream code unchanged.
+ * Imitates `ggml_sycl_pool_alloc` to keep the calling code unchanged.
  */
-template <typename T>
-struct ggml_sycl_fattn_view {
-    ggml_sycl_fattn_buffers::buffer & buf;
-    T *                               ptr = nullptr;
+struct ggml_sycl_fattn_alloc {
+    ggml_sycl_fattn_kv_buffers::buffer & buf;
+    sycl::half *                         ptr = nullptr;
 
-    explicit ggml_sycl_fattn_view(ggml_sycl_fattn_buffers::buffer & buf_) : buf(buf_) {}
+    explicit ggml_sycl_fattn_alloc(ggml_sycl_fattn_kv_buffers::buffer & buf_) : buf(buf_) {}
 
-    void alloc(size_t n_elems) {
-        ptr = buf.ensure<T>(n_elems);
+    sycl::half * alloc(size_t n_elems) {
+        ptr = buf.ensure_half(n_elems);
+        return ptr;
     }
 };
 
@@ -453,7 +448,7 @@ struct ggml_backend_sycl_context {
     std::unique_ptr<ggml_sycl_pool> pools[GGML_SYCL_MAX_DEVICES];
     std::unordered_map<sycl::queue *, std::unique_ptr<ggml_sycl_pool_alloc<uint8_t>>> scratchpad_map;
 
-    std::unique_ptr<ggml_sycl_fattn_buffers> fattn_bufs[GGML_SYCL_MAX_DEVICES];
+    std::unique_ptr<ggml_sycl_fattn_kv_buffers> fattn_bufs[GGML_SYCL_MAX_DEVICES];
 
     std::unique_ptr<ggml_sycl_pool> host_pools[GGML_SYCL_MAX_DEVICES];
 
@@ -461,7 +456,7 @@ struct ggml_backend_sycl_context {
 
     static std::unique_ptr<ggml_sycl_pool> new_pool_for_host(queue_ptr qptr, int device);
 
-    static std::unique_ptr<ggml_sycl_fattn_buffers> new_fattn_buffers(queue_ptr qptr, int device);
+    static std::unique_ptr<ggml_sycl_fattn_kv_buffers> new_fattn_kv_buffers(queue_ptr qptr, int device);
 
     ggml_sycl_pool & pool(int device) {
         if (pools[device] == nullptr) {
@@ -474,14 +469,14 @@ struct ggml_backend_sycl_context {
         return pool(device);
     }
 
-    ggml_sycl_fattn_buffers & fattn_buffers(int device) {
+    ggml_sycl_fattn_kv_buffers & fattn_buffers(int device) {
         if (fattn_bufs[device] == nullptr) {
-            fattn_bufs[device] = new_fattn_buffers(stream(device, 0), device);
+            fattn_bufs[device] = new_fattn_kv_buffers(stream(device, 0), device);
         }
         return *fattn_bufs[device];
     }
 
-    ggml_sycl_fattn_buffers & fattn_buffers() {
+    ggml_sycl_fattn_kv_buffers & fattn_buffers() {
         return fattn_buffers(device);
     }
 
