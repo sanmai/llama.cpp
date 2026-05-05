@@ -1501,6 +1501,7 @@ sycl::half * ggml_sycl_fattn_kv_buffers::kv_buffer::ensure_half(size_t n_elems) 
         return ptr;
     }
     if (ptr) {
+        SYCL_CHECK(CHECK_TRY_ERROR(qptr->wait()));
         SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(ptr, *qptr)));
         ptr = nullptr;
         capacity = 0;
