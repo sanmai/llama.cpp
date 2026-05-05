@@ -923,8 +923,8 @@ void launch_fattn(
     const int id  = ggml_sycl_get_device();
     const int nsm = ggml_sycl_info().devices[id].nsm;
 
-    ggml_sycl_fattn_alloc   K_f16(fbuf.K);
-    ggml_sycl_fattn_alloc   V_f16(fbuf.V);
+    ggml_sycl_fattn_alloc        K_f16(fbuf.K);
+    ggml_sycl_fattn_alloc        V_f16(fbuf.V);
     ggml_sycl_pool_alloc<int>    KV_max(pool);
     ggml_sycl_pool_alloc<float>  dst_tmp(pool);
     ggml_sycl_pool_alloc<sycl::float2> dst_tmp_meta(pool);

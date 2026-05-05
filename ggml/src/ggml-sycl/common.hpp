@@ -278,7 +278,7 @@ struct ggml_sycl_fattn_kv_buffers {
 };
 
 /**
- * Imitates `ggml_sycl_pool_alloc` to keep the calling code unchanged.
+ * Imitates `ggml_sycl_pool_alloc` to keep the code calling alloc unchanged.
  */
 struct ggml_sycl_fattn_alloc {
     ggml_sycl_fattn_kv_buffers::kv_buffer & buf;
