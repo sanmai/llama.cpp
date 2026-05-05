@@ -6,25 +6,19 @@ FROM intel/deep-learning-essentials:$ONEAPI_VERSION AS build
 
 ARG GGML_SYCL_F16=OFF
 RUN apt-get update && \
-    apt-get install -y git libssl-dev ccache
+    apt-get install -y git libssl-dev
 
 WORKDIR /app
 
 COPY . .
 
-RUN --mount=type=cache,target=/root/.cache/ccache \
-    if [ "${GGML_SYCL_F16}" = "ON" ]; then \
+RUN if [ "${GGML_SYCL_F16}" = "ON" ]; then \
         echo "GGML_SYCL_F16 is set" \
         && export OPT_SYCL_F16="-DGGML_SYCL_F16=ON"; \
     fi && \
-    ccache -M 20G && \
     echo "Building with dynamic libs" && \
-    cmake -B build -DGGML_NATIVE=OFF -DGGML_SYCL=ON \
-        -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx \
-        -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-        -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_BUILD_TESTS=OFF ${OPT_SYCL_F16} && \
-    cmake --build build --config Release -j$(nproc) && \
-    ccache -s
+    cmake -B build -DGGML_NATIVE=OFF -DGGML_SYCL=ON -DCMAKE_C_COMPILER=icx -DCMAKE_CXX_COMPILER=icpx -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DLLAMA_BUILD_TESTS=OFF ${OPT_SYCL_F16} && \
+    cmake --build build --config Release -j$(nproc)
 
 RUN mkdir -p /app/lib && \
     find build -name "*.so*" -exec cp -P {} /app/lib \;
