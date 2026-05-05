@@ -252,12 +252,12 @@ struct ggml_sycl_fattn_kv_buffers {
     // buffers grow in chunks of this size
     static constexpr size_t CHUNK_SIZE = 16ull << 20; // 16 MiB
 
-    struct buffer {
-        buffer(queue_ptr qptr_, int device_) : qptr(qptr_), device(device_) {}
-        ~buffer();
+    struct kv_buffer {
+        kv_buffer(queue_ptr qptr_, int device_) : qptr(qptr_), device(device_) {}
+        ~kv_buffer();
 
-        buffer(const buffer &) = delete;
-        buffer & operator=(const buffer &) = delete;
+        kv_buffer(const kv_buffer &) = delete;
+        kv_buffer & operator=(const kv_buffer &) = delete;
 
         sycl::half * ensure_half(size_t n_elems);
 
@@ -268,8 +268,8 @@ struct ggml_sycl_fattn_kv_buffers {
         int          device   = 0;
     };
 
-    buffer K;
-    buffer V;
+    kv_buffer K;
+    kv_buffer V;
 
     ggml_sycl_fattn_kv_buffers(queue_ptr qptr, int device) : K(qptr, device), V(qptr, device) {}
 
@@ -281,10 +281,10 @@ struct ggml_sycl_fattn_kv_buffers {
  * Imitates `ggml_sycl_pool_alloc` to keep the calling code unchanged.
  */
 struct ggml_sycl_fattn_alloc {
-    ggml_sycl_fattn_kv_buffers::buffer & buf;
+    ggml_sycl_fattn_kv_buffers::kv_buffer & buf;
     sycl::half *                         ptr = nullptr;
 
-    explicit ggml_sycl_fattn_alloc(ggml_sycl_fattn_kv_buffers::buffer & buf_) : buf(buf_) {}
+    explicit ggml_sycl_fattn_alloc(ggml_sycl_fattn_kv_buffers::kv_buffer & buf_) : buf(buf_) {}
 
     sycl::half * alloc(size_t n_elems) {
         ptr = buf.ensure_half(n_elems);

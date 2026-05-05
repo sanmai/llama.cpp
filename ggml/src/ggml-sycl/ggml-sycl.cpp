@@ -1495,7 +1495,7 @@ std::unique_ptr<ggml_sycl_fattn_kv_buffers> ggml_backend_sycl_context::new_fattn
     return std::unique_ptr<ggml_sycl_fattn_kv_buffers>(new ggml_sycl_fattn_kv_buffers(qptr, device));
 }
 
-sycl::half * ggml_sycl_fattn_kv_buffers::buffer::ensure_half(size_t n_elems) {
+sycl::half * ggml_sycl_fattn_kv_buffers::kv_buffer::ensure_half(size_t n_elems) {
     const size_t need_bytes = n_elems * sizeof(sycl::half);
     if (capacity >= need_bytes) {
         return ptr;
@@ -1526,9 +1526,9 @@ sycl::half * ggml_sycl_fattn_kv_buffers::buffer::ensure_half(size_t n_elems) {
     return ptr;
 }
 
-ggml_sycl_fattn_kv_buffers::buffer::~buffer() {
+ggml_sycl_fattn_kv_buffers::kv_buffer::~kv_buffer() {
 #ifdef DEBUG_SYCL_POOL
-    GGML_LOG_INFO("fattn_buffer[%d]: %.2f MiB\n", device, capacity / 1024.0 / 1024.0);
+    GGML_LOG_INFO("ggml_sycl_fattn_kv_buffer[%d]: %.2f MiB\n", device, capacity / 1024.0 / 1024.0);
 #endif
     if (ptr) {
         SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(ptr, *qptr)));
