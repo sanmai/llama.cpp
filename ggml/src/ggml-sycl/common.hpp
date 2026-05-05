@@ -248,7 +248,6 @@ struct ggml_sycl_pool {
     virtual void free(void * ptr, size_t size) = 0;
 };
 
-
 struct ggml_sycl_fattn_buffers {
     struct slot {
         void * ptr = nullptr;
