@@ -1702,6 +1702,10 @@ std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_pool_for_host(que
     return std::unique_ptr<ggml_sycl_pool>(new ggml_sycl_pool_host(qptr, device));
 }
 
+std::unique_ptr<ggml_sycl_fattn_buffers> ggml_backend_sycl_context::new_fattn_buffers(queue_ptr qptr, int device) {
+    return std::unique_ptr<ggml_sycl_fattn_buffers>(new ggml_sycl_fattn_buffers(qptr, device));
+}
+
 std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_pool_for_device(queue_ptr qptr, int device) {
     return new_pool_for_device(qptr, device, 256, "legacy");
 }
