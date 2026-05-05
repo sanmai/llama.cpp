@@ -1529,15 +1529,14 @@ void * ggml_sycl_fattn_buffers::ensure(slot & s, size_t need_bytes) {
 ggml_sycl_fattn_buffers::~ggml_sycl_fattn_buffers() {
 #ifdef DEBUG_SYCL_POOL
     const double mib = 1024.0 * 1024.0;
-    const size_t total = K_f16.capacity + V_f16.capacity + KV_max.capacity + dst_tmp.capacity + dst_tmp_meta.capacity;
-    GGML_LOG_INFO("fattn_buffers[%d]: K_f16=%.2f V_f16=%.2f KV_max=%.2f dst_tmp=%.2f dst_tmp_meta=%.2f MiB (total=%.2f MiB)\n",
+    const size_t total = K_f16.capacity + V_f16.capacity;
+    GGML_LOG_INFO("fattn_buffers[%d]: K_f16=%.2f V_f16=%.2f MiB (total=%.2f MiB)\n",
                   device,
-                  K_f16.capacity / mib, V_f16.capacity / mib, KV_max.capacity / mib,
-                  dst_tmp.capacity / mib, dst_tmp_meta.capacity / mib,
+                  K_f16.capacity / mib, V_f16.capacity / mib,
                   total / mib);
 #endif
 
-    slot * slots[] = { &K_f16, &V_f16, &KV_max, &dst_tmp, &dst_tmp_meta };
+    slot * slots[] = { &K_f16, &V_f16 };
     for (slot * s : slots) {
         if (s->ptr) {
             SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(s->ptr, *qptr)));
