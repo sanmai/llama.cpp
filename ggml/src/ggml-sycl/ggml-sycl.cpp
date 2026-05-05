@@ -1292,7 +1292,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
         }
         GGML_LOG_INFO("%s: %d buffers, cached = %.2f MiB\n", __func__,
                       n_cached, bytes_cached / 1024.0 / 1024.0);
-        const auto slots = format_slots_alloc_order();
+        const auto slots = format_slots_in_alloc_order();
         if (!slots.empty()) {
             GGML_LOG_INFO("%s: slots MiB: %s\n", __func__, slots.c_str());
         }
@@ -1309,7 +1309,7 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
     }
 
 #ifdef DEBUG_SYCL_POOL
-    std::string format_slots_alloc_order() const {
+    std::string format_slots_in_alloc_order() const {
         std::string line;
         char buf[32];
         bool first = true;
