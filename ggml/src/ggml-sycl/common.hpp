@@ -253,7 +253,7 @@ struct ggml_sycl_fattn_buffers {
     static constexpr size_t CHUNK_SIZE = 16ull << 20; // 16 MiB
 
     struct buffer {
-        buffer(queue_ptr qptr_, int device_) : qptr(qptr_), device(device_) {}
+        buffer(queue_ptr qptr_, int device_, const char * name_) : qptr(qptr_), device(device_), name(name_) {}
         ~buffer();
 
         buffer(const buffer &) = delete;
@@ -267,16 +267,17 @@ struct ggml_sycl_fattn_buffers {
     private:
         void * ensure_bytes(size_t need_bytes);
 
-        void *    ptr      = nullptr;
-        size_t    capacity = 0;
-        queue_ptr qptr     = nullptr;
-        int       device   = 0;
+        void *       ptr      = nullptr;
+        size_t       capacity = 0;
+        queue_ptr    qptr     = nullptr;
+        int          device   = 0;
+        const char * name     = "";
     };
 
     buffer K;
     buffer V;
 
-    ggml_sycl_fattn_buffers(queue_ptr qptr, int device) : K(qptr, device), V(qptr, device) {}
+    ggml_sycl_fattn_buffers(queue_ptr qptr, int device) : K(qptr, device, "K"), V(qptr, device, "V") {}
 
     ggml_sycl_fattn_buffers(const ggml_sycl_fattn_buffers &) = delete;
     ggml_sycl_fattn_buffers & operator=(const ggml_sycl_fattn_buffers &) = delete;
