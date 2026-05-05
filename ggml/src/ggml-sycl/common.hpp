@@ -249,8 +249,8 @@ struct ggml_sycl_pool {
 };
 
 struct ggml_sycl_fattn_buffers {
-    // Allocation floor to minimize early reallocations
-    static constexpr size_t PREFILL_FLOOR = 16ull << 20; // 16 MiB
+    // buffers grow in chunks of this size
+    static constexpr size_t CHUNK_SIZE = 16ull << 20; // 16 MiB
 
     struct buffer {
         buffer(queue_ptr qptr_, int device_) : qptr(qptr_), device(device_) {}
