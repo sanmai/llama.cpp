@@ -246,13 +246,44 @@ struct ggml_sycl_pool {
 
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
-
-    // Called at the end of a graph compute. Pools may use this to trim cached
-    // buffers that no longer match the working-set size of recent allocations.
-    virtual void on_compute_end() {}
 };
 
-static constexpr int GGML_SYCL_FATTN_POOL_MAX_BUFFERS = 5;
+// Per-context flash-attention scratch buffers. One named slot per role; each
+// slot grows on demand and is freed only when the SYCL context is destroyed.
+// K_f16 and V_f16 carry a 16 MiB floor so the prefill ramp doesn't churn the
+// allocator on every batch boundary.
+struct ggml_sycl_fattn_buffers {
+    explicit ggml_sycl_fattn_buffers(queue_ptr q) : q(q) {}
+    ~ggml_sycl_fattn_buffers();
+
+    ggml_sycl_fattn_buffers(const ggml_sycl_fattn_buffers &) = delete;
+    ggml_sycl_fattn_buffers & operator=(const ggml_sycl_fattn_buffers &) = delete;
+
+    sycl::half *   ensure_K_f16(size_t n)         { return (sycl::half *)   ensure(K_f16,        n * sizeof(sycl::half));   }
+    sycl::half *   ensure_V_f16(size_t n)         { return (sycl::half *)   ensure(V_f16,        n * sizeof(sycl::half));   }
+    int *          ensure_KV_max(size_t n)        { return (int *)          ensure(KV_max,       n * sizeof(int));          }
+    float *        ensure_dst_tmp(size_t n)       { return (float *)        ensure(dst_tmp,      n * sizeof(float));        }
+    sycl::float2 * ensure_dst_tmp_meta(size_t n)  { return (sycl::float2 *) ensure(dst_tmp_meta, n * sizeof(sycl::float2)); }
+
+private:
+    queue_ptr q = nullptr;
+
+    struct slot {
+        void * ptr = nullptr;
+        size_t capacity = 0;
+        size_t min_bytes = 0;
+    };
+
+    static constexpr size_t LARGE_MIN = 16ull << 20;
+
+    slot K_f16        { nullptr, 0, LARGE_MIN };
+    slot V_f16        { nullptr, 0, LARGE_MIN };
+    slot KV_max;
+    slot dst_tmp;
+    slot dst_tmp_meta;
+
+    void * ensure(slot & s, size_t need_bytes);
+};
 
 template<typename T>
 struct ggml_sycl_pool_alloc {
@@ -410,15 +441,13 @@ struct ggml_backend_sycl_context {
     std::unique_ptr<ggml_sycl_pool> pools[GGML_SYCL_MAX_DEVICES];
     std::unordered_map<sycl::queue *, std::unique_ptr<ggml_sycl_pool_alloc<uint8_t>>> scratchpad_map;
 
-    std::unique_ptr<ggml_sycl_pool> fattn_pools[GGML_SYCL_MAX_DEVICES];
+    std::unique_ptr<ggml_sycl_fattn_buffers> fattn_bufs[GGML_SYCL_MAX_DEVICES];
 
     std::unique_ptr<ggml_sycl_pool> host_pools[GGML_SYCL_MAX_DEVICES];
 
     static std::unique_ptr<ggml_sycl_pool> new_pool_for_device(queue_ptr qptr, int device);
 
     static std::unique_ptr<ggml_sycl_pool> new_pool_for_device(queue_ptr qptr, int device, int max_buffers, const char * label = nullptr);
-
-    static std::unique_ptr<ggml_sycl_pool> new_pool_for_fattn(queue_ptr qptr, int device, ggml_sycl_pool & legacy);
 
     static std::unique_ptr<ggml_sycl_pool> new_pool_for_host(queue_ptr qptr, int device);
 
@@ -433,27 +462,15 @@ struct ggml_backend_sycl_context {
         return pool(device);
     }
 
-    ggml_sycl_pool & fattn_pool(int device) {
-        if (fattn_pools[device] == nullptr) {
-            // Touch pool() first so the legacy pool is constructed and we can
-            // pass a stable reference for delegating small fattn allocations.
-            ggml_sycl_pool & legacy = pool(device);
-            fattn_pools[device] = new_pool_for_fattn(stream(device, 0), device, legacy);
+    ggml_sycl_fattn_buffers & fattn_buffers(int device) {
+        if (fattn_bufs[device] == nullptr) {
+            fattn_bufs[device].reset(new ggml_sycl_fattn_buffers(stream(device, 0)));
         }
-        return *fattn_pools[device];
+        return *fattn_bufs[device];
     }
 
-    ggml_sycl_pool & fattn_pool() {
-        return fattn_pool(device);
-    }
-
-    // Notify the current device's fattn pool that a graph compute just ended,
-    // so it can trim cached buffers whose size no longer reflects demand.
-    // No-op if the fattn pool was never instantiated.
-    void trim_fattn_pool() {
-        if (fattn_pools[device] != nullptr) {
-            fattn_pools[device]->on_compute_end();
-        }
+    ggml_sycl_fattn_buffers & fattn_buffers() {
+        return fattn_buffers(device);
     }
 
 #ifdef GGML_SYCL_GRAPH

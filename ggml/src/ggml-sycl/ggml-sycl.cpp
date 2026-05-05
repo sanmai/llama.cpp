@@ -28,7 +28,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <regex>
-#include <unordered_set>
 
 #include <sycl/sycl.hpp>
 #if defined(GGML_SYCL_GRAPH) && SYCL_EXT_ONEAPI_ASYNC_MEMORY_ALLOC
@@ -1624,54 +1623,6 @@ struct ggml_sycl_pool_leg : public ggml_sycl_pool {
     }
 };
 
-struct ggml_sycl_pool_fattn : public ggml_sycl_pool_leg {
-    // Alloc routes by request size: anything below REQUEST_THRESHOLD goes to
-    // the legacy (general) pool, which has 256 slots and absorbs the small
-    // working set at near-100% hit rate. Larger requests (the K_f16/V_f16
-    // buffers that scale with KV) stay in this pool's own slots and are
-    // dropped at end of graph.
-    //
-    // Free routes by provenance: we track every ptr we delegated to legacy
-    // and route its free back through legacy. Otherwise legacy's best-fit
-    // can hand back a non-fattn caller's bigger cached buffer, and routing
-    // by size alone would orphan that buffer in the wrong pool on free.
-    static constexpr size_t REQUEST_THRESHOLD = 16ull << 20; // 16 MiB
-
-    ggml_sycl_pool & legacy_pool;
-    std::unordered_set<void *> delegated;
-
-    explicit ggml_sycl_pool_fattn(queue_ptr qptr, int device, ggml_sycl_pool & legacy) :
-        ggml_sycl_pool_leg(qptr, device, GGML_SYCL_FATTN_POOL_MAX_BUFFERS, "fattn"),
-        legacy_pool(legacy) {}
-
-    size_t get_alloc_size(size_t size) const override {
-        return (size_t) (1.25 * size) + 1024 * 1024;
-    }
-
-    void * alloc(size_t size, size_t * actual_size) override {
-        if (size < REQUEST_THRESHOLD) {
-            void * ptr = legacy_pool.alloc(size, actual_size);
-            delegated.insert(ptr);
-            return ptr;
-        }
-        return ggml_sycl_pool_leg::alloc(size, actual_size);
-    }
-
-    void free(void * ptr, size_t size) override {
-        if (delegated.erase(ptr) > 0) {
-            legacy_pool.free(ptr, size);
-            return;
-        }
-        ggml_sycl_pool_leg::free(ptr, size);
-    }
-
-    // Experiment: drop every cached large-slot at end of graph. Small-slot
-    // working set lives in the legacy pool and is left alone.
-    void on_compute_end() override {
-        clear_pool();
-    }
-};
-
 struct ggml_sycl_pool_host : public ggml_sycl_pool {
     queue_ptr qptr;
     int       device;
@@ -1763,8 +1714,35 @@ std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_pool_for_device(q
    return std::unique_ptr<ggml_sycl_pool>(new ggml_sycl_pool_leg(qptr, device, max_buffers, label));
 }
 
-std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_pool_for_fattn(queue_ptr qptr, int device, ggml_sycl_pool & legacy) {
-   return std::unique_ptr<ggml_sycl_pool>(new ggml_sycl_pool_fattn(qptr, device, legacy));
+void * ggml_sycl_fattn_buffers::ensure(slot & s, size_t need_bytes) {
+    if (s.capacity >= need_bytes) {
+        return s.ptr;
+    }
+    if (s.ptr) {
+        SYCL_CHECK(CHECK_TRY_ERROR(q->wait()));
+        SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(s.ptr, *q)));
+        s.ptr = nullptr;
+        s.capacity = 0;
+    }
+    size_t cap = need_bytes < s.min_bytes ? s.min_bytes : need_bytes;
+    cap = cap + cap / 4 + (1ull << 20);
+    SYCL_CHECK(CHECK_TRY_ERROR(s.ptr = (void *) sycl::malloc_device(cap, *q)));
+    if (s.ptr == nullptr) {
+        GGML_LOG_ERROR("%s: can't allocate %lu bytes on device\n", __func__, cap);
+        GGML_ABORT("fattn buffer alloc failed");
+    }
+    s.capacity = cap;
+    return s.ptr;
+}
+
+ggml_sycl_fattn_buffers::~ggml_sycl_fattn_buffers() {
+    slot * slots[] = { &K_f16, &V_f16, &KV_max, &dst_tmp, &dst_tmp_meta };
+    for (slot * s : slots) {
+        if (s->ptr) {
+            SYCL_CHECK(CHECK_TRY_ERROR(q->wait()));
+            SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(s->ptr, *q)));
+        }
+    }
 }
 
 // TBD pool with virtual memory management
@@ -4884,8 +4862,6 @@ static void ggml_backend_sycl_graph_compute_impl(ggml_backend_sycl_context * syc
         }
         GGML_ASSERT(ok);
     }
-
-    sycl_ctx->trim_fattn_pool();
 }
 
 #ifdef GGML_SYCL_GRAPH

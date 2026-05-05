@@ -921,22 +921,16 @@ void launch_fattn(
     const int id  = ggml_sycl_get_device();
     const int nsm = ggml_sycl_info().devices[id].nsm;
 
-    ggml_sycl_pool & pool = ctx.fattn_pool();
+    ggml_sycl_fattn_buffers & fbuf = ctx.fattn_buffers();
 
-    // Keep GGML_SYCL_FATTN_POOL_MAX_BUFFERS in sync with these temp allocation sites.
-    ggml_sycl_pool_alloc<sycl::half>   K_f16(pool);
-    ggml_sycl_pool_alloc<sycl::half>   V_f16(pool);
-    ggml_sycl_pool_alloc<int>          KV_max(pool);
-    ggml_sycl_pool_alloc<float>        dst_tmp(pool);
-    ggml_sycl_pool_alloc<sycl::float2> dst_tmp_meta(pool);
-
-// #define MEM_FAULT_FATTN_POOL
-#ifdef MEM_FAULT_FATTN_POOL
-    ggml_sycl_pool_alloc<float> rogue(pool);
-    const size_t rogue_n = K->ne[1] * 65536;
-    rogue.alloc(rogue_n);
-    main_stream->memset(rogue.ptr, 0xAB, rogue_n * sizeof(float)).wait();
-#endif
+    // Each role is a persistent grow-only slot in fbuf; pointers stay nullptr
+    // unless the current call needs that role, so the kernel still sees
+    // nullptr for unused buffers.
+    sycl::half *   K_f16_ptr        = nullptr;
+    sycl::half *   V_f16_ptr        = nullptr;
+    int *          KV_max_ptr       = nullptr;
+    float *        dst_tmp_ptr      = nullptr;
+    sycl::float2 * dst_tmp_meta_ptr = nullptr;
 
 
     const char * K_data = (const char *) K->data;
@@ -953,10 +947,10 @@ void launch_fattn(
         const size_t bs = ggml_blck_size(K->type);
         const size_t ts = ggml_type_size(K->type);
 
-        K_f16.alloc(ggml_nelements(K));
+        K_f16_ptr = fbuf.ensure_K_f16(ggml_nelements(K));
         if (ggml_is_contiguously_allocated(K)) {
             to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(K->type, dst);
-            to_fp16(K_data, K_f16.ptr, ggml_nelements(K), main_stream);
+            to_fp16(K_data, K_f16_ptr, ggml_nelements(K), main_stream);
 
             nb11 = nb11 * bs * sizeof(sycl::half) / ts;
             nb12 = nb12 * bs * sizeof(sycl::half) / ts;
@@ -967,13 +961,13 @@ void launch_fattn(
             const int64_t s01 = nb11 / ts;
             const int64_t s02 = nb12 / ts;
             const int64_t s03 = nb13 / ts;
-            to_fp16(K_data, K_f16.ptr, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
+            to_fp16(K_data, K_f16_ptr, K->ne[0], K->ne[1], K->ne[2], K->ne[3], s01, s02, s03, main_stream);
 
             nb11 = K->ne[0] * sizeof(sycl::half);
             nb12 = K->ne[1] * nb11;
             nb13 = K->ne[2] * nb12;
         }
-        K_data = (char *) K_f16.ptr;
+        K_data = (char *) K_f16_ptr;
     }
 
     if (need_f16_V && V->type != GGML_TYPE_F16) {
@@ -986,11 +980,11 @@ void launch_fattn(
             const size_t bs = ggml_blck_size(V->type);
             const size_t ts = ggml_type_size(V->type);
 
-            V_f16.alloc(ggml_nelements(V));
+            V_f16_ptr = fbuf.ensure_V_f16(ggml_nelements(V));
             if (ggml_is_contiguously_allocated(V)) {
                 to_fp16_sycl_t to_fp16 = ggml_get_to_fp16_sycl(V->type, dst);
-                to_fp16(V_data, V_f16.ptr, ggml_nelements(V), main_stream);
-                V_data = (char *) V_f16.ptr;
+                to_fp16(V_data, V_f16_ptr, ggml_nelements(V), main_stream);
+                V_data = (char *) V_f16_ptr;
 
                 nb21 = nb21 * bs * sizeof(sycl::half) / ts;
                 nb22 = nb22 * bs * sizeof(sycl::half) / ts;
@@ -1001,13 +995,13 @@ void launch_fattn(
                 const int64_t s01 = nb21 / ts;
                 const int64_t s02 = nb22 / ts;
                 const int64_t s03 = nb23 / ts;
-                to_fp16(V_data, V_f16.ptr, V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
+                to_fp16(V_data, V_f16_ptr, V->ne[0], V->ne[1], V->ne[2], V->ne[3], s01, s02, s03, main_stream);
 
                 nb21 = V->ne[0] * sizeof(sycl::half);
                 nb22 = V->ne[1] * nb21;
                 nb23 = V->ne[2] * nb22;
             }
-            V_data = (char *) V_f16.ptr;
+            V_data = (char *) V_f16_ptr;
         }
     }
 
@@ -1029,7 +1023,7 @@ void launch_fattn(
         const int ne_KV_max = blocks_num_KV_max.x*blocks_num_KV_max.y;
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
 
-        KV_max.alloc(ne_KV_max);
+        KV_max_ptr = fbuf.ensure_KV_max(ne_KV_max);
         {
             dpct::has_capability_or_fail(main_stream->get_device(), { sycl::aspect::fp16 });
 
@@ -1037,7 +1031,7 @@ void launch_fattn(
                 sycl::local_accessor<int, 1> buf_iw_acc_ct1(sycl::range<1>(warp_size), cgh);
 
                 auto mask_data_ct0  = (const sycl::half2 *) mask->data;
-                auto KV_max_ptr_ct1 = KV_max.ptr;
+                auto KV_max_ptr_ct1 = KV_max_ptr;
 
                 cgh.parallel_for(sycl::nd_range<3>(blocks_num_KV_max * block_dim_KV_max, block_dim_KV_max),
                                  [=](sycl::nd_item<3> item_ct1) {
@@ -1068,7 +1062,7 @@ void launch_fattn(
         blocks_num.z = 1;
 
         if (ntiles_total % blocks_num.x != 0) { // Fixup is only needed if the SMs work on fractional tiles.
-            dst_tmp_meta.alloc((size_t(blocks_num.x) * ncols * (2 + DV/2)));
+            dst_tmp_meta_ptr = fbuf.ensure_dst_tmp_meta(size_t(blocks_num.x) * ncols * (2 + DV/2));
         }
     } else {
         const int ntiles_KQ = (K->ne[1] + nbatch_fa - 1) / nbatch_fa; // Max. number of parallel blocks limited by tensor size.
@@ -1105,8 +1099,8 @@ void launch_fattn(
         blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
 
         if (parallel_blocks > 1) {
-            dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
-            dst_tmp_meta.alloc(parallel_blocks*ggml_nrows(KQV));
+            dst_tmp_ptr      = fbuf.ensure_dst_tmp(size_t(parallel_blocks) * ggml_nelements(KQV));
+            dst_tmp_meta_ptr = fbuf.ensure_dst_tmp_meta(size_t(parallel_blocks) * ggml_nrows(KQV));
         }
     }
 
@@ -1135,8 +1129,8 @@ void launch_fattn(
 
     lauch_kernel<fattn_kernel, warp_size>(
         blocks_num, block_dim, main_stream, (unsigned int) nbytes_shared, (const char *) Q->data, K_data, V_data,
-        mask ? ((const char *) mask->data) : nullptr, sinks ? ((const char *) sinks->data) : nullptr, KV_max.ptr,
-        !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, (sycl::float2 *)dst_tmp_meta.ptr, scale, max_bias, m0, m1,
+        mask ? ((const char *) mask->data) : nullptr, sinks ? ((const char *) sinks->data) : nullptr, KV_max_ptr,
+        !stream_k && parallel_blocks > 1 ? dst_tmp_ptr : (float *) KQV->data, dst_tmp_meta_ptr, scale, max_bias, m0, m1,
         n_head_log2, logit_softcap, Q->ne[0], ne01, Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3], K->ne[0],
         K->ne[1], K->ne[2], K->ne[3], nb11, nb12, nb13, nb21, nb22, nb23, mask ? mask->ne[1] : 0,
         mask ? mask->ne[2] : 0, mask ? mask->ne[3] : 0, mask ? mask->nb[1] : 0, mask ? mask->nb[2] : 0,
@@ -1150,7 +1144,7 @@ void launch_fattn(
 
             main_stream->submit([&](sycl::handler & cgh) {
                 auto KQV_data_ct0         = (float *) KQV->data;
-                auto dst_tmp_meta_ptr_ct1 = dst_tmp_meta.ptr;
+                auto dst_tmp_meta_ptr_ct1 = dst_tmp_meta_ptr;
                 auto Q_ne_ct2             = Q->ne[1];
                 auto Q_ne_ct3             = Q->ne[2];
                 auto Q_ne_ct4             = Q->ne[3];
@@ -1173,8 +1167,8 @@ void launch_fattn(
         main_stream->submit([&](sycl::handler & cgh) {
             sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(sycl::range<1>(nbytes_shared_combine), cgh);
 
-            auto dst_tmp_ptr_ct0      = dst_tmp.ptr;
-            auto dst_tmp_meta_ptr_ct1 = dst_tmp_meta.ptr;
+            auto dst_tmp_ptr_ct0      = dst_tmp_ptr;
+            auto dst_tmp_meta_ptr_ct1 = dst_tmp_meta_ptr;
             auto KQV_data_ct2         = (float *) KQV->data;
 
             cgh.parallel_for(sycl::nd_range<3>(blocks_num_combine * block_dim_combine, block_dim_combine),
