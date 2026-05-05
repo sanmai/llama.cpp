@@ -1724,8 +1724,10 @@ void * ggml_sycl_fattn_buffers::ensure(slot & s, size_t need_bytes) {
         s.ptr = nullptr;
         s.capacity = 0;
     }
-    size_t cap = need_bytes < s.min_bytes ? s.min_bytes : need_bytes;
-    cap = cap + cap / 4 + (1ull << 20);
+    size_t cap = need_bytes + need_bytes / 4 + (1ull << 20);
+    if (cap < s.min_bytes) {
+        cap = s.min_bytes;
+    }
     SYCL_CHECK(CHECK_TRY_ERROR(s.ptr = (void *) sycl::malloc_device(cap, *q)));
     if (s.ptr == nullptr) {
         GGML_LOG_ERROR("%s: can't allocate %lu bytes on device\n", __func__, cap);
@@ -1736,6 +1738,14 @@ void * ggml_sycl_fattn_buffers::ensure(slot & s, size_t need_bytes) {
 }
 
 ggml_sycl_fattn_buffers::~ggml_sycl_fattn_buffers() {
+    const double mib = 1024.0 * 1024.0;
+    const size_t total = K_f16.capacity + V_f16.capacity + KV_max.capacity + dst_tmp.capacity + dst_tmp_meta.capacity;
+    GGML_LOG_INFO("fattn_buffers[%d]: K_f16=%.2f V_f16=%.2f KV_max=%.2f dst_tmp=%.2f dst_tmp_meta=%.2f MiB (total=%.2f MiB)\n",
+                  device,
+                  K_f16.capacity / mib, V_f16.capacity / mib, KV_max.capacity / mib,
+                  dst_tmp.capacity / mib, dst_tmp_meta.capacity / mib,
+                  total / mib);
+
     slot * slots[] = { &K_f16, &V_f16, &KV_max, &dst_tmp, &dst_tmp_meta };
     for (slot * s : slots) {
         if (s->ptr) {

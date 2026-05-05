@@ -253,21 +253,6 @@ struct ggml_sycl_pool {
 // K_f16 and V_f16 carry a 16 MiB floor so the prefill ramp doesn't churn the
 // allocator on every batch boundary.
 struct ggml_sycl_fattn_buffers {
-    explicit ggml_sycl_fattn_buffers(queue_ptr q) : q(q) {}
-    ~ggml_sycl_fattn_buffers();
-
-    ggml_sycl_fattn_buffers(const ggml_sycl_fattn_buffers &) = delete;
-    ggml_sycl_fattn_buffers & operator=(const ggml_sycl_fattn_buffers &) = delete;
-
-    sycl::half *   ensure_K_f16(size_t n)         { return (sycl::half *)   ensure(K_f16,        n * sizeof(sycl::half));   }
-    sycl::half *   ensure_V_f16(size_t n)         { return (sycl::half *)   ensure(V_f16,        n * sizeof(sycl::half));   }
-    int *          ensure_KV_max(size_t n)        { return (int *)          ensure(KV_max,       n * sizeof(int));          }
-    float *        ensure_dst_tmp(size_t n)       { return (float *)        ensure(dst_tmp,      n * sizeof(float));        }
-    sycl::float2 * ensure_dst_tmp_meta(size_t n)  { return (sycl::float2 *) ensure(dst_tmp_meta, n * sizeof(sycl::float2)); }
-
-private:
-    queue_ptr q = nullptr;
-
     struct slot {
         void * ptr = nullptr;
         size_t capacity = 0;
@@ -282,7 +267,34 @@ private:
     slot dst_tmp;
     slot dst_tmp_meta;
 
+    ggml_sycl_fattn_buffers(queue_ptr q, int device) : q(q), device(device) {}
+    ~ggml_sycl_fattn_buffers();
+
+    ggml_sycl_fattn_buffers(const ggml_sycl_fattn_buffers &) = delete;
+    ggml_sycl_fattn_buffers & operator=(const ggml_sycl_fattn_buffers &) = delete;
+
     void * ensure(slot & s, size_t need_bytes);
+
+private:
+    queue_ptr q = nullptr;
+    int       device = 0;
+};
+
+// Typed view over a single slot. Mirrors the call-site shape of
+// ggml_sycl_pool_alloc<T>: bind once, then alloc(n_elements) and read .ptr.
+// The view does not own the buffer; the underlying slot persists across calls.
+template <typename T>
+struct ggml_sycl_fattn_slot_view {
+    ggml_sycl_fattn_buffers &       fbuf;
+    ggml_sycl_fattn_buffers::slot & s;
+    T *                             ptr = nullptr;
+
+    ggml_sycl_fattn_slot_view(ggml_sycl_fattn_buffers & fbuf, ggml_sycl_fattn_buffers::slot & s)
+        : fbuf(fbuf), s(s) {}
+
+    void alloc(size_t n_elements) {
+        ptr = (T *) fbuf.ensure(s, n_elements * sizeof(T));
+    }
 };
 
 template<typename T>
@@ -464,7 +476,7 @@ struct ggml_backend_sycl_context {
 
     ggml_sycl_fattn_buffers & fattn_buffers(int device) {
         if (fattn_bufs[device] == nullptr) {
-            fattn_bufs[device].reset(new ggml_sycl_fattn_buffers(stream(device, 0)));
+            fattn_bufs[device].reset(new ggml_sycl_fattn_buffers(stream(device, 0), device));
         }
         return *fattn_bufs[device];
     }
