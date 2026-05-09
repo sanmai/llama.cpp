@@ -3070,6 +3070,27 @@ static void ggml_sycl_op_mul_mat(ggml_backend_sycl_context & ctx, const ggml_ten
         int64_t is_max = (ne11 + MUL_MAT_SRC1_COL_STRIDE - 1) / MUL_MAT_SRC1_COL_STRIDE;
         is_max = is_max <= GGML_SYCL_MAX_STREAMS ? is_max : GGML_SYCL_MAX_STREAMS;
 
+        GGML_SYCL_DEBUG("[SYCL][TENSOR-SPLIT] mul_mat ne11=%ld stride=%d slots=%ld devices=%d\n",
+                        (long) ne11, (int) MUL_MAT_SRC1_COL_STRIDE, (long) is_max,
+                        ggml_sycl_info().device_count);
+
+        // each non-main device's slot 0 waits on its own slots 1..is_max-1, so
+        // buffers allocated from its slot-0 pool (and used across slots) are
+        // safe to reuse on slot 0 after this op returns. before commit
+        // 7277d77b1 every slot aliased slot 0 and this dep was implicit; now
+        // slots are distinct queues and must be joined explicitly.
+        for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
+            if (i == ctx.device || dev[i].row_low == dev[i].row_high) {
+                continue;
+            }
+            ggml_sycl_set_device(i);
+            for (int64_t is = 1; is < is_max; ++is) {
+                SYCL_CHECK(CHECK_TRY_ERROR(
+                    ctx.stream(i, 0)->ext_oneapi_submit_barrier(
+                        {*src0_extra->events[i][is]})));
+            }
+        }
+
         ggml_sycl_set_device(ctx.device);
         for (int i = 0; i < ggml_sycl_info().device_count; ++i) {
             if (dev[i].row_low == dev[i].row_high) {
