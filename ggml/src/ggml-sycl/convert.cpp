@@ -1,6 +1,5 @@
 #include "convert.hpp"
 #include "dequantize.hpp"
-#include "dequantize_esimd.hpp"
 #include "presets.hpp"
 
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
@@ -124,14 +123,6 @@ static void dequantize_row_q4_0_sycl(const void *vx, dst_t *y, const int64_t k,
                                  dequantize_block_q4_0(vx, y, nb32, item_ct1);
                              });
     }
-}
-
-template <typename dst_t>
-static void dequantize_row_q4_0_sycl_esimd(const void *vx, dst_t *y, const int64_t k,
-                                           dpct::queue_ptr stream) {
-    const int64_t n_blocks = k / QK4_0;
-    omni_xpu::gguf::dequantize_q4_0_kernel<dst_t>(
-        static_cast<const uint8_t *>(vx), y, n_blocks, stream);
 }
 
 template <typename dst_t>
@@ -642,8 +633,6 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
             if (dst->src[0]->extra &&
                 ((ggml_tensor_extra_gpu*)dst->src[0]->extra)->optimized_feature.reorder) {
                 return dequantize_row_q4_0_sycl_reorder;
-            } else if (g_ggml_sycl_dequant_esimd) {
-                return dequantize_row_q4_0_sycl_esimd;
             } else {
                 return dequantize_block_sycl<QK4_0, QR4_0, dequantize_q4_0>;
             }
@@ -722,8 +711,6 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
             if (dst->src[0]->extra &&
                 ((ggml_tensor_extra_gpu*)dst->src[0]->extra)->optimized_feature.reorder) {
                 return dequantize_row_q4_0_sycl_reorder;
-            } else if (g_ggml_sycl_dequant_esimd) {
-                return dequantize_row_q4_0_sycl_esimd;
             } else {
                 return dequantize_row_q4_0_sycl;
             }
