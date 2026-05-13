@@ -72,6 +72,7 @@ int g_ggml_sycl_debug = 0;
 int g_ggml_sycl_disable_optimize = 0;
 int g_ggml_sycl_disable_graph = 0;
 int g_ggml_sycl_disable_dnn = 0;
+int g_ggml_sycl_disable_vmm = 0;
 int g_ggml_sycl_prioritize_dmmv = 0;
 int g_ggml_sycl_use_async_mem_op = 0;
 int g_ggml_sycl_enable_flash_attention = 1;
@@ -246,6 +247,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_disable_optimize = get_sycl_env("GGML_SYCL_DISABLE_OPT", 0);
         g_ggml_sycl_disable_graph = get_sycl_env("GGML_SYCL_DISABLE_GRAPH", 1);
         g_ggml_sycl_disable_dnn = get_sycl_env("GGML_SYCL_DISABLE_DNN", 0);
+        g_ggml_sycl_disable_vmm = get_sycl_env("GGML_SYCL_DISABLE_VMM", 0);
         g_ggml_sycl_prioritize_dmmv = get_sycl_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
         g_ggml_sycl_dequant_esimd   = get_sycl_env("GGML_SYCL_DEQUANT_ESIMD", 0);
 
@@ -278,6 +280,11 @@ static void ggml_check_sycl() try {
 #else
         GGML_LOG_INFO("  GGML_SYCL_DNNL: no\n");
 #endif
+#if defined(GGML_SYCL_USE_VMM)
+        GGML_LOG_INFO("  GGML_SYCL_USE_VMM: yes\n");
+#else
+        GGML_LOG_INFO("  GGML_SYCL_USE_VMM: no\n");
+#endif
 
         GGML_LOG_INFO("Running with Environment Variables:\n");
         GGML_LOG_INFO("  GGML_SYCL_DEBUG: %d\n", g_ggml_sycl_debug);
@@ -291,6 +298,9 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_DISABLE_DNN: %d\n", g_ggml_sycl_disable_dnn);
 #else
         GGML_LOG_INFO("  GGML_SYCL_DISABLE_DNN: DNN disabled by compile flag\n");
+#endif
+#if defined(GGML_SYCL_USE_VMM)
+        GGML_LOG_INFO("  GGML_SYCL_DISABLE_VMM: %d\n", g_ggml_sycl_disable_vmm);
 #endif
         GGML_LOG_INFO("  GGML_SYCL_PRIORITIZE_DMMV: %d\n", g_ggml_sycl_prioritize_dmmv);
         GGML_LOG_INFO("  GGML_SYCL_DEQUANT_ESIMD: %d\n", g_ggml_sycl_dequant_esimd);
@@ -1631,12 +1641,10 @@ std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_pool_for_host(que
 
 std::unique_ptr<ggml_sycl_pool> ggml_backend_sycl_context::new_pool_for_device(queue_ptr qptr, int device) {
 #if defined(GGML_SYCL_USE_VMM)
-    if (ggml_sycl_info().devices[device].vmm) {
-        GGML_LOG_INFO("SYCL pool[%d]: VMM\n", device);
+    if (!g_ggml_sycl_disable_vmm && ggml_sycl_info().devices[device].vmm) {
         return std::unique_ptr<ggml_sycl_pool>(new ggml_sycl_pool_vmm(qptr, device));
     }
 #endif // defined(GGML_SYCL_USE_VMM)
-    GGML_LOG_INFO("SYCL pool[%d]: legacy\n", device);
     return std::unique_ptr<ggml_sycl_pool>(new ggml_sycl_pool_leg(qptr, device));
 }
 
@@ -4342,6 +4350,11 @@ static void ggml_sycl_im2col(ggml_backend_sycl_context & ctx, ggml_tensor * dst)
     ggml_sycl_op_im2col(ctx, dst);
 }
 
+static void ggml_sycl_im2col_3d(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
+    scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/2);
+    ggml_sycl_op_im2col_3d(ctx, dst);
+}
+
 static void ggml_sycl_sum(ggml_backend_sycl_context & ctx, ggml_tensor * dst) {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/1);
     GGML_ASSERT(ggml_is_contiguous(dst->src[0]));
@@ -4638,6 +4651,9 @@ static bool ggml_sycl_compute_forward(ggml_backend_sycl_context & ctx, struct gg
             break;
         case GGML_OP_IM2COL:
             ggml_sycl_im2col(ctx, dst);
+            break;
+        case GGML_OP_IM2COL_3D:
+            ggml_sycl_im2col_3d(ctx, dst);
             break;
         case GGML_OP_POOL_2D:
             ggml_sycl_pool2d(ctx, dst);
@@ -5358,6 +5374,7 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
         case GGML_OP_IM2COL:
+        case GGML_OP_IM2COL_3D:
         case GGML_OP_UPSCALE:
             return true;
         case GGML_OP_SUM:
