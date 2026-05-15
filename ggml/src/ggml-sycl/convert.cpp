@@ -129,9 +129,14 @@ static void dequantize_row_q4_0_sycl(const void *vx, dst_t *y, const int64_t k,
 template <typename dst_t>
 static void dequantize_row_q4_0_sycl_esimd(const void *vx, dst_t *y, const int64_t k,
                                            dpct::queue_ptr stream) {
+    dpct::has_capability_or_fail(stream->get_device(),
+                                 {sycl::aspect::fp16, sycl::aspect::ext_intel_esimd});
+
     const int64_t n_blocks = k / QK4_0;
-    omni_xpu::gguf::dequantize_q4_0_kernel<dst_t>(
-        static_cast<const uint8_t *>(vx), y, n_blocks, stream);
+    stream->submit([&](sycl::handler & h) {
+        ggml_sycl_esimd::dequantize_block_q4_0_esimd<dst_t>(
+            static_cast<const uint8_t *>(vx), y, n_blocks, h);
+    });
 }
 
 template <typename dst_t>
