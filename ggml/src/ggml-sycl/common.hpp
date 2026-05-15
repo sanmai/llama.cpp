@@ -239,6 +239,8 @@ struct ggml_sycl_device_info {
     std::array<float, GGML_SYCL_MAX_DEVICES> default_tensor_split = {};
 
     int max_work_group_sizes[GGML_SYCL_MAX_DEVICES] = {0};
+
+    bool ext_esimd = true; // sycl::aspect::ext_intel_esimd supported by all enumerated devices
 };
 
 const ggml_sycl_device_info & ggml_sycl_info();
