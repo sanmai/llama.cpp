@@ -129,14 +129,21 @@ static void dequantize_row_q4_0_sycl(const void *vx, dst_t *y, const int64_t k,
 template <typename dst_t>
 static void dequantize_row_q4_0_sycl_esimd(const void *vx, dst_t *y, const int64_t k,
                                            dpct::queue_ptr stream) {
+
     dpct::has_capability_or_fail(stream->get_device(),
                                  {sycl::aspect::fp16, sycl::aspect::ext_intel_esimd});
 
-    const int64_t n_blocks = k / QK4_0;
-    stream->submit([&](sycl::handler & h) {
-        ggml_sycl_esimd::dequantize_block_q4_0_esimd<dst_t>(
-            static_cast<const uint8_t *>(vx), y, n_blocks, h);
-    });
+    const int64_t n_blocks     = k / QK4_0;
+    const int64_t n_work_items = (n_blocks + ggml_sycl_esimd::Q4_0_SBS - 1) / ggml_sycl_esimd::Q4_0_SBS;
+    const int64_t global_size  = (n_work_items + ggml_sycl_esimd::Q4_0_WG_SIZE - 1) /
+                                 ggml_sycl_esimd::Q4_0_WG_SIZE * ggml_sycl_esimd::Q4_0_WG_SIZE;
+
+    stream->parallel_for(
+        sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(ggml_sycl_esimd::Q4_0_WG_SIZE)),
+        [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
+            ggml_sycl_esimd::dequantize_block_q4_0_esimd<dst_t>(
+                static_cast<const uint8_t *>(vx), y, n_blocks, item);
+        });
 }
 
 template <typename dst_t>
