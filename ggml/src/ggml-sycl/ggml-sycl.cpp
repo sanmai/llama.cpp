@@ -3926,7 +3926,7 @@ __dpct_inline__ static void k_copy_src1_to_contiguous(
     int32_t iid1 = item_ct1.get_group(2);
     int32_t id = item_ct1.get_group(1);
 
-    const int32_t row_id_i = *(const int32_t *) (ids + iid1*ids_nb1 + id*ids_nb0);
+    const int32_t expert = *(const int32_t *) (ids + iid1*ids_nb1 + id*ids_nb0);
 
     const int64_t i11 = id % ne11;
     const int64_t i12 = iid1;
@@ -3934,7 +3934,7 @@ __dpct_inline__ static void k_copy_src1_to_contiguous(
     if (item_ct1.get_local_id(2) == 0) {
         src1_row =
             dpct::atomic_fetch_add<sycl::access::address_space::generic_space>(
-                expert_cur_rows + row_id_i, 1);
+                expert_cur_rows + expert, 1);
         row_mapping[src1_row] = {id, iid1};
     }
     /*
@@ -4115,8 +4115,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                 expert_counts[row_id_i]++;
             }
         }
-        for (int64_t i02 = 0; i02 < n_as; i02++) {
-            expert_offsets[i02 + 1] = expert_offsets[i02] + expert_counts[i02];
+        for (int64_t expert = 0; expert < n_as; expert++) {
+            expert_offsets[expert + 1] = expert_offsets[expert] + expert_counts[expert];
         }
 
         ggml_sycl_pool_alloc<char> src1_contiguous(ctx.pool(), sizeof(float)*n_routed_rows*ne10);
@@ -4164,27 +4164,27 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             });
         }
 
-        for (int64_t i02 = 0; i02 < n_as; i02++) {
-            const int64_t num_src1_rows = expert_counts[i02];
+        for (int64_t expert = 0; expert < n_as; expert++) {
+            const int64_t num_src1_rows = expert_counts[expert];
 
             if (num_src1_rows == 0) {
                 continue;
             }
 
-            const int64_t expert_row_offset = expert_offsets[i02];
+            const int64_t expert_offset = expert_offsets[expert];
 
-            src0_row.data = src0_original + i02*nb02;
+            src0_row.data = src0_original + expert*nb02;
 
             // Reuse the existing matmul path, but point src1/dst at this
             // expert's packed slice instead of giving every expert row 0.
-            src1_row.data = src1_contiguous.get() + expert_row_offset*nb11;
+            src1_row.data = src1_contiguous.get() + expert_offset*nb11;
             src1_row.ne[1] = num_src1_rows;
 
             src1_row.nb[1] = nb11;
             src1_row.nb[2] = num_src1_rows*nb11;
             src1_row.nb[3] = num_src1_rows*nb11;
 
-            dst_row.data = dst_contiguous.get() + expert_row_offset*nb1;
+            dst_row.data = dst_contiguous.get() + expert_offset*nb1;
             dst_row.ne[1] = num_src1_rows;
             dst_row.nb[1] = nb1;
             dst_row.nb[2] = num_src1_rows*nb1;
