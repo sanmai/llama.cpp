@@ -16,7 +16,7 @@ namespace ggml_sycl_esimd {
 
 namespace esimd = sycl::ext::intel::esimd;
 
-// Q4_0 ESIMD kernel (GGML layout)
+// Q4_0 ESIMD kernel
 // Output layout: [0-15] = low nibbles, [16-31] = high nibbles
 template <typename OT>
 void dequantize_block_q4_0_esimd(
