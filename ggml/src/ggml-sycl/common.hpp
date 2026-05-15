@@ -240,7 +240,7 @@ struct ggml_sycl_device_info {
 
     int max_work_group_sizes[GGML_SYCL_MAX_DEVICES] = {0};
 
-    bool ext_esimd = true; // sycl::aspect::ext_intel_esimd supported by all enumerated devices
+    bool ext_intel_esimd = true; // sycl::aspect::ext_intel_esimd supported by all devices
 };
 
 const ggml_sycl_device_info & ggml_sycl_info();

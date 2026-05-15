@@ -116,7 +116,7 @@ static ggml_sycl_device_info ggml_sycl_init() {
         info.max_work_group_sizes[i] = prop.get_max_work_group_size();
         info.devices[i].max_wg_per_cu = info.max_work_group_sizes[i] / prop.get_max_compute_units();
         info.devices[i].hw_info = get_device_hw_info(&device);
-        info.ext_esimd = info.ext_esimd && device.has(sycl::aspect::ext_intel_esimd);
+        info.ext_intel_esimd = info.ext_intel_esimd && device.has(sycl::aspect::ext_intel_esimd);
     }
 
     for (int id = 0; id < info.device_count; ++id) {
@@ -229,7 +229,7 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_disable_graph = get_sycl_env("GGML_SYCL_DISABLE_GRAPH", 1);
         g_ggml_sycl_disable_dnn = get_sycl_env("GGML_SYCL_DISABLE_DNN", 0);
         g_ggml_sycl_prioritize_dmmv = get_sycl_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
-        g_ggml_sycl_dequant_esimd = get_sycl_env("GGML_SYCL_DEQUANT_ESIMD", ggml_sycl_info().ext_esimd);
+        g_ggml_sycl_dequant_esimd = get_sycl_env("GGML_SYCL_DEQUANT_ESIMD", ggml_sycl_info().ext_intel_esimd);
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO
         g_ggml_sycl_enable_level_zero = get_sycl_env("GGML_SYCL_ENABLE_LEVEL_ZERO", 1);
 #else
