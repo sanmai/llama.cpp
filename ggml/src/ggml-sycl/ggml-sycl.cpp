@@ -3917,6 +3917,24 @@ struct mmid_row_mapping {
     int32_t i2;
 };
 
+// Read ids[group, route], i.e. the expert selected by the router for this row.
+__dpct_inline__ static int32_t mmid_get_expert_id(
+    const char * ids, int64_t group, int64_t route, size_t ids_group_stride, size_t ids_route_stride) {
+    return *(const int32_t *) (ids + group*ids_group_stride + route*ids_route_stride);
+}
+
+// Return row `row` in group `group` from a byte-strided F32 tensor view.
+__dpct_inline__ static const float * mmid_get_row(
+    const char * base, int64_t row, size_t row_stride, int64_t group, size_t group_stride) {
+    return (const float *) (base + row*row_stride + group*group_stride);
+}
+
+// Return mutable row `row` in group `group` from a byte-strided F32 tensor view.
+__dpct_inline__ static float * mmid_get_row(
+    char * base, int64_t row, size_t row_stride, int64_t group, size_t group_stride) {
+    return (float *) (base + row*row_stride + group*group_stride);
+}
+
 __dpct_inline__ static void k_copy_src1_to_contiguous(
     const char *__restrict__ src1_original, char *__restrict__ src1_contiguous,
     int *__restrict__ expert_cur_rows, mmid_row_mapping *__restrict__ row_mapping,
@@ -3926,7 +3944,7 @@ __dpct_inline__ static void k_copy_src1_to_contiguous(
     int32_t iid1 = item_ct1.get_group(2);
     int32_t id = item_ct1.get_group(1);
 
-    const int32_t expert = *(const int32_t *) (ids + iid1*ids_nb1 + id*ids_nb0);
+    const int32_t expert = mmid_get_expert_id(ids, iid1, id, ids_nb1, ids_nb0);
 
     const int64_t i11 = id % ne11;
     const int64_t i12 = iid1;
@@ -3944,8 +3962,8 @@ __dpct_inline__ static void k_copy_src1_to_contiguous(
     */
     item_ct1.barrier();
 
-    const float * src1_row_original = (const float *)(src1_original + i11*nb11 + i12*nb12);
-    float * src1_row_contiguous = (float *)(src1_contiguous + src1_row*nb11);
+    const float * src1_row_original = mmid_get_row(src1_original, i11, nb11, i12, nb12);
+    float * src1_row_contiguous = mmid_get_row(src1_contiguous, src1_row, nb11, 0, 0);
 
 #pragma unroll
     for (int i = item_ct1.get_local_id(2); i < ne10;
@@ -3963,8 +3981,8 @@ __dpct_inline__ static void k_copy_dst_from_contiguous(
     const int32_t i1 = row_mapping[i].i1;
     const int32_t i2 = row_mapping[i].i2;
 
-    const float * dst_row_contiguous = (const float *)(dst_contiguous + i*nb1);
-    float * dst_row_original = (float *)(dst_original + i1*nb1 + i2*nb2);
+    const float * dst_row_contiguous = mmid_get_row(dst_contiguous, i, nb1, 0, 0);
+    float * dst_row_original = mmid_get_row(dst_original, i1, nb1, i2, nb2);
 
 #pragma unroll
     for (int j = item_ct1.get_local_id(2); j < ne0;
@@ -4110,9 +4128,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         std::vector<int> expert_offsets(n_as + 1, 0);
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
             for (int64_t id = 0; id < n_ids; id++) {
-                const int32_t row_id_i = *(const int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
-                GGML_ASSERT(row_id_i >= 0 && row_id_i < n_as);
-                expert_counts[row_id_i]++;
+                const int32_t expert = mmid_get_expert_id(ids_host.data(), iid1, id, ids->nb[1], ids->nb[0]);
+                GGML_ASSERT(expert >= 0 && expert < n_as);
+                expert_counts[expert]++;
             }
         }
         for (int64_t expert = 0; expert < n_as; expert++) {
