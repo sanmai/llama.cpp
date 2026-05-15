@@ -4203,6 +4203,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         GGML_ASSERT(nb11 == sizeof(float)*ne10);
         GGML_ASSERT(nb1 == sizeof(float)*ne0);
 
+        // Build the packed MoE layout.
+        //
+        // ids tells us which expert each src1 row is routed to. Instead of
+        // scanning ids once per expert, scan it once on the host and reserve
+        // one contiguous row range per expert inside src1_contiguous/dst_contiguous:
+        //
+        //   expert i rows are [expert_offsets[i], expert_offsets[i + 1])
+        //
+        // Example for counts [3, 0, 2]:
+        //   offsets [0, 3, 3, 5]
+        //   expert 0 -> rows 0..2, expert 1 -> empty, expert 2 -> rows 3..4.
         std::vector<int> expert_counts(n_as, 0);
         std::vector<int> expert_offsets(n_as + 1, 0);
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
@@ -4221,6 +4232,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         ggml_sycl_pool_alloc<int> dev_expert_cur_rows(ctx.pool(), n_as);
         ggml_sycl_pool_alloc<mmid_row_mapping> dev_row_mapping(ctx.pool(), n_routed_rows);
 
+        // The scatter kernel uses these as per-expert insertion cursors. They
+        // start at expert_offsets[], so atomically appending a row routed to
+        // expert i writes into that expert's reserved packed range.
         SYCL_CHECK(CHECK_TRY_ERROR(
             stream->memcpy(dev_expert_cur_rows.get(), expert_offsets.data(), n_as*sizeof(int))));
 
@@ -4228,6 +4242,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         assert(max_work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
 
         {
+            // Scatter all routed src1 rows in one launch. dev_row_mapping keeps
+            // the inverse map from packed row -> original dst row so the final
+            // gather can put matmul results back in the original order.
             sycl::range<3> block_dims(1, 1, std::min((unsigned int)ne10, max_work_group_size));
             sycl::range<3> grid_dims(1, n_ids, ids->ne[1]);
             stream->submit([&](sycl::handler &cgh) {
@@ -4266,6 +4283,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
 
             src0_row.data = src0_original + i02*nb02;
 
+            // Reuse the existing matmul path, but point src1/dst at this
+            // expert's packed slice instead of giving every expert row 0.
             src1_row.data = src1_contiguous.get() + expert_row_offset*nb11;
             src1_row.ne[1] = num_src1_rows;
 
@@ -4283,6 +4302,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         }
 
         {
+            // Gather every packed output row back to its original dst location.
             sycl::range<3> block_dims(1, 1, std::min((unsigned int)ne0, max_work_group_size));
             sycl::range<3> grid_dims(1, 1, n_routed_rows);
             stream->submit([&](sycl::handler &cgh) {
