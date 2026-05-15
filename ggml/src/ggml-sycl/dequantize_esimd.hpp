@@ -20,10 +20,10 @@ namespace esimd = sycl::ext::intel::esimd;
 constexpr int Q4_0_SBS     = 16;
 constexpr int Q4_0_WG_SIZE = 64;
 
-// Q4_0 ESIMD kernel
+// Q4_0 ESIMD kernel; inlined for use in parallel_for lambda
 // Output layout: [0-15] = low nibbles, [16-31] = high nibbles
 template <typename OT>
-void dequantize_block_q4_0_esimd(
+__dpct_inline__ void dequantize_block_q4_0_esimd(
     const uint8_t * __restrict__ src,
     OT * __restrict__ dst,
     const int64_t n_blocks,
