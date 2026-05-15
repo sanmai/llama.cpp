@@ -129,21 +129,21 @@ static void dequantize_row_q4_0_sycl(const void *vx, dst_t *y, const int64_t k,
 template <typename dst_t>
 static void dequantize_row_q4_0_sycl_esimd(const void *vx, dst_t *y, const int64_t k,
                                            dpct::queue_ptr stream) {
+    const int64_t n_blocks = k / QK4_0;
+    if (n_blocks < ggml_sycl_esimd::Q4_0_MIN_BLOCKS) {
+        // Below the size threshold ESIMD per-call overhead dominates; let
+        // the parallel_for path handle small dequants (decode tail ops).
+        dequantize_row_q4_0_sycl<dst_t>(vx, y, k, stream);
+        return;
+    }
 
     dpct::has_capability_or_fail(stream->get_device(),
                                  {sycl::aspect::fp16, sycl::aspect::ext_intel_esimd});
 
-    const int64_t n_blocks     = k / QK4_0;
-    const int64_t n_work_items = (n_blocks + ggml_sycl_esimd::Q4_0_SBS - 1) / ggml_sycl_esimd::Q4_0_SBS;
-    const int64_t global_size  = (n_work_items + ggml_sycl_esimd::Q4_0_WG_SIZE - 1) /
-                                 ggml_sycl_esimd::Q4_0_WG_SIZE * ggml_sycl_esimd::Q4_0_WG_SIZE;
-
-    stream->parallel_for(
-        sycl::nd_range<1>(sycl::range<1>(global_size), sycl::range<1>(ggml_sycl_esimd::Q4_0_WG_SIZE)),
-        [=](sycl::nd_item<1> item) SYCL_ESIMD_KERNEL {
-            ggml_sycl_esimd::dequantize_block_q4_0_esimd<dst_t>(
-                static_cast<const uint8_t *>(vx), y, n_blocks, item);
-        });
+    stream->submit([&](sycl::handler & h) {
+        ggml_sycl_esimd::dequantize_block_q4_0_esimd<dst_t>(
+            static_cast<const uint8_t *>(vx), y, n_blocks, h);
+    });
 }
 
 template <typename dst_t>
@@ -163,6 +163,26 @@ static void dequantize_row_q4_0_sycl_reorder(const void *vx, dst_t *y, const int
             dequantize_block_q4_0_reorder(vx, y, k, item_ct1);
         });
 
+}
+
+template <typename dst_t>
+static void dequantize_row_q4_0_sycl_reorder_esimd(const void *vx, dst_t *y, const int64_t k,
+                                                   dpct::queue_ptr stream) {
+    const int64_t n_blocks = k / QK4_0;
+    if (n_blocks < ggml_sycl_esimd::Q4_0_MIN_BLOCKS) {
+        // Below the size threshold ESIMD per-call overhead dominates; let
+        // the existing reorder kernel handle small dequants.
+        dequantize_row_q4_0_sycl_reorder<dst_t>(vx, y, k, stream);
+        return;
+    }
+
+    dpct::has_capability_or_fail(stream->get_device(),
+                                 {sycl::aspect::fp16, sycl::aspect::ext_intel_esimd});
+
+    stream->submit([&](sycl::handler & h) {
+        ggml_sycl_esimd::dequantize_block_q4_0_reorder_esimd<dst_t>(
+            static_cast<const uint8_t *>(vx), y, n_blocks, h);
+    });
 }
 
 template <typename dst_t>
@@ -653,6 +673,9 @@ to_fp16_sycl_t ggml_get_to_fp16_sycl(ggml_type type, ggml_tensor * dst) {
         case GGML_TYPE_Q4_0:
             if (dst->src[0]->extra &&
                 ((ggml_tensor_extra_gpu*)dst->src[0]->extra)->optimized_feature.reorder) {
+                if (g_ggml_sycl_dequant_esimd) {
+                    return dequantize_row_q4_0_sycl_reorder_esimd;
+                }
                 return dequantize_row_q4_0_sycl_reorder;
             } else if (g_ggml_sycl_dequant_esimd) {
                 return dequantize_row_q4_0_sycl_esimd;
@@ -733,6 +756,9 @@ to_fp32_sycl_t ggml_get_to_fp32_sycl(ggml_type type, ggml_tensor *dst) {
         case GGML_TYPE_Q4_0:
             if (dst->src[0]->extra &&
                 ((ggml_tensor_extra_gpu*)dst->src[0]->extra)->optimized_feature.reorder) {
+                if (g_ggml_sycl_dequant_esimd) {
+                    return dequantize_row_q4_0_sycl_reorder_esimd;
+                }
                 return dequantize_row_q4_0_sycl_reorder;
             } else if (g_ggml_sycl_dequant_esimd) {
                 return dequantize_row_q4_0_sycl_esimd;
