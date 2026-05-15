@@ -3955,6 +3955,28 @@ __dpct_inline__ static void k_copy_src1_to_contiguous(
     }
 }
 
+__dpct_inline__ static void k_copy_src1_from_row_mapping(
+    const char *__restrict__ src1_original, char *__restrict__ src1_contiguous,
+    const mmid_row_mapping *__restrict__ row_mapping, int64_t ne11, int64_t ne10,
+    size_t nb11, size_t nb12, const sycl::nd_item<3> &item_ct1) {
+    const int32_t i = item_ct1.get_group(2);
+
+    const int32_t id   = row_mapping[i].i1;
+    const int32_t iid1 = row_mapping[i].i2;
+
+    const int64_t i11 = id % ne11;
+    const int64_t i12 = iid1;
+
+    const float * src1_row_original = (const float *)(src1_original + i11*nb11 + i12*nb12);
+    float * src1_row_contiguous = (float *)(src1_contiguous + i*nb11);
+
+#pragma unroll
+    for (int j = item_ct1.get_local_id(2); j < ne10;
+         j += item_ct1.get_local_range(2)) {
+        src1_row_contiguous[j] = src1_row_original[j];
+    }
+}
+
 __dpct_inline__ static void k_copy_dst_from_contiguous(
     char *__restrict__ dst_original, const char *__restrict__ dst_contiguous,
     const mmid_row_mapping *__restrict__ row_mapping, int64_t ne0, size_t nb1,
@@ -4041,10 +4063,9 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     }
 
     std::vector<char> ids_host(ggml_nbytes(ids));
-    const char * ids_dev = (const char *) ids->data;
 
     SYCL_CHECK(CHECK_TRY_ERROR(
-        stream->memcpy(ids_host.data(), ids_dev, ggml_nbytes(ids))));
+        stream->memcpy(ids_host.data(), ids->data, ggml_nbytes(ids))));
     SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
 
     ggml_tensor src0_row = *src0;
@@ -4098,6 +4119,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         dst_row.data  =  dst_contiguous.get();
 
         std::vector<int64_t> expert_counts(n_as, 0);
+        std::vector<int64_t> expert_offsets(n_as + 1, 0);
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
             for (int64_t id = 0; id < n_ids; id++) {
                 const int32_t row_id_i = *(const int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
@@ -4105,6 +4127,22 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                 expert_counts[row_id_i]++;
             }
         }
+        for (int64_t i02 = 0; i02 < n_as; i02++) {
+            expert_offsets[i02 + 1] = expert_offsets[i02] + expert_counts[i02];
+        }
+
+        std::vector<int64_t> expert_cursors = expert_offsets;
+        std::vector<mmid_row_mapping> row_mapping_host(n_routed_rows);
+        for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
+            for (int64_t id = 0; id < n_ids; id++) {
+                const int32_t row_id_i = *(const int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
+                row_mapping_host[expert_cursors[row_id_i]++] = {(int32_t) id, (int32_t) iid1};
+            }
+        }
+
+        ggml_sycl_pool_alloc<mmid_row_mapping> dev_row_mapping(ctx.pool(), n_routed_rows);
+        SYCL_CHECK(CHECK_TRY_ERROR(
+            stream->memcpy(dev_row_mapping.get(), row_mapping_host.data(), n_routed_rows*sizeof(mmid_row_mapping))));
 
         for (int64_t i02 = 0; i02 < n_as; i02++) {
             const int64_t num_src1_rows = expert_counts[i02];
@@ -4114,38 +4152,27 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             }
 
 
-            ggml_sycl_pool_alloc<int> dev_cur_src1_row(ctx.pool(), 1);
-            ggml_sycl_pool_alloc<mmid_row_mapping> dev_row_mapping(ctx.pool(), num_src1_rows);
-            SYCL_CHECK(CHECK_TRY_ERROR(
-                stream->memset(dev_cur_src1_row.get(), 0, sizeof(int))));
+            const int64_t expert_offset = expert_offsets[i02];
 
             const unsigned int max_work_group_size = ggml_sycl_info().max_work_group_sizes[ctx.device];
             assert(max_work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
 
             {
                 sycl::range<3> block_dims(1, 1, std::min((unsigned int)ne10, max_work_group_size));
-                sycl::range<3> grid_dims(1, n_ids, ids->ne[1]);
+                sycl::range<3> grid_dims(1, 1, num_src1_rows);
                 stream->submit([&](sycl::handler &cgh) {
-                    sycl::local_accessor<int, 0> src1_row_acc(cgh);
-
                     char *__restrict src1_contiguous_get =
                         src1_contiguous.get();
-                    int *__restrict dev_cur_src1_row_get =
-                        dev_cur_src1_row.get();
                     mmid_row_mapping *__restrict dev_row_mapping_get =
-                        dev_row_mapping.get();
-                    size_t ids_nb_ct6 = ids->nb[1];
-                    size_t ids_nb_ct7 = ids->nb[0];
+                        dev_row_mapping.get() + expert_offset;
 
                     cgh.parallel_for(
                         sycl::nd_range<3>(grid_dims * block_dims, block_dims),
                         [=](sycl::nd_item<3> item_ct1) {
-                            k_copy_src1_to_contiguous(
+                            k_copy_src1_from_row_mapping(
                                 src1_original, src1_contiguous_get,
-                                dev_cur_src1_row_get,
-                                dev_row_mapping_get, ids_dev, i02,
-                                ids_nb_ct6, ids_nb_ct7, ne11, ne10, nb11, nb12,
-                                item_ct1, src1_row_acc);
+                                dev_row_mapping_get, ne11, ne10, nb11, nb12,
+                                item_ct1);
                         });
                 });
             }
@@ -4174,7 +4201,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                     const char *__restrict dst_contiguous_get =
                         dst_contiguous.get();
                     const mmid_row_mapping *__restrict dev_row_mapping_get =
-                        dev_row_mapping.get();
+                        dev_row_mapping.get() + expert_offset;
 
                     cgh.parallel_for(
                         sycl::nd_range<3>(grid_dims * block_dims, block_dims),
