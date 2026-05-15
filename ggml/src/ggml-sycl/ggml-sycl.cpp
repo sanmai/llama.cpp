@@ -4097,21 +4097,17 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         src1_row.data = src1_contiguous.get();
         dst_row.data  =  dst_contiguous.get();
 
-        for (int64_t i02 = 0; i02 < n_as; i02++) {
-            int64_t num_src1_rows = 0;
-            for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
-                for (int64_t id = 0; id < n_ids; id++) {
-                    const int32_t row_id_i = *(const int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
-
-                    GGML_ASSERT(row_id_i >= 0 && row_id_i < n_as);
-
-                    if (row_id_i != i02) {
-                        continue;
-                    }
-
-                    num_src1_rows++;
-                }
+        std::vector<int64_t> expert_counts(n_as, 0);
+        for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
+            for (int64_t id = 0; id < n_ids; id++) {
+                const int32_t row_id_i = *(const int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
+                GGML_ASSERT(row_id_i >= 0 && row_id_i < n_as);
+                expert_counts[row_id_i]++;
             }
+        }
+
+        for (int64_t i02 = 0; i02 < n_as; i02++) {
+            const int64_t num_src1_rows = expert_counts[i02];
 
             if (num_src1_rows == 0) {
                 continue;
