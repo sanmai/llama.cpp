@@ -74,6 +74,7 @@ int g_ggml_sycl_prioritize_dmmv = 0;
 int g_ggml_sycl_use_async_mem_op = 0;
 int g_ggml_sycl_enable_level_zero = 0;
 int g_ggml_sycl_enable_flash_attention = 1;
+int g_ggml_sycl_dequant_esimd = 1;
 
 
 static ggml_sycl_device_info ggml_sycl_init() {
@@ -228,6 +229,28 @@ static void ggml_check_sycl() try {
         g_ggml_sycl_disable_graph = get_sycl_env("GGML_SYCL_DISABLE_GRAPH", 1);
         g_ggml_sycl_disable_dnn = get_sycl_env("GGML_SYCL_DISABLE_DNN", 0);
         g_ggml_sycl_prioritize_dmmv = get_sycl_env("GGML_SYCL_PRIORITIZE_DMMV", 0);
+        g_ggml_sycl_dequant_esimd   = get_sycl_env("GGML_SYCL_DEQUANT_ESIMD", 1);
+        if (g_ggml_sycl_dequant_esimd) {
+            // Downgrade to 0 if no enumerated GPU device advertises the
+            // ext_intel_esimd aspect. ESIMD kernels submitted to a device that
+            // lacks the aspect throw `Required aspect ext_intel_esimd is not
+            // supported on the device` at submit time; this check converts that
+            // into a clean fallback to the existing parallel_for path.
+            bool any_gpu_supports_esimd = false;
+            for (unsigned int i = 0; i < dpct::dev_mgr::instance().device_count(); ++i) {
+                auto & dev = dpct::dev_mgr::instance().get_device(i);
+                if (!dev.is_gpu()) {
+                    continue;
+                }
+                if (dev.has(sycl::aspect::ext_intel_esimd)) {
+                    any_gpu_supports_esimd = true;
+                    break;
+                }
+            }
+            if (!any_gpu_supports_esimd) {
+                g_ggml_sycl_dequant_esimd = 0;
+            }
+        }
 #ifdef GGML_SYCL_SUPPORT_LEVEL_ZERO
         g_ggml_sycl_enable_level_zero = get_sycl_env("GGML_SYCL_ENABLE_LEVEL_ZERO", 1);
 #else
@@ -304,6 +327,7 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_DISABLE_DNN: DNN disabled by compile flag\n");
 #endif
         GGML_LOG_INFO("  GGML_SYCL_PRIORITIZE_DMMV: %d\n", g_ggml_sycl_prioritize_dmmv);
+        GGML_LOG_INFO("  GGML_SYCL_DEQUANT_ESIMD: %d\n", g_ggml_sycl_dequant_esimd);
 
 #ifdef SYCL_FLASH_ATTN
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_FLASH_ATTN: %d\n", g_ggml_sycl_enable_flash_attention);
