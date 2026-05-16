@@ -4121,14 +4121,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         dst_row.data  =  dst_contiguous.get();
 
         // how many "owned" routed rows to pass to each expert
-        std::vector<int64_t> expert_counts;
+        std::vector<int64_t> expert_row_counts;
         // where each expert's slice starts and the previous ends (row indices, right-exclusive)
         std::vector<int64_t> expert_row_offsets;
         // the sources (slot/token pairs) of contiguous rows to guide k_copy_src1_to_contiguous
         std::vector<mmid_row_mapping> routed_row_src;
 
         mmid_counting_sort_rows(ids, ids_host.data(), n_ids, n_as, n_routed_rows,
-                                expert_counts, expert_row_offsets, routed_row_src);
+                                expert_row_counts, expert_row_offsets, routed_row_src);
 
         ggml_sycl_pool_alloc<mmid_row_mapping> dev_row_mapping(ctx.pool(), n_routed_rows);
         SYCL_CHECK(CHECK_TRY_ERROR(
@@ -4159,7 +4159,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         }
 
         for (int64_t i02 = 0; i02 < n_as; i02++) {
-            const int64_t num_src1_rows = expert_counts[i02];
+            const int64_t num_src1_rows = expert_row_counts[i02];
 
             if (num_src1_rows == 0) {
                 continue;
