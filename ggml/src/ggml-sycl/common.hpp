@@ -16,7 +16,9 @@
 #include <cstddef>
 #include <fstream>
 #include <iostream>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include "dpct/helper.hpp"
 #include "ggml.h"
@@ -322,7 +324,9 @@ struct ggml_backend_sycl_context {
     std::string name;
     optimize_feature opt_feature;
 
+    int curr_stream_no = 0;
     queue_ptr qptrs[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS] = { { nullptr } };
+    std::vector<std::unique_ptr<sycl::queue>> owned_queues;
 
     explicit ggml_backend_sycl_context(int device) :
         device(device),
@@ -332,13 +336,20 @@ struct ggml_backend_sycl_context {
 
     queue_ptr stream(int device, int stream) {
         if (qptrs[device][stream] == nullptr) {
-            qptrs[device][stream] = &(dpct::get_device(device).default_queue());
+            if (stream == 0) {
+                qptrs[device][stream] = &(dpct::get_device(device).default_queue());
+            } else {
+                ggml_sycl_set_device(device);
+                owned_queues.emplace_back(std::make_unique<sycl::queue>(
+                    dpct::get_device(device).create_in_order_queue()));
+                qptrs[device][stream] = owned_queues.back().get();
+            }
         }
         return qptrs[device][stream];
     }
 
     queue_ptr stream() {
-        return stream(device, 0);
+        return stream(device, curr_stream_no);
     }
 
 #if GGML_SYCL_DNNL
@@ -383,7 +394,7 @@ struct ggml_backend_sycl_context {
         }
     }
     dnnl::stream stream_dnnl() {
-        return stream_dnnl(device, 0);
+        return stream_dnnl(device, curr_stream_no);
     }
     dnnl::memory get_scratchpad_mem(const dnnl::memory::desc & scratchpad_md,
                                     const dnnl::engine & eng, const queue_ptr q) {
@@ -406,7 +417,7 @@ struct ggml_backend_sycl_context {
 #endif
 
     // pool
-    std::unique_ptr<ggml_sycl_pool> pools[GGML_SYCL_MAX_DEVICES];
+    std::unique_ptr<ggml_sycl_pool> pools[GGML_SYCL_MAX_DEVICES][GGML_SYCL_MAX_STREAMS];
     std::unordered_map<sycl::queue *, std::unique_ptr<ggml_sycl_pool_alloc<uint8_t>>> scratchpad_map;
 
     std::unique_ptr<ggml_sycl_fattn_kv_buffers> fattn_bufs[GGML_SYCL_MAX_DEVICES];
@@ -419,15 +430,19 @@ struct ggml_backend_sycl_context {
 
     static std::unique_ptr<ggml_sycl_fattn_kv_buffers> new_fattn_kv_buffers(queue_ptr qptr, int device);
 
-    ggml_sycl_pool & pool(int device) {
-        if (pools[device] == nullptr) {
-            pools[device] = new_pool_for_device(stream(device,0), device);
+    ggml_sycl_pool & pool(int device, int stream) {
+        if (pools[device][stream] == nullptr) {
+            pools[device][stream] = new_pool_for_device(this->stream(device, stream), device);
         }
-        return *pools[device];
+        return *pools[device][stream];
+    }
+
+    ggml_sycl_pool & pool(int device) {
+        return pool(device, 0);
     }
 
     ggml_sycl_pool & pool() {
-        return pool(device);
+        return pool(device, curr_stream_no);
     }
 
     ggml_sycl_fattn_kv_buffers & fattn_buffers(int device) {
@@ -453,6 +468,23 @@ struct ggml_backend_sycl_context {
     }
 
     ggml_sycl_pool & host_pool() { return host_pool(device); }
+};
+
+struct ggml_sycl_stream_override_guard {
+    ggml_backend_sycl_context & ctx;
+    int saved;
+
+    ggml_sycl_stream_override_guard(ggml_backend_sycl_context & ctx_, int new_slot) :
+        ctx(ctx_), saved(ctx_.curr_stream_no) {
+        ctx.curr_stream_no = new_slot;
+    }
+
+    ~ggml_sycl_stream_override_guard() {
+        ctx.curr_stream_no = saved;
+    }
+
+    ggml_sycl_stream_override_guard(const ggml_sycl_stream_override_guard &)             = delete;
+    ggml_sycl_stream_override_guard & operator=(const ggml_sycl_stream_override_guard &) = delete;
 };
 
 // common device functions
