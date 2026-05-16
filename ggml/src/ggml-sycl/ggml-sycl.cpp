@@ -4079,7 +4079,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         src1_row.data = src1_contiguous.get();
         dst_row.data  =  dst_contiguous.get();
 
-        // how many routed rows each expert "owns" (row_id_i is an expert id as chosen by the router)
+        // start with the counting sort by computing the frequencies, i.e., how many routed
+        // rows each expert "owns" (row_id_i is an expert id as chosen by the router)
         std::vector<int64_t> expert_counts(n_as, 0);
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
             for (int64_t id = 0; id < n_ids; id++) {
