@@ -3921,8 +3921,8 @@ __dpct_inline__ static void k_copy_src1_to_contiguous(
     const sycl::nd_item<3> &item_ct1) {
     const int32_t src1_row = item_ct1.get_group(2);
 
-    const int32_t id   = row_mapping[src1_row].i1;
     const int32_t iid1 = row_mapping[src1_row].i2;
+    const int32_t id   = row_mapping[src1_row].i1;
 
     const int64_t i11 = id % ne11;
     const int64_t i12 = iid1;
@@ -4097,6 +4097,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
             for (int64_t id = 0; id < n_ids; id++) {
                 const int32_t row_id_i = *(const int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
+                GGML_ASSERT(row_id_i >= 0 && row_id_i < n_as);
                 row_mapping_host[expert_cursors[row_id_i]++] = {(int32_t) id, (int32_t) iid1};
             }
         }
