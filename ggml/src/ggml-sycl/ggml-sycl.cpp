@@ -4089,7 +4089,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             }
         }
 
-        // where each expert's slice ends (row indices)
+        // where each expert's slice starts (row indices) and the previous ends
         std::vector<int64_t> expert_row_offsets(n_as + 1, 0);
         for (int64_t i02 = 0; i02 < n_as; i02++) {
             expert_row_offsets[i02 + 1] = expert_row_offsets[i02] + expert_counts[i02];
@@ -4143,7 +4143,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             if (num_src1_rows == 0) {
                 continue;
             }
-
 
             const int64_t expert_row_offset = expert_row_offsets[i02];
 
