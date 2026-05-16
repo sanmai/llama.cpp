@@ -4096,18 +4096,18 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         }
 
         std::vector<int64_t> expert_cursors = expert_row_offsets;
-        std::vector<mmid_row_mapping> row_mapping_host(n_routed_rows);
+        std::vector<mmid_row_mapping> routed_row_src(n_routed_rows);
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
             for (int64_t id = 0; id < n_ids; id++) {
                 const int32_t row_id_i = *(const int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
                 GGML_ASSERT(row_id_i >= 0 && row_id_i < n_as);
-                row_mapping_host[expert_cursors[row_id_i]++] = {(int32_t) id, (int32_t) iid1};
+                routed_row_src[expert_cursors[row_id_i]++] = {(int32_t) id, (int32_t) iid1};
             }
         }
 
         ggml_sycl_pool_alloc<mmid_row_mapping> dev_row_mapping(ctx.pool(), n_routed_rows);
         SYCL_CHECK(CHECK_TRY_ERROR(
-            stream->memcpy(dev_row_mapping.get(), row_mapping_host.data(), n_routed_rows*sizeof(mmid_row_mapping))));
+            stream->memcpy(dev_row_mapping.get(), routed_row_src.data(), n_routed_rows*sizeof(mmid_row_mapping))));
 
         const unsigned int max_work_group_size = ggml_sycl_info().max_work_group_sizes[ctx.device];
         assert(max_work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
