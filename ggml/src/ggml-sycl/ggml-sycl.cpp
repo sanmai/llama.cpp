@@ -3919,7 +3919,7 @@ __dpct_inline__ static void k_copy_src1_to_contiguous(
     const mmid_row_mapping *__restrict__ row_mapping,
     int64_t ne11, int64_t ne10, size_t nb11, size_t nb12,
     const sycl::nd_item<3> &item_ct1) {
-    int32_t src1_row = item_ct1.get_group(2);
+    const int32_t src1_row = item_ct1.get_group(2);
 
     const int32_t id   = row_mapping[i].i1;
     const int32_t iid1 = row_mapping[i].i2;
