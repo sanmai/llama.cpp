@@ -4079,8 +4079,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         src1_row.data = src1_contiguous.get();
         dst_row.data  =  dst_contiguous.get();
 
+        // how many routed rows each expert "owns"
         std::vector<int64_t> expert_counts(n_as, 0);
-        std::vector<int64_t> expert_offsets(n_as + 1, 0);
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
             for (int64_t id = 0; id < n_ids; id++) {
                 const int32_t row_id_i = *(const int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
@@ -4088,11 +4088,14 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                 expert_counts[row_id_i]++;
             }
         }
+
+        // where each expert's slice ends (row indices)
+        std::vector<int64_t> expert_row_offsets(n_as + 1, 0);
         for (int64_t i02 = 0; i02 < n_as; i02++) {
-            expert_offsets[i02 + 1] = expert_offsets[i02] + expert_counts[i02];
+            expert_row_offsets[i02 + 1] = expert_row_offsets[i02] + expert_counts[i02];
         }
 
-        std::vector<int64_t> expert_cursors = expert_offsets;
+        std::vector<int64_t> expert_cursors = expert_row_offsets;
         std::vector<mmid_row_mapping> row_mapping_host(n_routed_rows);
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
             for (int64_t id = 0; id < n_ids; id++) {
@@ -4137,7 +4140,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             }
 
 
-            const int64_t expert_offset = expert_offsets[i02];
+            const int64_t expert_offset = expert_row_offsets[i02];
 
             src0_row.data = src0_original + i02*nb02;
 
