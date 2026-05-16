@@ -4166,25 +4166,25 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row);
         }
 
-            {
-                sycl::range<3> block_dims(1, 1, std::min((unsigned int)ne0, max_work_group_size));
-                sycl::range<3> grid_dims(1, 1, n_routed_rows);
-                stream->submit([&](sycl::handler &cgh) {
-                    const char *__restrict dst_contiguous_get =
-                        dst_contiguous.get();
-                    const mmid_row_mapping *__restrict dev_row_mapping_get =
-                        dev_row_mapping.get();
+        {
+            sycl::range<3> block_dims(1, 1, std::min((unsigned int)ne0, max_work_group_size));
+            sycl::range<3> grid_dims(1, 1, n_routed_rows);
+            stream->submit([&](sycl::handler &cgh) {
+                const char *__restrict dst_contiguous_get =
+                    dst_contiguous.get();
+                const mmid_row_mapping *__restrict dev_row_mapping_get =
+                    dev_row_mapping.get();
 
-                    cgh.parallel_for(
-                        sycl::nd_range<3>(grid_dims * block_dims, block_dims),
-                        [=](sycl::nd_item<3> item_ct1) {
-                            k_copy_dst_from_contiguous(dst_original,
-                                                       dst_contiguous_get,
-                                                       dev_row_mapping_get,
-                                                       ne0, nb1, nb2, item_ct1);
-                        });
-                });
-            }
+                cgh.parallel_for(
+                    sycl::nd_range<3>(grid_dims * block_dims, block_dims),
+                    [=](sycl::nd_item<3> item_ct1) {
+                        k_copy_dst_from_contiguous(dst_original,
+                                                   dst_contiguous_get,
+                                                   dev_row_mapping_get,
+                                                   ne0, nb1, nb2, item_ct1);
+                    });
+            });
+        }
     }
 }
 catch (sycl::exception const &exc) {
