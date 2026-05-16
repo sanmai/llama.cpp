@@ -3916,8 +3916,9 @@ struct mmid_row_mapping {
 
 __dpct_inline__ static void k_copy_src1_to_contiguous(
     const char *__restrict__ src1_original, char *__restrict__ src1_contiguous,
-    const mmid_row_mapping *__restrict__ row_mapping, int64_t ne11, int64_t ne10,
-    size_t nb11, size_t nb12, const sycl::nd_item<3> &item_ct1) {
+    const mmid_row_mapping *__restrict__ row_mapping,
+    int64_t ne11, int64_t ne10, size_t nb11, size_t nb12,
+    const sycl::nd_item<3> &item_ct1) {
     const int32_t i = item_ct1.get_group(2);
 
     const int32_t id   = row_mapping[i].i1;
