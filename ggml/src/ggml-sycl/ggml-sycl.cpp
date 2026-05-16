@@ -74,7 +74,6 @@ int g_ggml_sycl_prioritize_dmmv = 0;
 int g_ggml_sycl_use_async_mem_op = 0;
 int g_ggml_sycl_enable_level_zero = 0;
 int g_ggml_sycl_enable_flash_attention = 1;
-int g_ggml_sycl_mul_mat_id_n_streams = 1;
 
 
 static ggml_sycl_device_info ggml_sycl_init() {
@@ -256,7 +255,6 @@ static void ggml_check_sycl() try {
 #else
         g_ggml_sycl_enable_flash_attention = 0;
 #endif
-        g_ggml_sycl_mul_mat_id_n_streams = get_sycl_env("GGML_SYCL_MUL_MAT_ID_N_STREAMS", 1);
 
         GGML_SYCL_DEBUG("[SYCL] call ggml_check_sycl\n");
 
@@ -313,7 +311,6 @@ static void ggml_check_sycl() try {
         GGML_LOG_INFO("  GGML_SYCL_ENABLE_FLASH_ATTN: %d disabled by compile flag\n",
             g_ggml_sycl_enable_flash_attention);
 #endif
-        GGML_LOG_INFO("  GGML_SYCL_MUL_MAT_ID_N_STREAMS: %d\n", g_ggml_sycl_mul_mat_id_n_streams);
 
 /* NOT REMOVE, keep it for next optimize for XMX.
 #if defined(SYCL_USE_XMX)
@@ -4140,11 +4137,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         const unsigned int max_work_group_size = ggml_sycl_info().max_work_group_sizes[ctx.device];
         assert(max_work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
 
-        sycl::event scatter_done;
         {
             sycl::range<3> block_dims(1, 1, std::min((unsigned int)ne10, max_work_group_size));
             sycl::range<3> grid_dims(1, 1, n_routed_rows);
-            scatter_done = stream->submit([&](sycl::handler &cgh) {
+            stream->submit([&](sycl::handler &cgh) {
                 char *__restrict src1_contiguous_get =
                     src1_contiguous.get();
                 mmid_row_mapping *__restrict dev_row_mapping_get =
@@ -4162,24 +4158,11 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             });
         }
 
-        const int n_streams = std::min<int64_t>(
-            std::max(1, g_ggml_sycl_mul_mat_id_n_streams),
-            std::min<int64_t>(GGML_SYCL_MAX_STREAMS, n_as));
-        std::vector<bool> stream_waited_for_scatter(n_streams, false);
-
         for (int64_t i02 = 0; i02 < n_as; i02++) {
             const int64_t num_src1_rows = expert_row_counts[i02];
 
             if (num_src1_rows == 0) {
                 continue;
-            }
-
-            const int stream_slot = (int) (i02 % n_streams);
-            ggml_sycl_stream_override_guard stream_guard(ctx, stream_slot);
-            queue_ptr expert_stream = ctx.stream();
-            if (stream_slot != 0 && !stream_waited_for_scatter[stream_slot]) {
-                SYCL_CHECK(CHECK_TRY_ERROR(expert_stream->ext_oneapi_submit_barrier({scatter_done})));
-                stream_waited_for_scatter[stream_slot] = true;
             }
 
             const int64_t expert_row_offset = expert_row_offsets[i02];
@@ -4202,20 +4185,6 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             dst_row.nb[3] = num_src1_rows*nb1;
 
             ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row);
-        }
-
-        if (n_streams > 1) {
-            std::vector<sycl::event> events;
-            events.reserve(n_streams - 1);
-            for (int stream_slot = 1; stream_slot < n_streams; stream_slot++) {
-                if (!stream_waited_for_scatter[stream_slot]) {
-                    continue;
-                }
-                events.push_back(ctx.stream(ctx.device, stream_slot)->ext_oneapi_submit_barrier());
-            }
-            if (!events.empty()) {
-                SYCL_CHECK(CHECK_TRY_ERROR(ctx.stream(ctx.device, 0)->ext_oneapi_submit_barrier(events)));
-            }
         }
 
         {
