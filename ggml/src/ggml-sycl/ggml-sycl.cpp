@@ -4079,28 +4079,25 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         src1_row.data = src1_contiguous.get();
         dst_row.data  =  dst_contiguous.get();
 
-        // Group routed rows by expert. One pass over ids buckets each routed row
-        // under the expert the router assigned it; concatenating the buckets gives
-        // the expert-grouped order. row_mapping_host[k] then says which
-        // (route-slot, token) the k-th row of the contiguous buffer came from.
-        // expert_row_offsets is the fencepost array of slice boundaries:
-        // offsets[i] = start of expert i, offsets[i+1] = its end, offsets[0] = 0,
-        // offsets[n_as] = n_routed_rows.
-        std::vector<std::vector<mmid_row_mapping>> rows_by_expert(n_as);
-        for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
-            for (int64_t id = 0; id < n_ids; id++) {
-                const int32_t row_id_i = *(const int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
-                GGML_ASSERT(row_id_i >= 0 && row_id_i < n_as);
-                rows_by_expert[row_id_i].push_back({(int32_t) id, (int32_t) iid1});
-            }
-        }
-
+        // Group routed rows by expert: for each expert, scan all routed rows and
+        // append the ones the router assigned to it. row_mapping_host[k] then says
+        // which (route-slot, token) the k-th row of the expert-grouped contiguous
+        // buffer came from. expert_row_offsets is the fencepost array of slice
+        // boundaries: offsets[i] = start of expert i, offsets[i+1] = its end,
+        // offsets[0] = 0, offsets[n_as] = n_routed_rows.
         std::vector<int64_t> expert_row_offsets(n_as + 1, 0);
         std::vector<mmid_row_mapping> row_mapping_host;
         row_mapping_host.reserve(n_routed_rows);
         for (int64_t i02 = 0; i02 < n_as; i02++) {
-            row_mapping_host.insert(row_mapping_host.end(),
-                                    rows_by_expert[i02].begin(), rows_by_expert[i02].end());
+            for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
+                for (int64_t id = 0; id < n_ids; id++) {
+                    const int32_t row_id_i = *(const int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
+                    GGML_ASSERT(row_id_i >= 0 && row_id_i < n_as);
+                    if (row_id_i == i02) {
+                        row_mapping_host.push_back({(int32_t) id, (int32_t) iid1});
+                    }
+                }
+            }
             expert_row_offsets[i02 + 1] = (int64_t) row_mapping_host.size();
         }
 
