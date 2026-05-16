@@ -4095,19 +4095,24 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             expert_row_offsets[i02 + 1] = expert_row_offsets[i02] + expert_counts[i02];
         }
 
-        std::vector<int64_t> expert_cursors = expert_row_offsets;
+        std::vector<int64_t> expert_row_next = expert_row_offsets;
         std::vector<mmid_row_mapping> routed_row_src(n_routed_rows);
         for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
             for (int64_t id = 0; id < n_ids; id++) {
                 const int32_t row_id_i = *(const int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
                 GGML_ASSERT(row_id_i >= 0 && row_id_i < n_as);
-                routed_row_src[expert_cursors[row_id_i]++] = {(int32_t) id, (int32_t) iid1};
+
+                // find and validate the next free row for a given expert (row_id_i)
+                const int64_t routed_row = expert_row_next[row_id_i]++;
+                GGML_ASSERT(routed_row >= expert_row_offsets[row_id_i]);
+                GGML_ASSERT(routed_row <  expert_row_offsets[row_id_i + 1]);
+                routed_row_src[routed_row] = {(int32_t) id, (int32_t) iid1};
             }
         }
 
         ggml_sycl_pool_alloc<mmid_row_mapping> dev_row_mapping(ctx.pool(), n_routed_rows);
         SYCL_CHECK(CHECK_TRY_ERROR(
-            stream->memcpy(dev_row_mapping.get(), routed_row_src.data(), n_routed_rows*sizeof(mmid_row_mapping))));
+                stream->memcpy(dev_row_mapping.get(), routed_row_src.data(), n_routed_rows*sizeof(mmid_row_mapping))));
 
         const unsigned int max_work_group_size = ggml_sycl_info().max_work_group_sizes[ctx.device];
         assert(max_work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
