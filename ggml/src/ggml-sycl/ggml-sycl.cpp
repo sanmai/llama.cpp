@@ -4140,20 +4140,20 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
             }
 
 
-            const int64_t expert_offset = expert_row_offsets[i02];
+            const int64_t expert_row_offset = expert_row_offsets[i02];
 
             src0_row.data = src0_original + i02*nb02;
 
             GGML_ASSERT(nb11 == sizeof(float)*ne10);
             GGML_ASSERT(nb1 == sizeof(float)*ne0);
-            src1_row.data = src1_contiguous.get() + expert_offset*nb11;
+            src1_row.data = src1_contiguous.get() + expert_row_offset*nb11;
             src1_row.ne[1] = num_src1_rows;
 
             src1_row.nb[1] = nb11;
             src1_row.nb[2] = num_src1_rows*nb11;
             src1_row.nb[3] = num_src1_rows*nb11;
 
-            dst_row.data = dst_contiguous.get() + expert_offset*nb1;
+            dst_row.data = dst_contiguous.get() + expert_row_offset*nb1;
             dst_row.ne[1] = num_src1_rows;
             dst_row.nb[1] = nb1;
             dst_row.nb[2] = num_src1_rows*nb1;
