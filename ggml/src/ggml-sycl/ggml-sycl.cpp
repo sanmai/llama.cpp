@@ -3919,7 +3919,7 @@ __dpct_inline__ static void k_copy_src1_to_contiguous(
     const mmid_row_mapping *__restrict__ row_mapping,
     int64_t ne11, int64_t ne10, size_t nb11, size_t nb12,
     const sycl::nd_item<3> &item_ct1) {
-    const int32_t i = item_ct1.get_group(2);
+    int32_t src1_row = item_ct1.get_group(2);
 
     const int32_t id   = row_mapping[i].i1;
     const int32_t iid1 = row_mapping[i].i2;
@@ -3928,12 +3928,12 @@ __dpct_inline__ static void k_copy_src1_to_contiguous(
     const int64_t i12 = iid1;
 
     const float * src1_row_original = (const float *)(src1_original + i11*nb11 + i12*nb12);
-    float * src1_row_contiguous = (float *)(src1_contiguous + i*nb11);
+    float * src1_row_contiguous = (float *)(src1_contiguous + src1_row*nb11);
 
 #pragma unroll
-    for (int j = item_ct1.get_local_id(2); j < ne10;
-         j += item_ct1.get_local_range(2)) {
-        src1_row_contiguous[j] = src1_row_original[j];
+    for (int i = item_ct1.get_local_id(2); i < ne10;
+         i += item_ct1.get_local_range(2)) {
+        src1_row_contiguous[i] = src1_row_original[i];
     }
 }
 
