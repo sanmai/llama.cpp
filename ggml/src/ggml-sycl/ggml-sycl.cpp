@@ -4001,6 +4001,47 @@ static bool ggml_sycl_mul_mat_id_mmvq_fused(
         src1_row_stride, stream);
 }
 
+// counting sort of the routed rows by expert id (row_id_i, as chosen by the router):
+// builds a projection of a memory layout where each expert's slice is contiguous
+static void mmid_counting_sort_rows(
+        const ggml_tensor * ids, const char * ids_host,
+        int64_t n_ids, int64_t n_as, int64_t n_routed_rows,
+        std::vector<int64_t> & expert_counts,
+        std::vector<int64_t> & expert_row_offsets,
+        std::vector<mmid_row_mapping> & routed_row_src) {
+
+    // frequencies: how many routed rows each expert "owns"
+    expert_counts.assign(n_as, 0);
+    for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
+        for (int64_t id = 0; id < n_ids; id++) {
+            const int32_t row_id_i = *(const int32_t *) (ids_host + iid1*ids->nb[1] + id*ids->nb[0]);
+            GGML_ASSERT(row_id_i >= 0 && row_id_i < n_as);
+            expert_counts[row_id_i]++;
+        }
+    }
+
+    // where each expert's slice starts (row indices) and the previous ends
+    expert_row_offsets.assign(n_as + 1, 0);
+    for (int64_t i02 = 0; i02 < n_as; i02++) {
+        expert_row_offsets[i02 + 1] = expert_row_offsets[i02] + expert_counts[i02];
+    }
+
+    std::vector<int64_t> expert_row_next = expert_row_offsets;
+    routed_row_src.resize(n_routed_rows);
+    for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
+        for (int64_t id = 0; id < n_ids; id++) {
+            const int32_t row_id_i = *(const int32_t *) (ids_host + iid1*ids->nb[1] + id*ids->nb[0]);
+            GGML_ASSERT(row_id_i >= 0 && row_id_i < n_as);
+
+            // find and validate the next free row for a given expert (row_id_i)
+            const int64_t routed_row = expert_row_next[row_id_i]++;
+            GGML_ASSERT(routed_row >= expert_row_offsets[row_id_i]);
+            GGML_ASSERT(routed_row < expert_row_offsets[row_id_i + 1]);
+            routed_row_src[routed_row] = {(int32_t) id, (int32_t) iid1};
+        }
+    }
+}
+
 static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                                  ggml_tensor *dst) try {
     scope_op_debug_print scope_dbg_print(__func__, dst, /*num_src=*/3);
@@ -4079,37 +4120,15 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         src1_row.data = src1_contiguous.get();
         dst_row.data  =  dst_contiguous.get();
 
-        // start with the counting sort by computing the frequencies, i.e., how many routed
-        // rows each expert "owns" (row_id_i is an expert id as chosen by the router)
-        std::vector<int64_t> expert_counts(n_as, 0);
-        for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
-            for (int64_t id = 0; id < n_ids; id++) {
-                const int32_t row_id_i = *(const int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
-                GGML_ASSERT(row_id_i >= 0 && row_id_i < n_as);
-                expert_counts[row_id_i]++;
-            }
-        }
+        // how many "owned" routed rows to pass to each expert
+        std::vector<int64_t> expert_counts;
+        // where each expert's slice starts and the previous ends (row indices, right-exclusive)
+        std::vector<int64_t> expert_row_offsets;
+        // the sources (slot/token pairs) of contiguous rows to guide k_copy_src1_to_contiguous
+        std::vector<mmid_row_mapping> routed_row_src;
 
-        // where each expert's slice starts (row indices) and the previous ends
-        std::vector<int64_t> expert_row_offsets(n_as + 1, 0);
-        for (int64_t i02 = 0; i02 < n_as; i02++) {
-            expert_row_offsets[i02 + 1] = expert_row_offsets[i02] + expert_counts[i02];
-        }
-
-        std::vector<int64_t> expert_row_next = expert_row_offsets;
-        std::vector<mmid_row_mapping> routed_row_src(n_routed_rows);
-        for (int64_t iid1 = 0; iid1 < ids->ne[1]; iid1++) {
-            for (int64_t id = 0; id < n_ids; id++) {
-                const int32_t row_id_i = *(const int32_t *) (ids_host.data() + iid1*ids->nb[1] + id*ids->nb[0]);
-                GGML_ASSERT(row_id_i >= 0 && row_id_i < n_as);
-
-                // find and validate the next free row for a given expert (row_id_i)
-                const int64_t routed_row = expert_row_next[row_id_i]++;
-                GGML_ASSERT(routed_row >= expert_row_offsets[row_id_i]);
-                GGML_ASSERT(routed_row < expert_row_offsets[row_id_i + 1]);
-                routed_row_src[routed_row] = {(int32_t) id, (int32_t) iid1};
-            }
-        }
+        mmid_counting_sort_rows(ids, ids_host.data(), n_ids, n_as, n_routed_rows,
+                                expert_counts, expert_row_offsets, routed_row_src);
 
         ggml_sycl_pool_alloc<mmid_row_mapping> dev_row_mapping(ctx.pool(), n_routed_rows);
         SYCL_CHECK(CHECK_TRY_ERROR(
