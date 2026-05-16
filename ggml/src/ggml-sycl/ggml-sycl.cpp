@@ -3921,8 +3921,8 @@ __dpct_inline__ static void k_copy_src1_to_contiguous(
     const sycl::nd_item<3> &item_ct1) {
     const int32_t src1_row = item_ct1.get_group(2);
 
-    const int32_t id   = row_mapping[i].i1;
-    const int32_t iid1 = row_mapping[i].i2;
+    const int32_t id   = row_mapping[src1_row].i1;
+    const int32_t iid1 = row_mapping[src1_row].i2;
 
     const int64_t i11 = id % ne11;
     const int64_t i12 = iid1;
@@ -4023,9 +4023,10 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
     }
 
     std::vector<char> ids_host(ggml_nbytes(ids));
+    const char * ids_dev = (const char *) ids->data;
 
     SYCL_CHECK(CHECK_TRY_ERROR(
-        stream->memcpy(ids_host.data(), ids->data, ggml_nbytes(ids))));
+        stream->memcpy(ids_host.data(), ids_dev, ggml_nbytes(ids))));
     SYCL_CHECK(CHECK_TRY_ERROR(stream->wait()));
 
     ggml_tensor src0_row = *src0;
