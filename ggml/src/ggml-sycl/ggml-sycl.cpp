@@ -4144,6 +4144,29 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
         SYCL_CHECK(CHECK_TRY_ERROR(
             stream->memcpy(dev_row_mapping.get(), row_mapping_host.data(), n_routed_rows*sizeof(mmid_row_mapping))));
 
+        const unsigned int max_work_group_size = ggml_sycl_info().max_work_group_sizes[ctx.device];
+        assert(max_work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
+
+        {
+            sycl::range<3> block_dims(1, 1, std::min((unsigned int)ne10, max_work_group_size));
+            sycl::range<3> grid_dims(1, 1, n_routed_rows);
+            stream->submit([&](sycl::handler &cgh) {
+                char *__restrict src1_contiguous_get =
+                    src1_contiguous.get();
+                mmid_row_mapping *__restrict dev_row_mapping_get =
+                    dev_row_mapping.get();
+
+                cgh.parallel_for(
+                    sycl::nd_range<3>(grid_dims * block_dims, block_dims),
+                    [=](sycl::nd_item<3> item_ct1) {
+                        k_copy_src1_from_row_mapping(
+                            src1_original, src1_contiguous_get,
+                            dev_row_mapping_get, ne11, ne10, nb11, nb12,
+                            item_ct1);
+                    });
+            });
+        }
+
         for (int64_t i02 = 0; i02 < n_as; i02++) {
             const int64_t num_src1_rows = expert_counts[i02];
 
@@ -4154,65 +4177,44 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
 
             const int64_t expert_offset = expert_offsets[i02];
 
-            const unsigned int max_work_group_size = ggml_sycl_info().max_work_group_sizes[ctx.device];
-            assert(max_work_group_size % (WARP_SIZE * WARP_SIZE) == 0);
-
-            {
-                sycl::range<3> block_dims(1, 1, std::min((unsigned int)ne10, max_work_group_size));
-                sycl::range<3> grid_dims(1, 1, num_src1_rows);
-                stream->submit([&](sycl::handler &cgh) {
-                    char *__restrict src1_contiguous_get =
-                        src1_contiguous.get();
-                    mmid_row_mapping *__restrict dev_row_mapping_get =
-                        dev_row_mapping.get() + expert_offset;
-
-                    cgh.parallel_for(
-                        sycl::nd_range<3>(grid_dims * block_dims, block_dims),
-                        [=](sycl::nd_item<3> item_ct1) {
-                            k_copy_src1_from_row_mapping(
-                                src1_original, src1_contiguous_get,
-                                dev_row_mapping_get, ne11, ne10, nb11, nb12,
-                                item_ct1);
-                        });
-                });
-            }
-
             src0_row.data = src0_original + i02*nb02;
 
             GGML_ASSERT(nb11 == sizeof(float)*ne10);
             GGML_ASSERT(nb1 == sizeof(float)*ne0);
+            src1_row.data = src1_contiguous.get() + expert_offset*nb11;
             src1_row.ne[1] = num_src1_rows;
 
             src1_row.nb[1] = nb11;
             src1_row.nb[2] = num_src1_rows*nb11;
             src1_row.nb[3] = num_src1_rows*nb11;
 
+            dst_row.data = dst_contiguous.get() + expert_offset*nb1;
             dst_row.ne[1] = num_src1_rows;
             dst_row.nb[1] = nb1;
             dst_row.nb[2] = num_src1_rows*nb1;
             dst_row.nb[3] = num_src1_rows*nb1;
 
             ggml_sycl_mul_mat(ctx, &src0_row, &src1_row, &dst_row);
+        }
 
-            {
-                sycl::range<3> block_dims(1, 1, std::min((unsigned int)ne0, max_work_group_size));
-                sycl::range<3> grid_dims(1, 1, num_src1_rows);
-                stream->submit([&](sycl::handler &cgh) {
-                    const char *__restrict dst_contiguous_get =
-                        dst_contiguous.get();
-                    const mmid_row_mapping *__restrict dev_row_mapping_get =
-                        dev_row_mapping.get() + expert_offset;
+        {
+            sycl::range<3> block_dims(1, 1, std::min((unsigned int)ne0, max_work_group_size));
+            sycl::range<3> grid_dims(1, 1, n_routed_rows);
+            stream->submit([&](sycl::handler &cgh) {
+                const char *__restrict dst_contiguous_get =
+                    dst_contiguous.get();
+                const mmid_row_mapping *__restrict dev_row_mapping_get =
+                    dev_row_mapping.get();
 
-                    cgh.parallel_for(
-                        sycl::nd_range<3>(grid_dims * block_dims, block_dims),
-                        [=](sycl::nd_item<3> item_ct1) {
-                            k_copy_dst_from_contiguous(dst_original,
-                                                       dst_contiguous_get,
-                                                       dev_row_mapping_get,
-                                                       ne0, nb1, nb2, item_ct1);
-                        });
-                });
-            }
+                cgh.parallel_for(
+                    sycl::nd_range<3>(grid_dims * block_dims, block_dims),
+                    [=](sycl::nd_item<3> item_ct1) {
+                        k_copy_dst_from_contiguous(dst_original,
+                                                   dst_contiguous_get,
+                                                   dev_row_mapping_get,
+                                                   ne0, nb1, nb2, item_ct1);
+                    });
+            });
         }
     }
 }
