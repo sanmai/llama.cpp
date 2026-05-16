@@ -3916,47 +3916,6 @@ struct mmid_row_mapping {
 
 __dpct_inline__ static void k_copy_src1_to_contiguous(
     const char *__restrict__ src1_original, char *__restrict__ src1_contiguous,
-    int *__restrict__ cur_src1_row, mmid_row_mapping *__restrict__ row_mapping,
-    const char *__restrict ids, int64_t i02, size_t ids_nb1, size_t ids_nb0,
-    int64_t ne11, int64_t ne10, size_t nb11, size_t nb12,
-    const sycl::nd_item<3> &item_ct1, int &src1_row) {
-    int32_t iid1 = item_ct1.get_group(2);
-    int32_t id = item_ct1.get_group(1);
-
-    const int32_t row_id_i = *(const int32_t *) (ids + iid1*ids_nb1 + id*ids_nb0);
-
-    if (row_id_i != i02) {
-        return;
-    }
-
-    const int64_t i11 = id % ne11;
-    const int64_t i12 = iid1;
-
-    if (item_ct1.get_local_id(2) == 0) {
-        src1_row =
-            dpct::atomic_fetch_add<sycl::access::address_space::generic_space>(
-                cur_src1_row, 1);
-        row_mapping[src1_row] = {id, iid1};
-    }
-    /*
-    DPCT1065:194: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
-    item_ct1.barrier();
-
-    const float * src1_row_original = (const float *)(src1_original + i11*nb11 + i12*nb12);
-    float * src1_row_contiguous = (float *)(src1_contiguous + src1_row*nb11);
-
-#pragma unroll
-    for (int i = item_ct1.get_local_id(2); i < ne10;
-         i += item_ct1.get_local_range(2)) {
-        src1_row_contiguous[i] = src1_row_original[i];
-    }
-}
-
-__dpct_inline__ static void k_copy_src1_from_row_mapping(
-    const char *__restrict__ src1_original, char *__restrict__ src1_contiguous,
     const mmid_row_mapping *__restrict__ row_mapping, int64_t ne11, int64_t ne10,
     size_t nb11, size_t nb12, const sycl::nd_item<3> &item_ct1) {
     const int32_t i = item_ct1.get_group(2);
@@ -4159,7 +4118,7 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                 cgh.parallel_for(
                     sycl::nd_range<3>(grid_dims * block_dims, block_dims),
                     [=](sycl::nd_item<3> item_ct1) {
-                        k_copy_src1_from_row_mapping(
+                        k_copy_src1_to_contiguous(
                             src1_original, src1_contiguous_get,
                             dev_row_mapping_get, ne11, ne10, nb11, nb12,
                             item_ct1);
