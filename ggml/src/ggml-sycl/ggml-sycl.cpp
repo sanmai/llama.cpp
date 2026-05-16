@@ -4131,7 +4131,8 @@ static void ggml_sycl_mul_mat_id(ggml_backend_sycl_context & ctx,
                     [=](sycl::nd_item<3> item_ct1) {
                         k_copy_src1_to_contiguous(
                             src1_original, src1_contiguous_get,
-                            dev_row_mapping_get, ne11, ne10, nb11, nb12,
+                            dev_row_mapping_get,
+                            ne11, ne10, nb11, nb12,
                             item_ct1);
                     });
             });
