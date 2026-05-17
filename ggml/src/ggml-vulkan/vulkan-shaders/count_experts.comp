@@ -11,13 +11,13 @@ layout (push_constant) uniform parameter
     uint32_t a_offset;
 } p;
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+#define BLOCK_SIZE 256
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
 layout (binding = 0) readonly buffer A {int data_a[];};
 layout (binding = 1) writeonly buffer Counts {uint data_expert_count[];};
 layout (binding = 2) writeonly buffer RowIds {uint data_row_ids[];};
-
-#define BLOCK_SIZE 256
 
 shared uint thread_counts[BLOCK_SIZE];
 
@@ -63,7 +63,7 @@ void main() {
         }
     }
 
-    if (tid == BLOCK_SIZE - 1) {
+    if (tid == 0) {
         data_expert_count[expert_id] = expert_count;
     }
 }
