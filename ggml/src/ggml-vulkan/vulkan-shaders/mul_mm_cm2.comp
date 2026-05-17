@@ -95,6 +95,7 @@ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
+layout (binding = 5) readonly buffer RowIds {uint data_row_ids[];};
 
 shared u16vec4 row_ids[BN];
 
@@ -104,7 +105,6 @@ layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufB {
 
 uint _ne1;
 layout (constant_id = 5) const uint subgroup_size = 32;
-shared uvec4 ballots_sh[BLOCK_SIZE / subgroup_size];
 
 B_TYPE decodeFuncB(const in decodeBufB bl, const in uint blockCoords[2], const in uint coordInBlock[2])
 {
@@ -129,68 +129,16 @@ D_TYPE perElemOpD(const in uint32_t r, const in uint32_t c, const in D_TYPE elem
     return elem;
 }
 
-void load_row_ids(uint expert_idx, bool nei0_is_pow2, uint ic) {
-    _ne1 = 0;
-    uint num_elements = p.nei1 * p.nei0;
-    uint nei0shift = findLSB(p.nei0);
+void load_row_ids(uint expert_idx, uint ic) {
+    _ne1 = data_expert_count[expert_idx];
 
-    uint ids[16];
-    uint iter = 0;
+    const uint row_base = expert_idx * p.nei1 * p.nei0 + ic * BN;
 
-    uint expert_count = data_expert_count[expert_idx];
-
-    for (uint j = 0; j < num_elements; j += BLOCK_SIZE) {
-        // prefetch up to 16 elements
-        if (iter == 0) {
-            [[unroll]] for (uint k = 0; k < 16; ++k) {
-                uint i = j + gl_LocalInvocationIndex + k*BLOCK_SIZE;
-                bool in_range = i < num_elements;
-                uint ii1;
-                if (nei0_is_pow2) {
-                    ii1 = i >> nei0shift;
-                } else {
-                    ii1 = i / p.nei0;
-                }
-                uint ii0 = i - ii1 * p.nei0;
-                ids[k] = in_range ? data_ids[ii1*p.nbi1 + ii0] : 0;
-            }
-        }
-        uint i = j + gl_LocalInvocationIndex;
-        bool in_range = i < num_elements;
-        uint ii1;
-        if (nei0_is_pow2) {
-            ii1 = i >> nei0shift;
-        } else {
-            ii1 = i / p.nei0;
-        }
-        uint ii0 = i - ii1 * p.nei0;
-        uint id = ids[iter++];
-        uvec4 ballot = subgroupBallot(in_range && id == expert_idx);
-
-        if (gl_SubgroupInvocationID == 0) {
-            ballots_sh[gl_SubgroupID] = ballot;
-        }
-        barrier();
-
-        uint subgroup_base = 0;
-        uint total = 0;
-        for (uint k = 0; k < gl_NumSubgroups; ++k) {
-            if (k == gl_SubgroupID) {
-                subgroup_base = total;
-            }
-            total += subgroupBallotBitCount(ballots_sh[k]);
-        }
-        barrier();
-
-        uint idx = subgroup_base + subgroupBallotExclusiveBitCount(ballot);
-        if (in_range && id == expert_idx && _ne1 + idx >= ic * BN && _ne1 + idx < (ic + 1) * BN) {
-            row_ids[_ne1 + idx - ic * BN] = u16vec4(fastmod(ii0, p.ne11), ii1, ii0, 0);
-        }
-        _ne1 += total;
-        iter &= 15;
-        if (_ne1 >= (ic + 1) * BN || _ne1 == expert_count) {
-            break;
-        }
+    for (uint i = gl_LocalInvocationIndex; i < BN && ic * BN + i < _ne1; i += BLOCK_SIZE) {
+        const uint row_id = data_row_ids[row_base + i];
+        const uint ii0 = row_id & 0xffff;
+        const uint ii1 = row_id >> 16;
+        row_ids[i] = u16vec4(fastmod(ii0, p.ne11), ii1, ii0, 0);
     }
     barrier();
 }
@@ -235,11 +183,7 @@ void main() {
     const uint ik = gl_WorkGroupID.x / blocks_m;
 
 #ifdef MUL_MAT_ID
-    if (bitCount(p.nei0) == 1) {
-        load_row_ids(expert_idx, true, ic);
-    } else {
-        load_row_ids(expert_idx, false, ic);
-    }
+    load_row_ids(expert_idx, ic);
 
     // Workgroup has no work
     if (ic * BN >= _ne1) return;

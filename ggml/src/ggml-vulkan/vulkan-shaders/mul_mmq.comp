@@ -36,6 +36,7 @@ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
 layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
+layout (binding = 5) readonly buffer RowIds {uint data_row_ids[];};
 #endif
 
 layout (push_constant) uniform parameter
@@ -157,27 +158,7 @@ void main() {
     const uint loadstride_b = BLOCK_SIZE * LOAD_VEC_B / BK;
 
 #ifdef MUL_MAT_ID
-#ifdef MUL_MAT_ID_USE_SUBGROUPS
-    if (bitCount(p.nei0) == 1) {
-        load_row_ids(expert_idx, true, ic);
-    } else {
-        load_row_ids(expert_idx, false, ic);
-    }
-#else
-    _ne1 = 0;
-    for (uint ii1 = 0; ii1 < p.nei1 && _ne1 < (ic + 1) * BN; ii1++) {
-        for (uint ii0 = 0; ii0 < p.nei0 && _ne1 < (ic + 1) * BN; ii0++) {
-            if (data_ids[ii1*p.nbi1 + ii0] == expert_idx) {
-                if (_ne1 >= ic * BN) {
-                    row_ids[_ne1 - ic * BN] = u16vec2(ii0, ii1);
-                }
-                _ne1++;
-            }
-        }
-    }
-
-    barrier();
-#endif
+    load_row_ids(expert_idx, ic);
 
     // Workgroup has no work
     if (ic * BN >= _ne1) return;

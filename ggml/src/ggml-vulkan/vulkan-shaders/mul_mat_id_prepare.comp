@@ -1,0 +1,69 @@
+#version 450
+
+#include "types.glsl"
+
+layout (push_constant) uniform parameter
+{
+    uint32_t ne00;
+    uint32_t ne01;
+    uint32_t nb00;
+    uint32_t nb01;
+    uint32_t a_offset;
+} p;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {int data_a[];};
+layout (binding = 1) writeonly buffer Counts {uint data_expert_count[];};
+layout (binding = 2) writeonly buffer RowIds {uint data_row_ids[];};
+
+#define BLOCK_SIZE 256
+
+shared uint thread_counts[BLOCK_SIZE];
+
+void main() {
+    const uint expert_id = gl_WorkGroupID.x;
+    const uint num_elements = p.ne00 * p.ne01;
+    const uint tid = gl_LocalInvocationID.x;
+
+    uint count = 0;
+
+    for (uint idx = tid; idx < num_elements; idx += BLOCK_SIZE) {
+        const uint i01 = idx / p.ne00;
+        const uint i00 = idx % p.ne00;
+        const uint row_expert_id = uint(data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00]);
+
+        if (row_expert_id == expert_id) {
+            ++count;
+        }
+    }
+
+    thread_counts[tid] = count;
+    barrier();
+
+    for (uint offset = 1; offset < BLOCK_SIZE; offset <<= 1) {
+        const uint addend = tid >= offset ? thread_counts[tid - offset] : 0;
+        barrier();
+        thread_counts[tid] += addend;
+        barrier();
+    }
+
+    const uint expert_count = thread_counts[BLOCK_SIZE - 1];
+    const uint row_base = expert_id * num_elements;
+    uint pos = tid == 0 ? 0 : thread_counts[tid - 1];
+
+    for (uint idx = tid; idx < num_elements; idx += BLOCK_SIZE) {
+        const uint i01 = idx / p.ne00;
+        const uint i00 = idx % p.ne00;
+        const uint row_expert_id = uint(data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00]);
+
+        if (row_expert_id == expert_id) {
+            data_row_ids[row_base + pos] = (i01 << 16) | i00;
+            ++pos;
+        }
+    }
+
+    if (tid == BLOCK_SIZE - 1) {
+        data_expert_count[expert_id] = expert_count;
+    }
+}
