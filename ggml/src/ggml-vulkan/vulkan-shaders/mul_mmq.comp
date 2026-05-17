@@ -35,8 +35,8 @@ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
-layout (binding = 4) readonly buffer Offsets {uint data_expert_offset[];};
-layout (binding = 5) readonly buffer RowIds {uvec2 data_row_ids[];};
+layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
+layout (binding = 5) readonly buffer RowIds {uint data_row_ids[];};
 #endif
 
 layout (push_constant) uniform parameter
@@ -112,7 +112,7 @@ void main() {
 
 #ifdef MUL_MAT_ID
     const uint expert_idx = gl_WorkGroupID.z;
-    if (ic * BN >= data_expert_offset[expert_idx + 1] - data_expert_offset[expert_idx]) {
+    if (ic * BN >= data_expert_count[expert_idx]) {
         return;
     }
 #endif
@@ -207,7 +207,7 @@ void main() {
             const uint buf_ib = loadc_b + l;
 
 #ifdef MUL_MAT_ID
-            const uvec2 row_idx = row_ids[buf_ib];
+            const u16vec2 row_idx = row_ids[buf_ib];
             const uint ib = pos_b_ib + row_idx.y * p.batch_stride_b / BK + (row_idx.x % p.ne11) * p.stride_b / BK;
 #else
             const uint ib = pos_b_ib + buf_ib * p.stride_b / BK;
@@ -272,7 +272,7 @@ void main() {
                 const uint row_i = dc_warp + cc;
                 if (row_i >= _ne1) break;
 
-                const uvec2 row_idx = row_ids[row_i - ic * BN];
+                const u16vec2 row_idx = row_ids[row_i - ic * BN];
 #endif // MUL_MAT_ID
                 [[unroll]] for (uint cr = 0; cr < TM; cr++) {
                     const uint sums_idx = (wsic * TN + cc) * WMITER * TM + wsir * TM + cr;

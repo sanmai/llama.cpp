@@ -561,7 +561,7 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
 void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uint ic, const uint _ne1, const uint block, const uint end_k) {
 #if LOAD_VEC_B == 8
             // Not supported for b_type bf16 because bf16mat2x4 does not exist
-            const uvec2 row_idx = row_ids[col];
+            const u16vec2 row_idx = row_ids[col];
             const uint idx = pos_b + row_idx.y * p.batch_stride_b / LOAD_VEC_B + (row_idx.x % p.ne11) * p.stride_b / LOAD_VEC_B + row;
             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_B / 2;
             FLOAT_TYPEV8 bb = FLOAT_TYPEV8(data_b[idx]);
@@ -570,7 +570,7 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
             buf_b[buf_idx + 2] = bb[1].xy;
             buf_b[buf_idx + 3] = bb[1].zw;
 #elif LOAD_VEC_B == 4
-            const uvec2 row_idx = row_ids[col];
+            const u16vec2 row_idx = row_ids[col];
             const uint idx = pos_b + row_idx.y * p.batch_stride_b / LOAD_VEC_B + (row_idx.x % p.ne11) * p.stride_b / LOAD_VEC_B + row;
             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_B / 2;
 #if defined(DATA_B_BF16)
@@ -584,12 +584,12 @@ void load_b_to_shmem(const uint pos_b, const uint row, const uint col, const uin
             const uint row_i = ic * BN + col;
             const uint buf_idx = col * SHMEM_STRIDE + row;
             if (row_i < _ne1 && block + row * 2 + 1 < end_k) {
-                const uvec2 row_idx = row_ids[col];
+                const u16vec2 row_idx = row_ids[col];
                 const uint idx = pos_b + row_idx.y * p.batch_stride_b + (row_idx.x % p.ne11) * p.stride_b + row * 2;
                 buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b[idx]),
                                               TO_FLOAT_TYPE(data_b[idx + 1]));
             } else if (row_i < _ne1 && block + row * 2 < end_k) {
-                const uvec2 row_idx = row_ids[col];
+                const u16vec2 row_idx = row_ids[col];
                 const uint idx = pos_b + row_idx.y * p.batch_stride_b + (row_idx.x % p.ne11) * p.stride_b + row * 2;
                 buf_b[buf_idx] = FLOAT_TYPEV2(TO_FLOAT_TYPE(data_b[idx]), 0.0f);
             } else {
