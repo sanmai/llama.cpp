@@ -1,0 +1,49 @@
+#version 450
+
+#include "types.glsl"
+
+layout (push_constant) uniform parameter
+{
+    uint32_t n_workgroups;
+} p;
+
+#define BLOCK_SIZE 256
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer PartialCounts {uint data_partial_counts[];};
+layout (binding = 1) writeonly buffer ExpertCounts {uint data_expert_count[];};
+layout (binding = 2) writeonly buffer WorkgroupOffsets {uint data_workgroup_offsets[];};
+
+shared uint thread_counts[BLOCK_SIZE];
+
+void main() {
+    const uint expert_id = gl_WorkGroupID.x;
+    const uint tid = gl_LocalInvocationID.x;
+    const uint base = expert_id * p.n_workgroups;
+
+    uint count = 0;
+    for (uint wg = tid; wg < p.n_workgroups; wg += BLOCK_SIZE) {
+        count += data_partial_counts[base + wg];
+    }
+
+    thread_counts[tid] = count;
+    barrier();
+
+    for (uint offset = 1; offset < BLOCK_SIZE; offset <<= 1) {
+        const uint addend = tid >= offset ? thread_counts[tid - offset] : 0;
+        barrier();
+        thread_counts[tid] += addend;
+        barrier();
+    }
+
+    uint running = tid == 0 ? 0 : thread_counts[tid - 1];
+    for (uint wg = tid; wg < p.n_workgroups; wg += BLOCK_SIZE) {
+        data_workgroup_offsets[base + wg] = running;
+        running += data_partial_counts[base + wg];
+    }
+
+    if (tid == 0) {
+        data_expert_count[expert_id] = thread_counts[BLOCK_SIZE - 1];
+    }
+}

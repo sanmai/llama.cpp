@@ -1,0 +1,50 @@
+#version 450
+
+#include "types.glsl"
+
+layout (push_constant) uniform parameter
+{
+    uint32_t ne00;
+    uint32_t ne01;
+    uint32_t nb00;
+    uint32_t nb01;
+    uint32_t a_offset;
+    uint32_t n_experts;
+} p;
+
+#define BLOCK_SIZE 256
+#define MAX_EXPERTS 1024
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {int data_a[];};
+layout (binding = 1) writeonly buffer PartialCounts {uint data_partial_counts[];};
+
+shared uint expert_counts[MAX_EXPERTS];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint wg = gl_WorkGroupID.x;
+    const uint num_elements = p.ne00 * p.ne01;
+    const uint row = wg * BLOCK_SIZE + tid;
+
+    for (uint expert_id = tid; expert_id < p.n_experts; expert_id += BLOCK_SIZE) {
+        expert_counts[expert_id] = 0;
+    }
+    barrier();
+
+    if (row < num_elements) {
+        const uint i01 = row / p.ne00;
+        const uint i00 = row % p.ne00;
+        const uint expert_id = uint(data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00]);
+
+        if (expert_id < p.n_experts) {
+            atomicAdd(expert_counts[expert_id], 1);
+        }
+    }
+    barrier();
+
+    for (uint expert_id = tid; expert_id < p.n_experts; expert_id += BLOCK_SIZE) {
+        data_partial_counts[expert_id * gl_NumWorkGroups.x + wg] = expert_counts[expert_id];
+    }
+}

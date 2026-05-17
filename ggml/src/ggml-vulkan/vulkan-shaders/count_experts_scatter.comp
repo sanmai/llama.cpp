@@ -1,0 +1,71 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+#include "types.glsl"
+
+layout (push_constant) uniform parameter
+{
+    uint32_t ne00;
+    uint32_t ne01;
+    uint32_t nb00;
+    uint32_t nb01;
+    uint32_t a_offset;
+    uint32_t n_experts;
+    uint32_t n_workgroups;
+} p;
+
+#define BLOCK_SIZE 256
+#define MAX_EXPERTS 1024
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {int data_a[];};
+layout (binding = 1) readonly buffer WorkgroupOffsets {uint data_workgroup_offsets[];};
+layout (binding = 2) writeonly buffer RowIds {uint data_row_ids[];};
+
+shared uint expert_cursors[MAX_EXPERTS];
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint wg = gl_WorkGroupID.x;
+    const uint num_elements = p.ne00 * p.ne01;
+    const uint row = wg * BLOCK_SIZE + tid;
+
+    for (uint expert_id = tid; expert_id < p.n_experts; expert_id += BLOCK_SIZE) {
+        expert_cursors[expert_id] = 0;
+    }
+    barrier();
+
+    if (row >= num_elements) {
+        return;
+    }
+
+    const uint i01 = row / p.ne00;
+    const uint i00 = row % p.ne00;
+    const uint row_expert_id = uint(data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00]);
+
+    bool pending = row_expert_id < p.n_experts;
+    while (subgroupBallotBitCount(subgroupBallot(pending)) > 0) {
+        const uint leader = subgroupBallotFindLSB(subgroupBallot(pending));
+        const uint expert_id = subgroupShuffle(row_expert_id, leader);
+        const uvec4 same_expert = subgroupBallot(pending && row_expert_id == expert_id);
+        const uint local_pos = subgroupBallotExclusiveBitCount(same_expert);
+        const uint subgroup_count = subgroupBallotBitCount(same_expert);
+
+        uint pos_base = 0;
+        if (gl_SubgroupInvocationID == leader) {
+            pos_base = atomicAdd(expert_cursors[expert_id], subgroup_count);
+        }
+        pos_base = subgroupShuffle(pos_base, leader);
+
+        if (pending && row_expert_id == expert_id) {
+            const uint expert_base = row_expert_id * num_elements;
+            const uint wg_base = data_workgroup_offsets[row_expert_id * p.n_workgroups + wg];
+            data_row_ids[expert_base + wg_base + pos_base + local_pos] = (i01 << 16) | i00;
+            pending = false;
+        }
+    }
+}

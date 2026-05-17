@@ -871,6 +871,9 @@ struct vk_device_struct {
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
     vk_pipeline pipeline_count_experts;
+    vk_pipeline pipeline_count_experts_partials;
+    vk_pipeline pipeline_count_experts_prefix;
+    vk_pipeline pipeline_count_experts_scatter;
 
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
     vk_pipeline pipeline_topk_moe[num_topk_moe_pipelines][2];
@@ -1128,6 +1131,29 @@ struct vk_op_count_experts_push_constants {
     uint32_t nb00;
     uint32_t nb01;
     uint32_t a_offset;
+};
+
+struct vk_op_count_experts_partials_push_constants {
+    uint32_t ne00;
+    uint32_t ne01;
+    uint32_t nb00;
+    uint32_t nb01;
+    uint32_t a_offset;
+    uint32_t n_experts;
+};
+
+struct vk_op_count_experts_prefix_push_constants {
+    uint32_t n_workgroups;
+};
+
+struct vk_op_count_experts_scatter_push_constants {
+    uint32_t ne00;
+    uint32_t ne01;
+    uint32_t nb00;
+    uint32_t nb01;
+    uint32_t a_offset;
+    uint32_t n_experts;
+    uint32_t n_workgroups;
 };
 
 struct vk_op_glu_push_constants {
@@ -4811,6 +4837,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_count_equal_i32, "count_equal_i32", count_equal_i32_len, count_equal_i32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, { device->subgroup_size }, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_count_experts, "count_experts", count_experts_len, count_experts_data, "main", 3, sizeof(vk_op_count_experts_push_constants), {256, 1, 1}, {}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_count_experts_partials, "count_experts_partials", count_experts_partials_len, count_experts_partials_data, "main", 2, sizeof(vk_op_count_experts_partials_push_constants), {256, 1, 1}, {}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_count_experts_prefix, "count_experts_prefix", count_experts_prefix_len, count_experts_prefix_data, "main", 3, sizeof(vk_op_count_experts_prefix_push_constants), {256, 1, 1}, {}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_count_experts_scatter, "count_experts_scatter", count_experts_scatter_len, count_experts_scatter_data, "main", 3, sizeof(vk_op_count_experts_scatter_push_constants), {256, 1, 1}, {}, 1, true);
 
     for (auto &s : device->pipeline_solve_tri_f32) {
         const vk_solve_tri_pipeline_state &state = s.first;
@@ -8649,11 +8678,20 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     if (quantize_y) {
         to_q8_1 = ggml_vk_get_quantize_pipeline(ctx, GGML_TYPE_Q8_1);
     }
-    vk_pipeline count_experts = ctx->device->pipeline_count_experts;
+    vk_pipeline count_experts_partials = ctx->device->pipeline_count_experts_partials;
+    vk_pipeline count_experts_prefix = ctx->device->pipeline_count_experts_prefix;
+    vk_pipeline count_experts_scatter = ctx->device->pipeline_count_experts_scatter;
 
     const uint32_t n_routed_rows = nei0 * nei1;
+    const uint32_t n_prepare_workgroups = CEIL_DIV(n_routed_rows, 256);
+    GGML_ASSERT(n_as <= 1024);
+    GGML_ASSERT(n_prepare_workgroups <= 256);
     size_t expert_count_size = sizeof(uint32_t) * n_as;
-    size_t row_ids_offset = ggml_vk_align_size(expert_count_size, ctx->device->properties.limits.minStorageBufferOffsetAlignment);
+    size_t partial_counts_offset = ggml_vk_align_size(expert_count_size, ctx->device->properties.limits.minStorageBufferOffsetAlignment);
+    size_t partial_counts_size = sizeof(uint32_t) * n_as * n_prepare_workgroups;
+    size_t workgroup_offsets_offset = partial_counts_offset + ggml_vk_align_size(partial_counts_size, ctx->device->properties.limits.minStorageBufferOffsetAlignment);
+    size_t workgroup_offsets_size = sizeof(uint32_t) * n_as * n_prepare_workgroups;
+    size_t row_ids_offset = workgroup_offsets_offset + ggml_vk_align_size(workgroup_offsets_size, ctx->device->properties.limits.minStorageBufferOffsetAlignment);
     size_t row_ids_size = sizeof(uint32_t) * n_as * n_routed_rows;
     size_t mul_mat_id_prepare_size = row_ids_offset + row_ids_size;
 
@@ -8687,7 +8725,9 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
         if (quantize_y) {
             ggml_pipeline_request_descriptor_sets(ctx, to_q8_1, 1);
         }
-        ggml_pipeline_request_descriptor_sets(ctx, count_experts, 1);
+        ggml_pipeline_request_descriptor_sets(ctx, count_experts_partials, 1);
+        ggml_pipeline_request_descriptor_sets(ctx, count_experts_prefix, 1);
+        ggml_pipeline_request_descriptor_sets(ctx, count_experts_scatter, 1);
     }
 
     vk_buffer d_D = dst_buf_ctx->dev_buffer;
@@ -8739,18 +8779,35 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
     }
     // Group routed rows by expert once so matmul workgroups can load row ids without scanning ids.
     vk_subbuffer expert_count_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, 0);
+    vk_subbuffer partial_counts_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, partial_counts_offset);
+    vk_subbuffer workgroup_offsets_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, workgroup_offsets_offset);
     vk_subbuffer row_ids_buf = ggml_vk_subbuffer(ctx, ctx->prealloc_split_k, row_ids_offset);
     if (ctx->prealloc_split_k_need_sync) {
         ggml_vk_sync_buffers(ctx, subctx);
     }
     {
-        const std::vector<uint32_t> pc = { (uint32_t)nei0,
-                                           (uint32_t)nei1,
-                                           (uint32_t)(nbi0 / ggml_type_size(ids->type)),
-                                           (uint32_t)(nbi1 / ggml_type_size(ids->type)),
-                                           (uint32_t)(get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)) };
-        ggml_vk_dispatch_pipeline(ctx, subctx, count_experts,
-            { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, expert_count_buf, row_ids_buf }, pc, { (uint32_t)n_as, 1, 1});
+        const std::vector<uint32_t> partials_pc = { (uint32_t)nei0,
+                                                    (uint32_t)nei1,
+                                                    (uint32_t)(nbi0 / ggml_type_size(ids->type)),
+                                                    (uint32_t)(nbi1 / ggml_type_size(ids->type)),
+                                                    (uint32_t)(get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)),
+                                                    (uint32_t)n_as };
+        ggml_vk_dispatch_pipeline(ctx, subctx, count_experts_partials,
+            { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, partial_counts_buf }, partials_pc, { n_prepare_workgroups, 1, 1});
+
+        const std::vector<uint32_t> prefix_pc = { n_prepare_workgroups };
+        ggml_vk_dispatch_pipeline(ctx, subctx, count_experts_prefix,
+            { partial_counts_buf, expert_count_buf, workgroup_offsets_buf }, prefix_pc, { (uint32_t)n_as, 1, 1});
+
+        const std::vector<uint32_t> scatter_pc = { (uint32_t)nei0,
+                                                   (uint32_t)nei1,
+                                                   (uint32_t)(nbi0 / ggml_type_size(ids->type)),
+                                                   (uint32_t)(nbi1 / ggml_type_size(ids->type)),
+                                                   (uint32_t)(get_misalign_bytes(ctx, ids) / ggml_type_size(ids->type)),
+                                                   (uint32_t)n_as,
+                                                   n_prepare_workgroups };
+        ggml_vk_dispatch_pipeline(ctx, subctx, count_experts_scatter,
+            { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, workgroup_offsets_buf, row_ids_buf }, scatter_pc, { n_prepare_workgroups, 1, 1});
     }
 
     if (x_non_contig) {

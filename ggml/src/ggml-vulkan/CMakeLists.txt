@@ -176,6 +176,12 @@ if (Vulkan_FOUND)
     set (_ggml_vk_output_dir "${CMAKE_CURRENT_BINARY_DIR}/vulkan-shaders.spv")
 
     file(GLOB _ggml_vk_shader_files CONFIGURE_DEPENDS "${_ggml_vk_input_dir}/*.comp")
+    list(APPEND _ggml_vk_shader_files
+        "${_ggml_vk_input_dir}/count_experts_partials.comp"
+        "${_ggml_vk_input_dir}/count_experts_prefix.comp"
+        "${_ggml_vk_input_dir}/count_experts_scatter.comp"
+    )
+    list(REMOVE_DUPLICATES _ggml_vk_shader_files)
 
     # Because external projects do not provide source-level tracking,
     # the vulkan-shaders-gen sources need to be explicitly added to
