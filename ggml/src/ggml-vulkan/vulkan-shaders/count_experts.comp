@@ -9,69 +9,61 @@ layout (push_constant) uniform parameter
     uint32_t nb00;
     uint32_t nb01;
     uint32_t a_offset;
-    uint32_t n_as;
 } p;
 
 #define BLOCK_SIZE 256
 
 layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
 
-layout (binding = 0) readonly  buffer Ids     {int  data_ids[];};
-layout (binding = 1)           buffer Offsets {uint data_expert_offset[];};
-layout (binding = 2)           buffer Cursor  {uint data_row_cursor[];};
-layout (binding = 3) writeonly buffer RowIds  {uint data_row_ids[];};
+layout (binding = 0) readonly buffer A {int data_a[];};
+layout (binding = 1) writeonly buffer Counts {uint data_expert_count[];};
+layout (binding = 2) writeonly buffer RowIds {uint data_row_ids[];};
 
-// Counting sort: lay the routed rows out so every expert owns one contiguous
-// slice of data_row_ids. A single workgroup keeps the prefix sum free of any
-// cross-workgroup synchronization, and the whole pass is O(n_as + nei0*nei1)
-// instead of O(n_as * nei0*nei1).
+shared uint thread_counts[BLOCK_SIZE];
+
 void main() {
-    const uint tid          = gl_LocalInvocationID.x;
+    const uint expert_id = gl_WorkGroupID.x;
     const uint num_elements = p.ne00 * p.ne01;
-    const uint n_as         = p.n_as;
+    const uint tid = gl_LocalInvocationID.x;
 
-    for (uint e = tid; e <= n_as; e += BLOCK_SIZE) {
-        data_expert_offset[e] = 0;
-    }
-    memoryBarrierBuffer();
-    barrier();
+    uint count = 0;
 
-    // histogram: how many rows each expert owns
     for (uint idx = tid; idx < num_elements; idx += BLOCK_SIZE) {
         const uint i01 = idx / p.ne00;
         const uint i00 = idx % p.ne00;
-        const uint expert_id = uint(data_ids[p.a_offset + i01 * p.nb01 + i00 * p.nb00]);
+        const uint row_expert_id = uint(data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00]);
 
-        atomicAdd(data_expert_offset[expert_id], 1u);
-    }
-    memoryBarrierBuffer();
-    barrier();
-
-    // exclusive prefix sum -> per-expert slice start, and seed the scatter
-    // cursors. n_as is small (experts per MoE layer), so a serial scan by one
-    // invocation is plenty and avoids a multi-block scan.
-    if (tid == 0) {
-        uint acc = 0;
-        for (uint e = 0; e < n_as; ++e) {
-            const uint c = data_expert_offset[e];
-            data_expert_offset[e] = acc;
-            data_row_cursor[e]    = acc;
-            acc += c;
+        if (row_expert_id == expert_id) {
+            ++count;
         }
-        data_expert_offset[n_as] = acc;
     }
-    memoryBarrierBuffer();
+
+    thread_counts[tid] = count;
     barrier();
 
-    // scatter: drop every routed row into its expert's slice
+    for (uint offset = 1; offset < BLOCK_SIZE; offset <<= 1) {
+        const uint addend = tid >= offset ? thread_counts[tid - offset] : 0;
+        barrier();
+        thread_counts[tid] += addend;
+        barrier();
+    }
+
+    const uint expert_count = thread_counts[BLOCK_SIZE - 1];
+    const uint row_base = expert_id * num_elements;
+    uint pos = tid == 0 ? 0 : thread_counts[tid - 1];
+
     for (uint idx = tid; idx < num_elements; idx += BLOCK_SIZE) {
         const uint i01 = idx / p.ne00;
         const uint i00 = idx % p.ne00;
-        const uint expert_id = uint(data_ids[p.a_offset + i01 * p.nb01 + i00 * p.nb00]);
+        const uint row_expert_id = uint(data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00]);
 
-        const uint pos = atomicAdd(data_row_cursor[expert_id], 1u);
-        // i01 (token index) packed into the high 16 bits, i00 into the low 16.
-        // This caps nei1 at 65535; a ubatch never gets anywhere near that.
-        data_row_ids[pos] = (i01 << 16) | i00;
+        if (row_expert_id == expert_id) {
+            data_row_ids[row_base + pos] = (i01 << 16) | i00;
+            ++pos;
+        }
+    }
+
+    if (tid == 0) {
+        data_expert_count[expert_id] = expert_count;
     }
 }

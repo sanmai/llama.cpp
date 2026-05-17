@@ -35,7 +35,7 @@ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
-layout (binding = 4) readonly buffer Offsets {uint data_expert_offset[];};
+layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
 layout (binding = 5) readonly buffer RowIds {uint data_row_ids[];};
 #endif
 
@@ -112,7 +112,7 @@ void main() {
 
 #ifdef MUL_MAT_ID
     const uint expert_idx = gl_WorkGroupID.z;
-    if (ic * BN >= data_expert_offset[expert_idx + 1] - data_expert_offset[expert_idx]) {
+    if (ic * BN >= data_expert_count[expert_idx]) {
         return;
     }
 #endif
