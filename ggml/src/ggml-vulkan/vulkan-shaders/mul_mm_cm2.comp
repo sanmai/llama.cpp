@@ -94,7 +94,7 @@ layout (binding = 2) writeonly buffer D {D_TYPE data_d[];};
 
 #ifdef MUL_MAT_ID
 layout (binding = 3) readonly buffer IDS {int data_ids[];};
-layout (binding = 4) readonly buffer Counts {int data_expert_count[];};
+layout (binding = 4) readonly buffer Offsets {uint data_expert_offset[];};
 layout (binding = 5) readonly buffer RowIds {uint data_row_ids[];};
 
 shared u16vec4 row_ids[BN];
@@ -104,7 +104,6 @@ layout(buffer_reference, std430, buffer_reference_align = 2) buffer decodeBufB {
 };
 
 uint _ne1;
-layout (constant_id = 5) const uint subgroup_size = 32;
 
 B_TYPE decodeFuncB(const in decodeBufB bl, const in uint blockCoords[2], const in uint coordInBlock[2])
 {
@@ -130,14 +129,13 @@ D_TYPE perElemOpD(const in uint32_t r, const in uint32_t c, const in D_TYPE elem
 }
 
 void load_row_ids(uint expert_idx, uint ic) {
-    _ne1 = data_expert_count[expert_idx];
-
-    const uint row_base = expert_idx * p.nei1 * p.nei0 + ic * BN;
+    const uint row_base = data_expert_offset[expert_idx];
+    _ne1 = data_expert_offset[expert_idx + 1] - row_base;
 
     for (uint i = gl_LocalInvocationIndex; i < BN && ic * BN + i < _ne1; i += BLOCK_SIZE) {
-        const uint row_id = data_row_ids[row_base + i];
-        const uint ii0 = row_id & 0xffff;
-        const uint ii1 = row_id >> 16;
+        const uint row_id = data_row_ids[row_base + ic * BN + i];
+        const uint ii0 = row_id & 0xffff;       // expert slot within the token
+        const uint ii1 = row_id >> 16;          // token index (capped at 65535)
         row_ids[i] = u16vec4(fastmod(ii0, p.ne11), ii1, ii0, 0);
     }
     barrier();
@@ -150,7 +148,7 @@ void main() {
 
 #ifdef MUL_MAT_ID
     const uint expert_idx = gl_WorkGroupID.z;
-    if (ic * BN >= data_expert_count[expert_idx]) {
+    if (ic * BN >= data_expert_offset[expert_idx + 1] - data_expert_offset[expert_idx]) {
         return;
     }
     // initialize to row 0 so we don't need to bounds check
