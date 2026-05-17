@@ -870,7 +870,6 @@ struct vk_device_struct {
     std::map<std::pair<uint32_t, uint32_t>, vk_pipeline> pipeline_fa_mask_opt;
 
     vk_pipeline pipeline_flash_attn_split_k_reduce;
-    vk_pipeline pipeline_count_experts;
     vk_pipeline pipeline_mul_mat_id_prepare;
 
     // [2] is for whether to take n_experts from spec constant (0) or push constant (1)
@@ -1123,7 +1122,7 @@ struct vk_op_push_constants {
     float param4;
 };
 
-struct vk_op_count_experts_push_constants {
+struct vk_op_mul_mat_id_prepare_push_constants {
     uint32_t ne00;
     uint32_t ne01;
     uint32_t nb00;
@@ -4811,8 +4810,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
 
     ggml_vk_create_pipeline(device, device->pipeline_count_equal_i32, "count_equal_i32", count_equal_i32_len, count_equal_i32_data, "main", 3, sizeof(vk_op_push_constants), {512, 1, 1}, { device->subgroup_size }, 1);
 
-    ggml_vk_create_pipeline(device, device->pipeline_count_experts, "count_experts", count_experts_len, count_experts_data, "main", 2, sizeof(vk_op_count_experts_push_constants), {1, 1, 1}, {}, 1, true);
-    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_id_prepare, "mul_mat_id_prepare", mul_mat_id_prepare_len, mul_mat_id_prepare_data, "main", 3, sizeof(vk_op_count_experts_push_constants), {256, 1, 1}, {}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_mul_mat_id_prepare, "mul_mat_id_prepare", mul_mat_id_prepare_len, mul_mat_id_prepare_data, "main", 3, sizeof(vk_op_mul_mat_id_prepare_push_constants), {256, 1, 1}, {}, 1, true);
 
     for (auto &s : device->pipeline_solve_tri_f32) {
         const vk_solve_tri_pipeline_state &state = s.first;
