@@ -2918,6 +2918,22 @@ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subct
     );
 }
 
+static void ggml_vk_compute_memory_barrier(vk_context& subctx) {
+    VK_LOG_DEBUG("ggml_vk_compute_memory_barrier()");
+
+    subctx->s->buffer->buf.pipelineBarrier(
+        vk::PipelineStageFlagBits::eComputeShader,
+        vk::PipelineStageFlagBits::eComputeShader,
+        {},
+        { {
+          vk::AccessFlagBits::eShaderWrite,
+          vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite
+        } },
+        {},
+        {}
+    );
+}
+
 static void ggml_vk_reset_event(vk_context& ctx, vk::Event& event) {
     VK_LOG_DEBUG("ggml_vk_set_event()");
 
@@ -8794,12 +8810,12 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                                     (uint32_t)n_as };
         ggml_vk_dispatch_pipeline(ctx, subctx, count_experts_partials,
             { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, partial_counts_buf }, partials_pc, { n_prepare_workgroups, 1, 1});
-        ggml_vk_sync_buffers(ctx, subctx);
+        ggml_vk_compute_memory_barrier(subctx);
 
         const std::vector<uint32_t> prefix_pc = { n_prepare_workgroups };
         ggml_vk_dispatch_pipeline(ctx, subctx, count_experts_prefix,
             { partial_counts_buf, expert_count_buf, workgroup_offsets_buf }, prefix_pc, { (uint32_t)n_as, 1, 1});
-        ggml_vk_sync_buffers(ctx, subctx);
+        ggml_vk_compute_memory_barrier(subctx);
 
         const std::vector<uint32_t> scatter_pc = { (uint32_t)nei0,
                                                    (uint32_t)nei1,
@@ -8810,7 +8826,7 @@ static void ggml_vk_mul_mat_id_q_f16(ggml_backend_vk_context * ctx, vk_context& 
                                                    n_prepare_workgroups };
         ggml_vk_dispatch_pipeline(ctx, subctx, count_experts_scatter,
             { vk_subbuffer{ d_ids, ids_buf_offset, ids_sz }, workgroup_offsets_buf, row_ids_buf }, scatter_pc, { n_prepare_workgroups, 1, 1});
-        ggml_vk_sync_buffers(ctx, subctx);
+        ggml_vk_compute_memory_barrier(subctx);
     }
 
     if (x_non_contig) {
