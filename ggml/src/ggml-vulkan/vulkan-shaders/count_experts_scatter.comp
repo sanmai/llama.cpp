@@ -39,15 +39,16 @@ void main() {
     }
     barrier();
 
-    if (row >= num_elements) {
-        return;
+    uint i01 = 0;
+    uint i00 = 0;
+    uint row_expert_id = p.n_experts;
+    if (row < num_elements) {
+        i01 = row / p.ne00;
+        i00 = row % p.ne00;
+        row_expert_id = uint(data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00]);
     }
 
-    const uint i01 = row / p.ne00;
-    const uint i00 = row % p.ne00;
-    const uint row_expert_id = uint(data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00]);
-
-    bool pending = row_expert_id < p.n_experts;
+    bool pending = row < num_elements && row_expert_id < p.n_experts;
     while (subgroupBallotBitCount(subgroupBallot(pending)) > 0) {
         const uint leader = subgroupBallotFindLSB(subgroupBallot(pending));
         const uint expert_id = subgroupShuffle(row_expert_id, leader);

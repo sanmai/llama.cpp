@@ -22,10 +22,7 @@ void main() {
     const uint tid = gl_LocalInvocationID.x;
     const uint base = expert_id * p.n_workgroups;
 
-    uint count = 0;
-    for (uint wg = tid; wg < p.n_workgroups; wg += BLOCK_SIZE) {
-        count += data_partial_counts[base + wg];
-    }
+    uint count = tid < p.n_workgroups ? data_partial_counts[base + tid] : 0;
 
     thread_counts[tid] = count;
     barrier();
@@ -37,10 +34,8 @@ void main() {
         barrier();
     }
 
-    uint running = tid == 0 ? 0 : thread_counts[tid - 1];
-    for (uint wg = tid; wg < p.n_workgroups; wg += BLOCK_SIZE) {
-        data_workgroup_offsets[base + wg] = running;
-        running += data_partial_counts[base + wg];
+    if (tid < p.n_workgroups) {
+        data_workgroup_offsets[base + tid] = tid == 0 ? 0 : thread_counts[tid - 1];
     }
 
     if (tid == 0) {
