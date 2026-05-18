@@ -1,0 +1,22 @@
+#version 450
+
+#include "types.glsl"
+
+layout (push_constant) uniform parameter
+{
+    uint32_t n_experts;
+} p;
+
+#define BLOCK_SIZE 256
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) writeonly buffer Counts {uint data_expert_count[];};
+
+void main() {
+    const uint expert_id = gl_GlobalInvocationID.x;
+
+    if (expert_id < p.n_experts) {
+        data_expert_count[expert_id] = 0;
+    }
+}

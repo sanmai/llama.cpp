@@ -1,0 +1,59 @@
+#version 450
+
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+#extension GL_KHR_shader_subgroup_shuffle : enable
+
+#include "types.glsl"
+
+layout (push_constant) uniform parameter
+{
+    uint32_t ne00;
+    uint32_t ne01;
+    uint32_t nb00;
+    uint32_t nb01;
+    uint32_t a_offset;
+    uint32_t n_experts;
+} p;
+
+#define BLOCK_SIZE 256
+
+layout(local_size_x = BLOCK_SIZE, local_size_y = 1, local_size_z = 1) in;
+
+layout (binding = 0) readonly buffer A {int data_a[];};
+layout (binding = 1) buffer Counts {uint data_expert_count[];};
+layout (binding = 2) writeonly buffer RowIds {uint data_row_ids[];};
+
+void main() {
+    const uint row = gl_GlobalInvocationID.x;
+    const uint num_elements = p.ne00 * p.ne01;
+
+    uint i01 = 0;
+    uint i00 = 0;
+    uint row_expert_id = p.n_experts;
+    if (row < num_elements) {
+        i01 = row / p.ne00;
+        i00 = row % p.ne00;
+        row_expert_id = uint(data_a[p.a_offset + i01 * p.nb01 + i00 * p.nb00]);
+    }
+
+    bool pending = row < num_elements && row_expert_id < p.n_experts;
+    while (subgroupBallotBitCount(subgroupBallot(pending)) > 0) {
+        const uint leader = subgroupBallotFindLSB(subgroupBallot(pending));
+        const uint expert_id = subgroupShuffle(row_expert_id, leader);
+        const uvec4 same_expert = subgroupBallot(pending && row_expert_id == expert_id);
+        const uint local_pos = subgroupBallotExclusiveBitCount(same_expert);
+        const uint subgroup_count = subgroupBallotBitCount(same_expert);
+
+        uint pos_base = 0;
+        if (gl_SubgroupInvocationID == leader) {
+            pos_base = atomicAdd(data_expert_count[expert_id], subgroup_count);
+        }
+        pos_base = subgroupShuffle(pos_base, leader);
+
+        if (pending && row_expert_id == expert_id) {
+            data_row_ids[row_expert_id * num_elements + pos_base + local_pos] = (i01 << 16) | i00;
+            pending = false;
+        }
+    }
+}
