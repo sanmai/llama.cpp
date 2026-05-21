@@ -348,6 +348,8 @@ void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RE
 
     const int nb = k / qk;
 
+    static const int test_offsets[5] = { 0, -1, 1, -2, 2 };
+
     for (int i = 0; i < nb; i++) {
         for (int s = 0; s < n_sub; s++) {
             const float * xb = x + i*qk + s*qk_sub;
@@ -359,10 +361,35 @@ void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RE
                 }
             }
 
-            // UE4M3 scale: amax / 6.0 maps the max E2M1 value (6.0) to amax
-            const uint8_t ue = ggml_fp32_to_ue4m3(amax / 6.0f);
-            y[i].d[s] = ue;
-            const float d = ggml_ue4m3_to_fp32(ue);
+            // UE4M3 scale: amax / 6.0 maps the max E2M1 value (6.0) to amax.
+            // Refine it over first +/- {0,1,2} by min squared reconstruction error.
+            const int first_code = (int) ggml_fp32_to_ue4m3(amax / 6.0f);
+
+            float   best_err = FLT_MAX;
+            uint8_t best_ue  = 0;
+            float   best_d   = 0.0f;
+            for (int t = 0; t < 5; t++) {
+                const int code = first_code + test_offsets[t];
+                if (code < 0 || code > 0x7e) {
+                    continue;
+                }
+                const float d = ggml_ue4m3_to_fp32((uint8_t) code);
+
+                float err = 0.0f;
+                for (int j = 0; j < qk_sub; j++) {
+                    const uint8_t q = best_index_mxfp4(xb[j], d);
+                    const float   e = xb[j] - kvalues_mxfp4[q]*d;
+                    err += e*e;
+                }
+                if (err < best_err) {
+                    best_err = err;
+                    best_ue  = (uint8_t) code;
+                    best_d   = d;
+                }
+            }
+
+            y[i].d[s] = best_ue;
+            const float d = best_d;
 
             for (int j = 0; j < qk_sub/2; ++j) {
                 const uint8_t x0 = best_index_mxfp4(xb[0        + j], d);
