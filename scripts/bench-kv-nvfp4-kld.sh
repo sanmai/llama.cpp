@@ -51,12 +51,12 @@ if [[ ! -f "${BASE}" ]]; then
         --kl-divergence-base "${BASE}"
 fi
 
-run_compare f16   f16
-run_compare q8_0  q8_0
-run_compare q4_0  q4_0
-run_compare nvfp4 nvfp4
+# With no args, run the full default suite. Otherwise run only the given
+# K/V pairs, e.g.: bench-kv-nvfp4-kld.sh q8_0/nvfp4 q8_0/q4_0
+if [[ $# -eq 0 ]]; then
+    set -- f16/f16 q8_0/q8_0 q4_0/q4_0 nvfp4/nvfp4 nvfp4/f16 f16/nvfp4 q4_0/f16 f16/q4_0
+fi
 
-run_compare nvfp4 f16
-run_compare f16   nvfp4
-run_compare q4_0  f16
-run_compare f16   q4_0
+for pair in "$@"; do
+    run_compare "${pair%%/*}" "${pair##*/}"
+done
