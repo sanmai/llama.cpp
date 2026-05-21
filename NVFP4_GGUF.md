@@ -33,4 +33,30 @@ KL-divergence from its f16 reference (and lower perplexity) than the same model 
 
 ## Results
 
-_(to be filled in)_
+Qwen3-1.7B-Base, full `wiki.test.raw`, ctx 512, b4096/ub2048. KLD/PPL vs the f16 base
+(PPL(f16) ~= 9.87). All three quant arms are 4.87 bpw (identical GGUF size, 999.90 MiB):
+nvfp4 tensors + Q6_K output + Q8_0 embd, same mix in every arm.
+
+| quant                  | Mean PPL(Q)        | PPL ratio | Mean KLD            | Same top-p |
+|------------------------|--------------------|-----------|---------------------|------------|
+| nvfp4-old (no search)  | 11.790 +/- 0.086   | 1.19411   | 0.19044 +/- 0.00081 | 78.49%     |
+| nvfp4-new (MSE search) | 11.583 +/- 0.082   | 1.17312   | 0.17393 +/- 0.00069 | 78.62%     |
+| q4_0 (context)         | 11.387 +/- 0.081   | 1.15325   | 0.16130 +/- 0.00046 | 79.20%     |
+
+**Hypothesis CONFIRMED.** The MSE scale search lowers NVFP4 weight-quant divergence:
+Mean KLD 0.19044 -> 0.17393 (**-8.7%**), PPL penalty +19.4% -> +17.3%. The gap is ~20 sigma
+on the error bars - robustly real, not noise.
+
+**But the gain is modest, and bounded as predicted.** The ~8x synthetic dot-error improvement
+(`test-quantize-fns`, uniform random data) does NOT translate to ~8x end-to-end: real weights
+see ~9% lower KLD. The search refines each sub-block's UE4M3 scale but cannot restore NVFP4's
+dropped per-tensor scale.
+
+**nvfp4 still trails q4_0 at equal footprint** (searched-nvfp4 0.17393 vs q4_0 0.16130, ~8%
+worse KLD). So the search makes nvfp4 *better than before*, not *better than q4_0* - consistent
+with the KV-cache finding: ggml's single-level nvfp4 tracks q4_0 and never beats it.
+
+**Takeaway.** The MSE search is a worthwhile, free improvement to the *existing* NVFP4
+reference quantizer (~9% lower KLD for any nvfp4 weight conversion or KV write, and it removed
+CPU/CUDA encoding drift). It does not make nvfp4 the preferred 4-bit format. Caveats: single
+small model; no imatrix (nvfp4 ignores it - q4_0/q4_K with imatrix would widen their lead).
