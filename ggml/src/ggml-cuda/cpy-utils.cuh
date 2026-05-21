@@ -189,6 +189,8 @@ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, b
 // NVFP4: per-16 UE4M3 micro-scale, 4-bit E2M1 codes. Block-local, mirrors quantize_row_nvfp4_ref.
 // id = 0.5/d because kvalues_mxfp4 holds 2x the E2M1 magnitudes and ggml_cuda_ue4m3_to_fp32 folds in a /2.
 static __device__ void quantize_f32_nvfp4_block(const float * __restrict__ x, block_nvfp4 * __restrict__ y) {
+    constexpr int test_offsets[5] = { 0, -1, 1, -2, 2 };
+
     for (int s = 0; s < QK_NVFP4/QK_NVFP4_SUB; ++s) {
         const float * xb = x + s*QK_NVFP4_SUB;
 
@@ -197,11 +199,36 @@ static __device__ void quantize_f32_nvfp4_block(const float * __restrict__ x, bl
             amax = fmaxf(amax, fabsf(xb[j]));
         }
 
-        const uint8_t ue = ggml_cuda_fp32_to_ue4m3(amax / 6.0f);
-        y->d[s] = ue;
+        // Refine the UE4M3 sub-block scale: try first_code +/- {0,1,2} and keep the one
+        // with the lowest summed squared reconstruction error (cf. quantize_mmq_nvfp4).
+        const int first_code = (int) ggml_cuda_fp32_to_ue4m3(amax / 6.0f);
 
-        const float d  = ggml_cuda_ue4m3_to_fp32(ue);
-        const float id = d > 0.0f ? 0.5f/d : 0.0f;
+        float   best_err = FLT_MAX;
+        uint8_t best_ue  = 0;
+        float   best_d   = 0.0f;
+        for (int t = 0; t < 5; ++t) {
+            const int code = first_code + test_offsets[t];
+            if (code < 0 || code > 0x7e) {
+                continue;
+            }
+            const float d  = ggml_cuda_ue4m3_to_fp32((uint8_t) code);
+            const float id = d > 0.0f ? 0.5f/d : 0.0f;
+
+            float err = 0.0f;
+            for (int j = 0; j < QK_NVFP4_SUB; ++j) {
+                const uint8_t q = ggml_cuda_float_to_fp4_e2m1(xb[j], id);
+                const float   e = fabsf(xb[j]) - kvalues_mxfp4[q & 0x7]*d;
+                err = fmaf(e, e, err);
+            }
+            if (err < best_err) {
+                best_err = err;
+                best_ue  = (uint8_t) code;
+                best_d   = d;
+            }
+        }
+
+        y->d[s] = best_ue;
+        const float id = best_d > 0.0f ? 0.5f/best_d : 0.0f;
 
         for (int j = 0; j < QK_NVFP4_SUB/2; ++j) {
             const uint8_t x0 = ggml_cuda_float_to_fp4_e2m1(xb[0              + j], id);
