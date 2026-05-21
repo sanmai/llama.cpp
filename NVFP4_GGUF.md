@@ -107,3 +107,57 @@ larger change; depth and x^2 are dead ends.
 
 Committed unweighted +/-2 is the sweet spot among {+/-2, +/-3, x^2-weighted +/-2}. Keep it.
 Real further gains require imatrix plumbing, not search-depth or naive reweighting.
+
+## Performance (RTX 5090, native FP4 vs q4_0)
+
+`llama-bench`, `-ngl 99 -b 4096 -ub 2048 -r 20`. Each pair is the same f16 source quantized to
+nvfp4 (committed +/-2 search) and q4_0; identical GGUF size in each pair (so equal bytes/bandwidth).
+On Blackwell the nvfp4 weight matmul takes the native FP4 MMA path (`mmq.cu:125` `use_native_fp4`);
+q4_0 uses integer DP4A MMQ. Decode (`tg`, batch 1) is a bandwidth-bound GEMV via MMVQ - no tensor
+cores on either side.
+
+Qwen3-1.7B (t/s):
+
+| test    | q4_0            | nvfp4           | delta  |
+|---------|-----------------|-----------------|--------|
+| pp4096  | 23967 +/- 258   | 24649 +/- 333   | +2.8%  |
+| pp8192  | 17713 +/- 112   | 18052 +/- 263   | +1.9%  |
+| pp16384 | 11175 +/- 355   | 11330 +/- 314   | +1.4%  |
+| tg128   | 588.0 +/- 16    | 558.3 +/- 13    | -5.0%  |
+
+Qwen2.5-7B (t/s):
+
+| test    | q4_0            | nvfp4           | delta   |
+|---------|-----------------|-----------------|---------|
+| pp4096  | 10944 +/- 89    | 13065 +/- 16    | +19.4%  |
+| pp8192  | 8518 +/- 15     | 9738 +/- 15     | +14.3%  |
+| pp16384 | 5833 +/- 23     | 6394 +/- 12     | +9.6%   |
+| tg128   | 281.2 +/- 0.9   | 275.4 +/- 0.7   | -2.1%   |
+
+**Prefill: nvfp4 wins, and the win scales with model size** (1.7B ~1-3%, 7B ~10-19%). That
+scaling IS the evidence the FP4 cores are doing the work: native FP4 MMA needs large GEMMs to
+flex, and a 1.7B's FFN matmuls are too small. The taper with prompt length (+19 -> +14 -> +10%
+at 7B) is attention dilution - O(n^2) f16 attention is identical for both arms and grows as a
+share of total time, shrinking the weight-matmul fraction the format difference rides on.
+
+**Decode: nvfp4 loses** (~2% at 7B, ~5% at 1.7B). Same bytes -> same bandwidth; the loss is the
+extra per-byte unpack in the GEMV - non-uniform E2M1 LUT lookup (`get_int_from_table_16`) plus a
+per-16 UE4M3/FP8 scale decode - that q4_0 avoids (uniform codes straight into DP4A, one fp16
+scale per 32). The FP4 MMA that wins prefill is absent on this path, so the format's richness is
+pure overhead here. It's the exact mirror of the prefill win.
+
+**Energy:** at ~equal power, +16% prefill t/s (pp4096, 7B) ~= ~16% fewer joules for the prefill
+phase; decode ~neutral. So for prefill-of-long-prompts, nvfp4 is faster and cooler. (Power not
+yet sampled; this is the speed->energy floor, not a measured J/token.)
+
+**This gain is NOT free - it is a trade, not a Pareto win.** Pair it with the quality result
+above: nvfp4 carries ~8% worse KLD than q4_0 at equal footprint. So nvfp4 on Blackwell buys
+**+10-19% prefill throughput at the cost of ~8% KLD / ~0.58 pp top-1**, same size. Worth it if
+prefill-/energy-bound and tolerant of a small quality dip; q4_0 still wins quality-per-byte. The
+imatrix asymmetry tilts the trade further toward q4 (it would widen q4's quality lead while
+nvfp4's speed edge persists).
+
+Caveats: speed is measured on 7B, quality on 1.7B - a same-model 7B KLD run is still needed to
+make it a clean single-model speed-vs-quality statement. Native FP4 path confirmed via static
+dispatch + the scaling signature; no `nsys`/`ncu` receipt captured yet. Clocks unlocked, but 7B
+sigmas are ~0.1-0.8% (runs long enough for stable boost).
