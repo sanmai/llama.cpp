@@ -165,9 +165,7 @@ endif()
 if (GGML_SYCL_TARGET STREQUAL "INTEL")
     add_compile_definitions(GGML_SYCL_WARP_SIZE=16)
     if (NOT GGML_SYCL_DEVICE_ARCH)
-        # LOCAL ONLY (not for PR): -ze-intel-... is an Intel-GPU/Level-Zero
-        # backend option; the OpenCL CPU device rejects it. Restore for GPU builds.
-        # target_link_options(ggml-sycl PRIVATE -Xs -ze-intel-greater-than-4GB-buffer-required)
+        target_link_options(ggml-sycl PRIVATE -Xs -ze-intel-greater-than-4GB-buffer-required)
     else()
         message(STATUS "Skipping -ze-intel-greater-than-4GB-buffer-required for spir64_gen AOT")
     endif()
