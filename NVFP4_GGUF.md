@@ -189,10 +189,38 @@ prefill-/energy-bound and tolerant of a small quality dip; q4_0 still wins quali
 imatrix asymmetry tilts the trade further toward q4 (it would widen q4's quality lead while
 nvfp4's speed edge persists).
 
-Caveats: speed is measured on 7B, quality on 1.7B - a same-model 7B KLD run is still needed to
-make it a clean single-model speed-vs-quality statement. Native FP4 path confirmed via static
-dispatch + the scaling signature; no `nsys`/`ncu` receipt captured yet. Clocks unlocked, but 7B
-sigmas are ~0.1-0.8% (runs long enough for stable boost).
+Caveats: native FP4 path confirmed via static dispatch + the scaling signature; no `nsys`/`ncu`
+receipt captured yet. Clocks unlocked, but 7B sigmas are ~0.1-0.8% (runs long enough for stable
+boost). Same-model quality is below.
+
+## 7B quality (Qwen2.5-7B) + the same-model verdict
+
+Weight-quant KLD/PPL vs the qwen2.5-7b f16 base (full `wiki.test.raw`, ctx 512). nvfp4 and
+q4_0-fresh are the same ~4.13 GiB; q4_0-imat is +0.3% (imatrix nudges a couple tensor types).
+
+| quant            | PPL ratio | Mean KLD            | Same top-p |
+|------------------|-----------|---------------------|------------|
+| nvfp4 (search)   | +7.7%     | 0.10524             | 85.21%     |
+| q4_0 (no imat)   | +4.1%     | 0.05779             | 88.83%     |
+| q4_0 + imatrix   | +1.8%     | 0.04649             | 89.92%     |
+
+- **nvfp4 vs plain q4_0: ~82% worse KLD** (0.105 vs 0.058), ~1.9x the PPL penalty, -3.6 pp
+  top-1. At 1.7B (Qwen3) the gap was only ~8%; at 7B (Qwen2.5) it blows open.
+- **imatrix halves q4_0's PPL penalty** (+4.1% -> +1.8%, -20% KLD) - the asymmetry nvfp4 can't
+  use (`quantize_row_nvfp4_ref` ignores the imatrix).
+- **nvfp4 vs the realistic q4_0+imatrix: ~2.3x worse KLD, 4.3x the PPL penalty** (+7.7% vs
+  +1.8%), -4.7 pp top-1.
+
+**Same-model speed-vs-quality verdict:** nvfp4 buys +10-19% prefill but costs ~2-2.3x worse
+quantization quality. The speed gain does not come close to justifying a doubling of divergence;
+even against un-imatrix'd q4_0 it is ~1.8x worse. For weights, q4_0 (esp. with imatrix) dominates.
+
+**Why 8% (1.7B) -> 82% (7B):** nvfp4's single-level floor. q4_0 rides its fp16-per-32 scale down
+to 0.058 on the redundant 7B; nvfp4, missing the per-tensor scale, stalls at 0.105 and cannot
+follow. On the harder 1.7B both sit near a ~0.16-0.17 floor and look close. nvfp4 looks
+competitive exactly where 4-bit is hard, and falls behind exactly where 4-bit is easy. (Caveat:
+1.7B=Qwen3, 7B=Qwen2.5 - same family that showed K-outliers in the KV study - so model and scale
+are confounded; the 7B result itself is clean.)
 
 ## Why the imatrix helps nvfp4 less: the single-scale ceiling
 
