@@ -108,6 +108,38 @@ larger change; depth and x^2 are dead ends.
 Committed unweighted +/-2 is the sweet spot among {+/-2, +/-3, x^2-weighted +/-2}. Keep it.
 Real further gains require imatrix plumbing, not search-depth or naive reweighting.
 
+## imatrix (Qwen3-1.7B, calibrated on wiki.train, KLD vs same f16 base)
+
+Plumbed the imatrix into nvfp4: `quantize_nvfp4` now branches on `quant_weights`, and
+`quantize_row_nvfp4_impl` weights the +/-2 UE4M3 scale search by `qw*sqrt(sigma2+x^2)` (same
+form as `quantize_row_q4_0_impl`). q4_0 re-quantized with the same imatrix (overwrites the
+no-imatrix q4_0).
+
+|       | no-imatrix KLD | imatrix KLD | imatrix gain |
+|-------|----------------|-------------|--------------|
+| q4_0  | 0.16130        | 0.10145     | -37.1%       |
+| nvfp4 | 0.17393        | 0.14431     | -17.0%       |
+
+The nvfp4 imatrix plumbing **works** (-17%, best nvfp4 result; a real keepable improvement,
+unlike +/-3 and x^2). But q4_0 exploits the imatrix >2x as well, so the **gap widens**:
+nvfp4-imat is 42% worse than q4_0-imat (0.1443 vs 0.1015), up from 8% without imatrix.
+
+Why nvfp4 can't ride it as far (the structural ceiling, sharpened): q4_0's `make_qx_quants`
+lets the imatrix steer a *continuous* fp16 scale (fine +/-9x0.1 grid) AND the per-element level
+assignment (weighted least-squares). nvfp4's path can only let the imatrix pick among ~5
+*discrete* UE4M3 rungs, with per-element E2M1 codes still nearest (fixed non-uniform levels -
+no room to spend importance on a value). Coarse discrete scale throttles the benefit.
+
+## Overall conclusion
+
+On quality, q4_0 beats nvfp4 at every level and the imatrix widens the lead - the E2M1 +
+per-16 FP8-scale format is the ceiling, not the quantizer. nvfp4's case is purely **prefill
+throughput**: native FP4 MMA on Blackwell gives +~19% pp on the 7B (-2% decode). So nvfp4 is a
+speed-for-quality trade, not a quality win. The two keepable contributions, independent of that
+verdict: (1) the +/-2 MSE scale search (~9% better nvfp4 quant, fixed CPU/CUDA drift), (2) the
+imatrix plumbing (-17%). Both improve the existing type; neither makes nvfp4 preferable to q4_0
+on quality.
+
 ## Performance (RTX 5090, native FP4 vs q4_0)
 
 `llama-bench`, `-ngl 99 -b 4096 -ub 2048 -r 20`. Each pair is the same f16 source quantized to
