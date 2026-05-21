@@ -379,7 +379,7 @@ void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RE
                 for (int j = 0; j < qk_sub; j++) {
                     const uint8_t q = best_index_mxfp4(xb[j], d);
                     const float   e = xb[j] - kvalues_mxfp4[q]*d;
-                    err += e*e;
+                    err += xb[j]*xb[j]*e*e; // x^2-weighted: bias the scale toward the large, output-driving values
                 }
                 if (err < best_err) {
                     best_err = err;

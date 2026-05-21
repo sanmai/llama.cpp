@@ -60,3 +60,22 @@ with the KV-cache finding: ggml's single-level nvfp4 tracks q4_0 and never beats
 reference quantizer (~9% lower KLD for any nvfp4 weight conversion or KV write, and it removed
 CPU/CUDA encoding drift). It does not make nvfp4 the preferred 4-bit format. Caveats: single
 small model; no imatrix (nvfp4 ignores it - q4_0/q4_K with imatrix would widen their lead).
+
+## Search depth: +/-2 vs +/-3 (Qwen3-1.7B, vs same f16 base)
+
+| search depth        | Mean KLD            | quant time |
+|---------------------|---------------------|------------|
+| +/-2 (committed)    | 0.173927 +/- 0.00069 | 9.8s       |
+| +/-3                | 0.177830 +/- 0.00069 | 14.1s      |
+
++/-3 is **worse** by +0.0039 KLD (~5.7 sigma), at ~1.4x the cost. This is not noise and is the
+informative result: a min-error search can only *lower* per-block SSE with more candidates, so
++/-3 yields lower unweighted SSE but HIGHER KLD. The search optimizes the wrong objective -
+unweighted SSE over-weights the many small values, so a wider scan drops the scale to fit the
+bulk better while distorting the few large values that drive the output. Conclusion: do not
+widen; the depth is already past where the unweighted proxy diverges from output quality. This
+directly motivates importance-weighting the error (x^2 / imatrix) instead of more depth.
+
+## x^2-weighted error (+/-2)
+
+_(pending)_
