@@ -222,6 +222,31 @@ competitive exactly where 4-bit is hard, and falls behind exactly where 4-bit is
 1.7B=Qwen3, 7B=Qwen2.5 - same family that showed K-outliers in the KV study - so model and scale
 are confounded; the 7B result itself is clean.)
 
+## Quality-per-bit ladder (Qwen2.5-7B, same f16 base, no imatrix unless noted)
+
+Where nvfp4 actually sits among 4-bit-class formats. Sorted by KLD (best first):
+
+| format          | size      | Mean KLD | PPL ratio | Same top-p |
+|-----------------|-----------|----------|-----------|------------|
+| IQ4_XS          | 3.96 GiB  | 0.04071  | +3.0%     | 90.51%     |
+| q4_0 + imatrix  | 4.14 GiB  | 0.04649  | +1.8%     | 89.92%     |
+| q4_0            | 4.13 GiB  | 0.05779  | +4.1%     | 88.83%     |
+| **nvfp4**       | 4.13 GiB  | 0.10524  | +7.7%     | 85.21%     |
+| Q3_K_M          | 3.55 GiB  | 0.10925  | +8.6%     | 85.08%     |
+| Q3_K_S          | 3.25 GiB  | 0.19372  | +12.2%    | 79.57%     |
+
+**nvfp4 is q3-tier quality at q4 size, and Pareto-dominated on both axes at once.**
+- It matches Q3_K_M (0.1052 vs 0.1092 KLD, 85.21% vs 85.08% top-1) - same quality, but Q3_K_M is
+  0.58 GiB smaller.
+- IQ4_XS is *smaller* than nvfp4 (3.96 vs 4.13 GiB) yet **2.6x better KLD** (0.041 vs 0.105) - and
+  is the best 4-bit here, edging q4_0+imatrix. So even a smaller proper 4-bit beats nvfp4 outright.
+
+Every other 4-bit option gives equal-or-better quality at equal-or-smaller size. nvfp4's only
+non-dominated property is Blackwell native FP4 prefill throughput (+10-19%, see Performance). For
+the memory-bound "run q1-q3 of a bigger model" use case, nvfp4 is the wrong tool (heavier than
+q3/q2, fits less model); it only makes sense throughput-bound on Blackwell, spending q4 bytes for
+q3 quality to get the FP4 prefill win.
+
 ## Why the imatrix helps nvfp4 less: the single-scale ceiling
 
 The imatrix's only lever is the **scale choice** - in *both* formats. For a fixed scale `d` the
