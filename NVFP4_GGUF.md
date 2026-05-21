@@ -327,6 +327,33 @@ calibration set trades some in-domain gain for robustness. The *relative* claim 
 absolute KLDs and the imatrix deltas are expected to compress on larger models, which the 7B
 sweep will show.)
 
+## The UE4M3 micro-scale runs ~100% subnormal (Qwen3.6-27B)
+
+Measured directly from `qwen3.6-27b-nvfp4.gguf` (`scripts/nvfp4-subnormal-stats.py`, over all
+1.63e9 micro-scale codes): **99.94% of UE4M3 block scales are subnormal** (codes 0x01..0x07). The
+decoded scales are pinned to the 7 subnormal levels - median 2.93e-3, p99.9 = 6.84e-3 (the
+*largest* subnormal), max across the whole model only 0.117. The 3-mantissa-bit normal grid is
+essentially never used.
+
+Mechanism: encode stores `ue4m3(amax/6)` and decode folds a `*0.5`, so the effective per-16 scale
+is `d ~= amax/12`. UE4M3's normal range starts at 2^-7 = 7.81e-3, so a block is normal only when
+`amax > 0.094`; typical Qwen weight sub-blocks (median amax ~0.035) fall below that. So the per-16
+"FP8 scale" is in practice a **7-level log grid**, far coarser than the ~5 rungs the +/-2 search
+suggests above - that, not the search, is the real scale ceiling.
+
+This sharpens the diagnosis: real NVFP4's dropped second scale does **range placement** (its
+per-tensor FP32 normalizes block scales to the top of E4M3's range); ggml's omission lands them in
+the subnormal floor instead. Because the miscalibration is *uniform across every tensor* (whole-model
+scale span 9.77e-4..0.117 = ~7 octaves, well inside UE4M3's ~15-octave normal range), a **single
+global exponent shift** rescues it - no per-tensor storage. Feasible N in [3, 10.9]; N=6 centers the
+distribution. And the precision is gained at quantize time (scales stored in the normal grid), so the
+native FP4 OMMA reads the better scales directly; only one constant epilogue `*2^-N` corrects the
+magnitude -> **native-FP4-compatible, no new type**.
+
+Ceiling KLD (no-subnormal requantize vs the 27B f16 base, `--chunks 200`) is being measured next; if
+it moves nvfp4 KLD substantially toward q4_0, the cheap global recalibration - not a per-tensor type
+- is the fix.
+
 ## Future avenue: batched / concurrent-prefill serving
 
 All perf numbers above are single-stream `pp` (+10-19% nvfp4 on 7B). The strongest unmeasured
