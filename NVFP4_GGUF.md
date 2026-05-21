@@ -76,6 +76,27 @@ bulk better while distorting the few large values that drive the output. Conclus
 widen; the depth is already past where the unweighted proxy diverges from output quality. This
 directly motivates importance-weighting the error (x^2 / imatrix) instead of more depth.
 
-## x^2-weighted error (+/-2)
+## x^2-weighted error (+/-2, Qwen3-1.7B, vs same f16 base)
 
-_(pending)_
+| error metric            | Mean KLD            | PPL ratio | Same top-p |
+|-------------------------|---------------------|-----------|------------|
+| unweighted (committed)  | 0.173927 +/- 0.00069 | 1.17312   | 78.62%     |
+| x^2-weighted            | 0.177634 +/- 0.00070 | 1.17608   | 78.19%     |
+
+x^2-weighting is **worse** by +0.0037 KLD (~5.3 sigma), worse on all three metrics. Hypothesis
+refuted. Reconciling with the +/-3 result: unweighted +/-2 is a balance point. +/-3 (more
+candidates -> picks a lower scale, fits the small-value bulk harder) pushes *toward small
+values* and hurt; x^2-weighting pushes *toward the few large values* (the max, which amax/6
+already pins) and also hurt. Both directions away from the committed unweighted +/-2 regress.
+
+The lesson: per-sub-block reconstruction error - weighted or not - is only a proxy for KLD, and
+unweighted +/-2 happens to be the best proxy among these variants. A crude per-weight reweight
+(x^2) is just a differently-misaligned proxy. The principled lever is the **imatrix**
+(activation-aware importance, what make_qx_quants uses as `qw`), which `quantize_row_nvfp4_ref`
+currently ignores even though `quantize_nvfp4` receives `quant_weights`. That is a real,
+larger change; depth and x^2 are dead ends.
+
+## Verdict on tuning the search
+
+Committed unweighted +/-2 is the sweet spot among {+/-2, +/-3, x^2-weighted +/-2}. Keep it.
+Real further gains require imatrix plumbing, not search-depth or naive reweighting.
