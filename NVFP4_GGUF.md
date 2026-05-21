@@ -56,6 +56,11 @@ dropped per-tensor scale.
 worse KLD). So the search makes nvfp4 *better than before*, not *better than q4_0* - consistent
 with the KV-cache finding: ggml's single-level nvfp4 tracks q4_0 and never beats it.
 
+Same-top-p (top-1 token agreement vs the f16 base) tells the same story at coarser resolution:
+q4_0 79.20% vs nvfp4 78.62%, a **~0.58 pp** gap in q4_0's favor (the search narrows it from
+~0.71 pp at no-search nvfp4 = 78.49%, but does not overtake). Same-top-p only counts the argmax;
+the full-distribution shift shows up larger in KLD (the ~8% above).
+
 **Takeaway.** The MSE search is a worthwhile, free improvement to the *existing* NVFP4
 reference quantizer (~9% lower KLD for any nvfp4 weight conversion or KV write, and it removed
 CPU/CUDA encoding drift). It does not make nvfp4 the preferred 4-bit format. Caveats: single
