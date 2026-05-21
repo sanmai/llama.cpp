@@ -166,7 +166,25 @@ Qwen2.5-7B (t/s):
 | pp16384 | 5833 +/- 23     | 6394 +/- 12     | +9.6%   |
 | tg128   | 281.2 +/- 0.9   | 275.4 +/- 0.7   | -2.1%   |
 
-**Prefill: nvfp4 wins, and the win scales with model size** (1.7B ~1-3%, 7B ~10-19%). That
+Qwen3.6-27B (dense Qwen3.5, t/s, **-b 8192 -ub 4096** "full blast", + Q3_K arm):
+
+| test    | q4_0 (4.5bpw)   | nvfp4 (4.5bpw)  | Q3_K (3.4bpw)   | nvfp4 vs q4_0 | nvfp4 vs Q3_K |
+|---------|-----------------|-----------------|-----------------|---------------|---------------|
+| pp4096  | 3635.6 +/- 25   | 4804.5 +/- 31   | 3048.7 +/- 9    | +32.2%        | +57.6%        |
+| pp8192  | 3427.0 +/- 38   | 4564.9 +/- 27   | 2945.0 +/- 10   | +33.2%        | +55.0%        |
+| pp16384 | 3051.8 +/- 10   | 3948.5 +/- 5    | 2644.7 +/- 4    | +29.4%        | +49.3%        |
+| tg128   | 84.42 +/- 0.13  | 84.08 +/- 0.12  | 85.65 +/- 0.09  | -0.4%         | -1.8%         |
+
+At 27B (full blast) the prefill win **strengthens and flattens**: ~+30% over q4_0 across all
+prompt lengths (the FFN body so dominates a 27B that attention dilution barely registers). The
+**decode tax vanishes with scale**: -5.0% (1.7B) -> -2.1% (7B) -> -0.4% (27B), as the per-16
+FP8/LUT unpack amortizes. And nvfp4 **beats the smaller Q3_K on prefill by +49-58%** despite
+Q3_K's fewer bits: prefill is compute-bound, Q3_K runs DP4A K-quant (no tensor cores), so 3.4
+bpw is *slower* there; Q3_K only edges decode (+1.8%, bandwidth-bound). Speed landscape: prefill
+nvfp4 >> q4_0 > Q3_K; decode all within ~2%. Power pinned ~572/575 W during prefill, so the +30%
+prefill ~= ~30% fewer joules/prompt vs q4_0 (and below Q3_K's energy too).
+
+**Prefill: nvfp4 wins, and the win scales with model size** (1.7B ~1-3%, 7B ~10-19%, 27B ~+30%). That
 scaling IS the evidence the FP4 cores are doing the work: native FP4 MMA needs large GEMMs to
 flex, and a 1.7B's FFN matmuls are too small. The taper with prompt length (+19 -> +14 -> +10%
 at 7B) is attention dilution - O(n^2) f16 attention is identical for both arms and grows as a
