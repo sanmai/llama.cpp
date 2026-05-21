@@ -287,3 +287,16 @@ calibration set trades some in-domain gain for robustness. The *relative* claim 
 ~half of q4_0 and the gap widens - is structural and should hold across models/domains; the
 absolute KLDs and the imatrix deltas are expected to compress on larger models, which the 7B
 sweep will show.)
+
+## Future avenue: batched / concurrent-prefill serving
+
+All perf numbers above are single-stream `pp` (+10-19% nvfp4 on 7B). The strongest unmeasured
+case for nvfp4 is **batched serving** - many parallel prefills, long-context RAG, agentic
+workloads - which is *more* compute-bound, so the native FP4 advantage should grow beyond the
+single-stream figure. This is nvfp4's best-case workload and the natural home for the
+throughput-bound segment. Native FP4 is the entire consumer Blackwell line (sm_120: 5050..5090),
+not a 5090 halo feature, so the segment is mass-market; the +10-19% ratio is a 5090 number that
+should roughly transfer down the line but is unmeasured on smaller cards. Worth a llama-bench
+(multiple parallel sequences) or server throughput run before a final line on nvfp4's usefulness.
+This is orthogonal to the weight-quality avenue above: batched prefill widens nvfp4's *speed*
+edge; the two-level-scale restoration would fix its *quality* deficit - independent levers.
