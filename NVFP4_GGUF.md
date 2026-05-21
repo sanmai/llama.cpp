@@ -193,3 +193,44 @@ Caveats: speed is measured on 7B, quality on 1.7B - a same-model 7B KLD run is s
 make it a clean single-model speed-vs-quality statement. Native FP4 path confirmed via static
 dispatch + the scaling signature; no `nsys`/`ncu` receipt captured yet. Clocks unlocked, but 7B
 sigmas are ~0.1-0.8% (runs long enough for stable boost).
+
+## Why the imatrix helps nvfp4 less: the single-scale ceiling
+
+The imatrix's only lever is the **scale choice** - in *both* formats. For a fixed scale `d` the
+weighted block error `sum_j w_j (x_j - c_j*d)^2` separates per element, so each code
+`c_j = argmin_c w_j (x_j - c*d)^2` = nearest code, independent of `w_j` (a non-negative constant
+just scales that term). Importance weights only matter where the error is *summed across j* -
+i.e. picking `d`. q4_0's per-element levels are nearest-given-scale too; the imatrix does not
+touch per-element rounding in either.
+
+So the binding constraint is purely the **scale's resolution**:
+- q4_0: `d` is a **continuous fp16** value (LS-fit via `sumlx/suml2`, finely searched). The
+  importance-weighted optimum is a real number and a continuous knob lands on it.
+- nvfp4: `d` is a **UE4M3** value; the +/-2 search reaches ~5 of them. The weighted optimum is
+  *rounded to the nearest reachable rung*. The imatrix computes a better target; nvfp4 cannot
+  represent it. Hence -17% (nvfp4) vs -37% (q4_0).
+
+**Unifying point:** that single coarse scale is exactly ggml dropping real-NVFP4's second-level
+**per-tensor FP32 scale** (true NVFP4 effective scale = `FP32_tensor * UE4M3_subblock`; ggml
+kept only the UE4M3 micro-scale). This is the *same* omission that makes the block writable
+incrementally - i.e. KV-viable. One design choice, three consequences: KV-viability (+), capped
+weight quality vs q4_0 (-), and a starved imatrix lever (-).
+
+**Actionable, and it splits weights from KV:**
+- **Weights are static** -> two-level scaling is free (it is how real NVFP4 PTQ checkpoints
+  store weights). Adding a per-tensor FP32 scale would hand the imatrix a continuous knob and
+  very likely recover most of the gap to q4_0 - the real path to "nvfp4 weights competitive
+  *and* +19% prefill". It is a format change (extra per-tensor scale), not a quantizer tweak.
+- **KV is block-local** -> the cache is written per token, so a per-tensor scale is impossible;
+  the coarse ceiling is inherent and the KV verdict (tracks q4_0, never better) is permanent.
+
+One-liner: the imatrix does not generalize *poorly* for nvfp4 - it generalizes exactly as far
+as the format's one coarse degree of freedom allows, and that freedom was traded for
+KV-viability. Restore the second scale level (weights only) and the imatrix story changes.
+
+(Generalization caveats for the magnitudes: the imatrix was calibrated on wiki.train and
+evaluated on wiki.test - same domain, so -17%/-37% are optimistic in-domain bounds; a diverse
+calibration set trades some in-domain gain for robustness. The *relative* claim - nvfp4 gains
+~half of q4_0 and the gap widens - is structural and should hold across models/domains; the
+absolute KLDs and the imatrix deltas are expected to compress on larger models, which the 7B
+sweep will show.)
