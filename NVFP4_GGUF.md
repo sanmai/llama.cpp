@@ -189,9 +189,23 @@ prefill-/energy-bound and tolerant of a small quality dip; q4_0 still wins quali
 imatrix asymmetry tilts the trade further toward q4 (it would widen q4's quality lead while
 nvfp4's speed edge persists).
 
-Caveats: native FP4 path confirmed via static dispatch + the scaling signature; no `nsys`/`ncu`
-receipt captured yet. Clocks unlocked, but 7B sigmas are ~0.1-0.8% (runs long enough for stable
-boost). Same-model quality is below.
+**Native FP4 confirmed three independent ways (no ambiguity):**
+- *Compiled* - `cuobjdump --dump-sass libggml-cuda.so` carries `OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X`
+  (= NVFP4: m16n8**k64** tile, E2M1 4-bit operands, UE4M3 block scale, scale_vec::4X; the `.E8`
+  sibling is MXFP4). That is `mma.sync...kind::mxf4nvf4` lowered to SASS.
+- *Dispatched* - `nsys` on an nvfp4 prefill shows `quantize_mmq_nvfp4` (the FP4 activation packer,
+  unique to the `use_native_fp4` branch) + `mul_mat_q<(ggml_type)40,...>` (NVFP4) as the top kernels.
+- *Executed* - `ncu` profiles `mul_mat_q<40>` on CC 12.0 (RTX 5090).
+
+**Mechanism of the prefill win (from the SASS):** q4_0's MMQ runs `IMMA.16832.S8.S8` (int8,
+**k=32**); nvfp4 runs `OMMA.16864...` (FP4, **k=64**) - double the K-depth per tensor-core
+instruction at the same issue slots. That k32->k64 doubling is the architectural source of the
++10-19%, not a vague "FP4 is faster". (ncu also showed the kernel only ~17% SM-busy at pp256 -
+the FP4 cores idle at small sizes, which is why the win scales with size/batch -> the batched
+avenue below.)
+
+Caveats: clocks unlocked, but 7B sigmas are ~0.1-0.8% (runs long enough for stable boost).
+Same-model quality is below.
 
 ## 7B quality (Qwen2.5-7B) + the same-model verdict
 
