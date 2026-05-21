@@ -61,20 +61,22 @@ reference quantizer (~9% lower KLD for any nvfp4 weight conversion or KV write, 
 CPU/CUDA encoding drift). It does not make nvfp4 the preferred 4-bit format. Caveats: single
 small model; no imatrix (nvfp4 ignores it - q4_0/q4_K with imatrix would widen their lead).
 
-## Search depth: +/-2 vs +/-3 (Qwen3-1.7B, vs same f16 base)
+## Search depth: +/-0 .. +/-3 (Qwen3-1.7B, vs same f16 base)
 
-| search depth        | Mean KLD            | quant time |
-|---------------------|---------------------|------------|
-| +/-2 (committed)    | 0.173927 +/- 0.00069 | 9.8s       |
-| +/-3                | 0.177830 +/- 0.00069 | 14.1s      |
+| search depth        | Mean KLD            | note          |
+|---------------------|---------------------|---------------|
+| +/-0 (no search)    | 0.190443            | baseline      |
+| +/-1                | 0.178935 +/- 0.00070 | +0.0050 (~7s) worse than +/-2 |
+| +/-2 (committed)    | 0.173927 +/- 0.00069 | **minimum**   |
+| +/-3                | 0.177830 +/- 0.00069 | +0.0039 (~5.7s) worse than +/-2 |
 
-+/-3 is **worse** by +0.0039 KLD (~5.7 sigma), at ~1.4x the cost. This is not noise and is the
-informative result: a min-error search can only *lower* per-block SSE with more candidates, so
-+/-3 yields lower unweighted SSE but HIGHER KLD. The search optimizes the wrong objective -
-unweighted SSE over-weights the many small values, so a wider scan drops the scale to fit the
-bulk better while distorting the few large values that drive the output. Conclusion: do not
-widen; the depth is already past where the unweighted proxy diverges from output quality. This
-directly motivates importance-weighting the error (x^2 / imatrix) instead of more depth.
+A clean valley with the floor at **+/-2** - both under-refining (+/-1, too few candidates) and
+over-refining (+/-3) lose, each ~5-7 sigma worse. The +/-3 direction is the informative one: a
+min-error search can only *lower* per-block SSE with more candidates, so +/-3 has lower
+unweighted SSE yet HIGHER KLD - it optimizes the wrong objective. Unweighted SSE over-weights
+the many small values, so a wider scan drops the scale to fit the bulk while distorting the few
+large values that drive the output. The committed +/-2 is empirically optimal among the four.
+Depth is settled; the only principled lever left is importance-weighting (imatrix).
 
 ## x^2-weighted error (+/-2, Qwen3-1.7B, vs same f16 base)
 
