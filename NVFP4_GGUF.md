@@ -201,19 +201,23 @@ q4_0-fresh are the same ~4.13 GiB; q4_0-imat is +0.3% (imatrix nudges a couple t
 | quant            | PPL ratio | Mean KLD            | Same top-p |
 |------------------|-----------|---------------------|------------|
 | nvfp4 (search)   | +7.7%     | 0.10524             | 85.21%     |
+| nvfp4 + imatrix  | +7.1%     | 0.09235             | 86.33%     |
 | q4_0 (no imat)   | +4.1%     | 0.05779             | 88.83%     |
 | q4_0 + imatrix   | +1.8%     | 0.04649             | 89.92%     |
 
 - **nvfp4 vs plain q4_0: ~82% worse KLD** (0.105 vs 0.058), ~1.9x the PPL penalty, -3.6 pp
   top-1. At 1.7B (Qwen3) the gap was only ~8%; at 7B (Qwen2.5) it blows open.
-- **imatrix halves q4_0's PPL penalty** (+4.1% -> +1.8%, -20% KLD) - the asymmetry nvfp4 can't
-  use (`quantize_row_nvfp4_ref` ignores the imatrix).
-- **nvfp4 vs the realistic q4_0+imatrix: ~2.3x worse KLD, 4.3x the PPL penalty** (+7.7% vs
-  +1.8%), -4.7 pp top-1.
+- **imatrix helps both, unevenly.** q4_0 halves its PPL penalty (+4.1% -> +1.8%, -20% KLD);
+  nvfp4 - once plumbed (`quantize_row_nvfp4_impl`) - gains -12% KLD (0.1052 -> 0.0924). nvfp4
+  *can* use the imatrix now; it just rides it less far (single-scale ceiling, see below).
+- **nvfp4+imatrix vs the realistic q4_0+imatrix: ~2x worse KLD** (0.0924 vs 0.0465), ~3.9x the
+  PPL penalty (+7.1% vs +1.8%), -3.6 pp top-1.
 
-**Same-model speed-vs-quality verdict:** nvfp4 buys +10-19% prefill but costs ~2-2.3x worse
-quantization quality. The speed gain does not come close to justifying a doubling of divergence;
-even against un-imatrix'd q4_0 it is ~1.8x worse. For weights, q4_0 (esp. with imatrix) dominates.
+**Same-model speed-vs-quality trade:** nvfp4 buys +10-19% prefill at ~2x worse quantization
+quality than q4_0 (imatrix on both: 0.0924 vs 0.0465). Whether that's worth it is
+workload-dependent, not a wash: prefill-/throughput-/energy-bound work on consumer Blackwell
+(the whole sm_120 line, 5050..5090 + laptop parts) can reasonably take the trade; memory-bound
+or quality-per-byte favors q4_0/IQ4_XS. A real trade, not a free win and not a write-off.
 
 **Why 8% (1.7B) -> 82% (7B):** nvfp4's single-level floor. q4_0 rides its fp16-per-32 scale down
 to 0.058 on the redundant 7B; nvfp4, missing the per-tensor scale, stalls at 0.105 and cannot
@@ -231,21 +235,24 @@ Where nvfp4 actually sits among 4-bit-class formats. Sorted by KLD (best first):
 | IQ4_XS          | 3.96 GiB  | 0.04071  | +3.0%     | 90.51%     |
 | q4_0 + imatrix  | 4.14 GiB  | 0.04649  | +1.8%     | 89.92%     |
 | q4_0            | 4.13 GiB  | 0.05779  | +4.1%     | 88.83%     |
-| **nvfp4**       | 4.13 GiB  | 0.10524  | +7.7%     | 85.21%     |
+| **nvfp4 + imat**| 4.13 GiB  | 0.09235  | +7.1%     | 86.33%     |
+| nvfp4 (search)  | 4.13 GiB  | 0.10524  | +7.7%     | 85.21%     |
 | Q3_K_M          | 3.55 GiB  | 0.10925  | +8.6%     | 85.08%     |
 | Q3_K_S          | 3.25 GiB  | 0.19372  | +12.2%    | 79.57%     |
 
-**nvfp4 is q3-tier quality at q4 size, and Pareto-dominated on both axes at once.**
-- It matches Q3_K_M (0.1052 vs 0.1092 KLD, 85.21% vs 85.08% top-1) - same quality, but Q3_K_M is
-  0.58 GiB smaller.
-- IQ4_XS is *smaller* than nvfp4 (3.96 vs 4.13 GiB) yet **2.6x better KLD** (0.041 vs 0.105) - and
-  is the best 4-bit here, edging q4_0+imatrix. So even a smaller proper 4-bit beats nvfp4 outright.
+**nvfp4 sits at the q3/q4 boundary in quality; the imatrix lifts it but cannot reach real 4-bit.**
+- Without imatrix it merely matches Q3_K_M (0.1052 vs 0.1092 KLD) at 0.58 GiB more size. With the
+  imatrix it **clears Q3_K_M** (0.0924 vs 0.1092, 86.33% vs 85.08% top-1) - so it's no longer
+  q3-tier, but it's still not q4-tier.
+- It remains dominated on quality-per-byte by the real 4-bit formats: q4_0 (0.058) and q4_0+imatrix
+  (0.046) at the same size, and IQ4_XS (0.041) which is *smaller* (3.96 GiB) **and** ~2x better KLD.
 
-Every other 4-bit option gives equal-or-better quality at equal-or-smaller size. nvfp4's only
-non-dominated property is Blackwell native FP4 prefill throughput (+10-19%, see Performance). For
-the memory-bound "run q1-q3 of a bigger model" use case, nvfp4 is the wrong tool (heavier than
-q3/q2, fits less model); it only makes sense throughput-bound on Blackwell, spending q4 bytes for
-q3 quality to get the FP4 prefill win.
+So on quality-per-byte alone, q4_0/IQ4_XS win and nvfp4 is the wrong tool for the memory-bound
+"fit a bigger model" case. nvfp4's non-dominated property is **Blackwell native FP4 prefill
+throughput** (+10-19%, see Performance) - available across the whole consumer sm_120 line, not
+just halo cards. That makes it a genuine trade for prefill-/throughput-/energy-bound workloads:
+spend ~2x quantization quality (vs q4_0+imatrix) to buy double-digit prefill on commodity
+Blackwell. Worth it or not depends on the workload; it is not a blanket write-off.
 
 ## Why the imatrix helps nvfp4 less: the single-scale ceiling
 
