@@ -564,3 +564,57 @@ loss a global scale could rescue. Wiring `.input_scale` would not recover it.
 a quality run. Stock build: `q4_0` SOUND, `nvfp4` SOUND, `nvfp4-nosubn` GARBAGE (expected - the
 lifted bytes only reconstruct on the matching divide-by-64 build; this is the artifact the clean
 test above replaces).
+
+## Decisive test resolved: native kernel works, decomposed by a W4A16 dequant control (2026-05-22)
+
+Ran the clean test the section above proposed. Quantized Qwen3.6-27B with the subnormal lift in the
+quantizer (`quantize_row_nvfp4_ref`/`_impl`: encode arg `*64`, decode `/64`; global UE4M3 codec left
+stock) + the #22897 producer port, so the stored byte reads 64x large on every path and the
+per-tensor `.scale = sum(f32*dq)/sum(dq^2)` LS-derives `2^-6 * bias` (~0.01564) automatically,
+applied via `build_lora_mm`'s `ggml_mul`. Built `qwen3.6-27b-nvfp4-canon2.gguf`.
+
+**It runs SOUND on the native FP4 OMMA, coherent generation - the "kernel bug" is refuted.** The
+native scale operand is magnitude-independent after all (PR #22196/#21074 review: four UE4M3 scales
+in one register, scale_vec::4X `{0,0}` selectors, `tidx_A` picks the row not the byte). The earlier
+26%/top-p-0 came from doing the compensation in the MMQ *write-back* (missed MMVQ/stream-k/router and
+compounded across 65 layers); the graph-level `ggml_mul` epilogue covers every matmul uniformly,
+kernel-agnostic.
+
+**Coverage gap (debugged via a load failure).** The `.scale` epilogue only covers matmul weights.
+Two NVFP4 paths apply no scale and must stay unlifted (`--token-embedding-type q8_0
+--tensor-type eh_proj=q8_0`): `token_embd` (read by `get_rows` -> 64x embeddings) and `nextn.eh_proj`
+(`build_lora_mm` with no `_s` arg; #22897 also over-emits its scale, two unconsumed tensors ->
+`done_getting_tensors: expected 1874, got 1872`). This is the same gap the tied-`output==tok_embd`
+assert guards, and it applies equally to NVIDIA's canonical per-tensor `s_global`.
+
+**The dequant control (W4A16).** To separate weight-quant quality from the W4A4 activation penalty,
+force NVFP4 off MMQ onto the cuBLAS dequant path: env gate `GGML_NVFP4_FORCE_DEQUANT=1` ->
+`ggml_cuda_should_use_mmq` returns false for NVFP4 -> weights dequantized to f16, f16 GEMM, f16 acts.
+`.scale` still applies (it is graph-level). Same gguf, same 200-chunk KLD vs the f16 base:
+
+| config                             | acts        | weight scales | Mean KLD            | PPL ratio | top-p   |
+|------------------------------------|-------------|---------------|---------------------|-----------|---------|
+| nvfp4 native, old (subnormal)      | fp4  (W4A4) | subnormal     | 0.07907 +/- 0.00175 | 1.05777   | 89.041% |
+| nvfp4 native, lift + .scale        | fp4  (W4A4) | normal        | 0.06880 +/- 0.00155 | 1.03824   | 89.737% |
+| nvfp4 dequant control, lift+.scale | f16  (W4A16)| normal        | 0.03961 +/- 0.00134 | 1.01895   | 92.461% |
+| q4_0 native                        | int8 (W4A8) | fp16          | 0.04852 +/- 0.00149 | 1.03311   | 91.737% |
+
+Reading it:
+- **Subnormal rescue lands on the native speed path:** 0.07907 -> 0.06880, **-13% KLD**, free (no new
+  type; normal-grid placement + the `.scale` epilogue). The "speed XOR quality" fork above is
+  half-closed - the weight rescue is no longer dequant-only.
+- **As a weight format (W4A16), lifted nvfp4 beats q4_0:** 0.03961 vs 0.04852, **-18%** (top-p 92.46
+  vs 91.74), and edges the old global-pow2 ceiling (0.04028) - the per-tensor LS `.scale` is a hair
+  better than a uniform 2^-6 shift, and it is stored in-file so it runs on a stock binary.
+- **The native gap to q4_0 is purely activations:** 0.06880 (W4A4) - 0.03961 (W4A16) = **0.02919**,
+  the fp4-activation penalty (matches the +0.029 measured earlier). Native nvfp4 stays ~42% behind
+  q4_0 native; the weight fix narrows but cannot close it, because the OMMA is fp4 x fp4 - there is
+  no int8-activation option on the speed path.
+
+**Net.** "Reap both native FP4 speed and precision" delivers *better* native precision
+(0.079 -> 0.069, while keeping the +30% prefill), not q4_0-beating precision. To beat q4_0 you must
+either drop to W4A16 (forgo the FP4 speed - then nvfp4 wins, 0.0396 vs 0.0485) or shrink the W4A4
+activation error, which the weight scale cannot touch. Follow-up for a deployable type: replace the
+uniform LIFT + LS `.scale` with NVIDIA-canonical per-tensor `s_global = global_amax/(448*6)`,
+`s_block = (block_amax/6)/s_global` (robust per-tensor range placement, apples-to-apples vs NVIDIA's
+own NVFP4).
