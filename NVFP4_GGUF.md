@@ -26,13 +26,50 @@ KL-divergence from its f16 reference (and lower perplexity) than the same model 
 
 ## Prior art
 
-- https://github.com/ggml-org/llama.cpp/pull/22858 ("llama-quantizer has no code to make correct NVFP4 ggufs")
-- https://github.com/ggml-org/llama.cpp/pull/23046 (NvFP4 quantized LM head support)
-- https://github.com/vllm-project/vllm/pull/42124 (LM head quantization support for ModelOpt)
-- https://github.com/ggml-org/llama.cpp/pull/22196 (Blackwell native NVFP4 support)
-- https://github.com/ggml-org/llama.cpp/pull/21074 (generic NVFP4 MMQ kernel)
-- https://github.com/ggml-org/llama.cpp/pull/20506 (Qwen3.5/Qwen3.5MoE tensors for NVFP4)
-- https://github.com/ggml-org/llama.cpp/pull/22897 (NVFP4 scale tensors)
+The upstream NVFP4 work splits cleanly into **kernels** (consume scales), a **consumer** (applies
+the per-tensor scale in the graph), and **producers** (emit the scale tensors). Read in that frame:
+
+Kernels (consume the per-16 UE4M3 block scales; both assume the per-tensor global scale is `1`):
+- https://github.com/ggml-org/llama.cpp/pull/22196 (Blackwell native NVFP4 / FP4 OMMA). The
+  `scale_vec::4X` MMA reads the four UE4M3 block scales via `get_int_b4` into one packed register
+  with `{0,0}` PTX selectors; the lane map (`tidx_A = tx/4 + (tx%2)*8`) selects which *row's* scale
+  register a lane supplies, not which byte - so it is **structurally magnitude-independent** (a code
+  reading, not a proof). Validated only on `test-backend-ops` (near-uniform synthetic) and
+  self-quantized (subnormal) ggufs; the real normal-range/high-variance regime is untested in-PR.
+  NVIDIA's per-tensor F32 scale is deliberately deferred to a separate `GGML_OP_MUL` (discussion
+  #22042: `quantize/dequantize_row_nvfp4` are "incorrect when F32 != 1.0").
+- https://github.com/ggml-org/llama.cpp/pull/21074 (generic NVFP4 MMQ, non-Blackwell dp4a). Each
+  lane decodes its own block's four UE4M3 scales independently (`ggml_cuda_ue4m3_to_fp32` ->
+  `x_df`), no warp cooperation - **immune** to any lane-permutation scale bug. Same per-block decode
+  as `dequantize_block_nvfp4`. Validated for speed (`llama-bench`) only.
+
+Consumer (the per-tensor scale path - present on master *and* on this branch):
+- `build_lora_mm(w, cur, w_s)` -> `res = ggml_mul(ctx0, res, w_s)` (`llama-graph.cpp:1002`). The
+  weight `.scale` ("NVFP4 scale2") is a post-matmul per-tensor multiply that rides on top of *any*
+  mul_mat kernel (native FP4 or dequant). This is where NVIDIA's dropped per-tensor F32 global
+  re-enters - as a sibling tensor + graph epilogue, **no new ggml type, block layout unchanged**.
+  The activation `.input_scale` is loaded and saved but **consumed nowhere** (dead across the whole
+  `src/` tree; `build_lora_mm` has no input-scale parameter) - scaffolding for a future W4A4 path.
+
+Producers (emit `.scale` / `.input_scale`; two independent ones):
+- https://github.com/ggml-org/llama.cpp/pull/22897 (`llama-quantize`, OPEN). Adds the missing
+  `LLAMA_FTYPE_MOSTLY_NVFP4` default-type mapping (was UB) and emits per-tensor F32 `.scale` =
+  `sum(f32 * dequant) / sum(dequant^2)` - the **LS-optimal global bias correction** given the
+  *unchanged subnormal* block scales (their 0.5B run: ~0.96-1.04). It does **not** touch the
+  block-scale encoding, so it is orthogonal to (and far smaller than) the subnormal rescue measured
+  below. Writes `.input_scale` = the same value (a placeholder; inert). Experts (`.experts.`)
+  excluded. Supersedes the closed #22858 ("llama-quantizer has no code to make correct NVFP4 ggufs").
+- https://github.com/ggml-org/llama.cpp/pull/20506 + #20505 (Qwen3.5/Qwen3.5-MoE). #20506 wires the
+  `*_s` weight scales into the graph; the sibling #20505 is the converter that imports a
+  pre-quantized ModelOpt/compressed-tensors NVFP4 checkpoint **verbatim** - block UE4M3 scales
+  bit-copied (`& 0x7F`), `weight_scale_2` -> `.scale` (raw F32, applied via `ggml_mul`),
+  `input_scale` -> `.input_scale` (dead). Self-quantizer bypassed (`raw_dtype=NVFP4`). These are the
+  only ggufs that carry genuine normal-range block scales + a real global scale. **Not on this
+  branch** (`feat/nvfp4-gguf`): the loader half is here, the converter half is not.
+- https://github.com/ggml-org/llama.cpp/pull/23046 (NVFP4 LM head). Extends `.scale` to the
+  top-level `output` tensor (outside the per-layer loop), wires `output_s` into the final-logits
+  `build_lora_mm`, and bans NVFP4 on a tied `output == tok_embd` head. `.input_scale` still dead.
+- https://github.com/vllm-project/vllm/pull/42124 (vLLM LM-head quant for ModelOpt; reference).
 
 ## Setup
 
@@ -456,3 +493,63 @@ should roughly transfer down the line but is unmeasured on smaller cards. Worth 
 (multiple parallel sequences) or server throughput run before a final line on n4_0's usefulness.
 This is orthogonal to the weight-quality avenue above: batched prefill widens n4_0's *speed*
 edge; the two-level-scale restoration would fix its *quality* deficit - independent levers.
+
+## Producer/consumer split + corrected kernel-bug status (2026-05-22)
+
+Reviewing the upstream PRs (kernels #22196/#21074, consumer `build_lora_mm`, producers #22897 and
+#20505/#20506/#23046, see Prior art) reframes the "second scale level" question and walks back the
+"likely a ggml kernel bug" conclusion of the *Native FP4 rejects rebiased scales* section above.
+
+**The per-tensor scale already has a home, and it is not the kernel.** NVIDIA's dropped F32 global
+scale re-enters as a sibling `.scale` tensor multiplied onto the matmul output in the graph
+(`build_lora_mm` -> `ggml_mul`), riding on top of *either* the native FP4 OMMA or the dequant
+kernel. The kernels deliberately assume `s_global == 1`; the maintainers split responsibility so the
+block layout (and the FP4 OMMA) never has to change. So the reserved **N4_K** needs **no new ggml
+type** - it is N4_0's block plus a per-tensor F32 `.scale`, which the loader on this branch already
+applies. The activation companion `.input_scale` is emitted by both producers but consumed nowhere
+(`build_lora_mm` has no input-scale arg) - dead scaffolding for a future W4A4 path.
+
+**Two distinct levers, previously conflated under "second scale level":**
+- **(a) LS bias correction** - #22897's `.scale = sum(f32*dq)/sum(dq^2)`, a single per-tensor scalar
+  that removes the residual *multiplicative* bias given the *unchanged subnormal* block scales
+  (~0.96-1.04). It cannot fix per-block or per-element error, only the mean gain - expect a small
+  KLD move. Works on native (it is a graph epilogue).
+- **(b) Subnormal rescue** - re-encoding the block UE4M3 scales into the normal 3-bit-mantissa grid
+  (the -19% W4A16 result above). This changes the *block-scale encoding*, which #22897 does **not**
+  do. This is the dominant weight-format gap. Canonical NVFP4 gets (b) for free: a per-tensor
+  `s_global = global_amax/(448*6)` normalizes block scales into the normal range *and* is stored as
+  `.scale` - one factor delivers both the rescue and the magnitude compensation.
+
+**Kernel-bug status: contested, not confirmed.** The native scale operand reads the four block
+scales into one register with row-selecting lanes (#22196) and the generic path decodes each scale
+independently (#21074) - both arguments say normal-range, high-variance scales should *not* be
+corrupted by the kernel. Yet the lifted-scale `nosubn` gguf gave top-p 26% on native (above). The
+prime suspect is now the *measurement vehicle*, not the kernel: that run carried the magnitude
+compensation as a `* 2^-N` patch in the MMQ **write-back**, which only covers the matmuls that hit
+the instrumented epilogue (MMVQ decode, stream-k fixup, MoE/`mul_mat_id`, and the router were never
+proven covered) and compounds any miss across 65 layers. The `ggml_mul` consumer path has none of
+that: it scales *every* matmul output uniformly, in the graph, independent of which CUDA kernel ran.
+
+**Clean decisive test (now unblocked by the #22897 producer mechanism):** quantize with block scales
+re-encoded into the normal grid **and** a compensating per-tensor `.scale` written as a sibling
+tensor (extend #22897's emission; set `.scale = 2^-N * LS_correction`), then run on the native FP4
+OMMA on a **stock** binary - the compensation arrives via `ggml_mul`, the write-back hack is gone.
+- SOUND + KLD ~ 0.069 (0.040 weight-rescued + 0.029 W4A4 activation) -> no kernel bug; the earlier
+  26% was the write-back hack's path-coverage gap, and the speed/quality fork stands as a W4A4
+  *activation* trade (the weight rescue helps only W4A16).
+- GARBAGE -> a genuine native normal-range scale issue survives the clean epilogue; pin it with a
+  deterministic high-variance `test-backend-ops` case before any kernel change.
+Vehicle note: Qwen3.6-27B is `qwen35` **dense** (block_count 65), so `build_lora_mm` covers all its
+weights - no `build_lora_mm_id`/expert-scale wrinkle (and #22897 excludes experts anyway).
+
+**Activation side is not a scale-placement problem.** The native activation quantizer
+(`quantize.cu`) computes its own per-16 UE4M3 activation scale dynamically (`amax_raw/6`, +/-2 MSE)
+and ignores `.input_scale`. Activation amax is O(0.1-1) -> those block scales already land in normal
+range, so the +0.029 W4A4 penalty is intrinsic E2M1 4-bit resolution, **not** a subnormal-placement
+loss a global scale could rescue. Wiring `.input_scale` would not recover it.
+
+**Smoke gate.** `nvfp4-smoke.sh` now greedy-decodes a few tokens from a repeated `passed\n` prompt
+(`llama-completion --temp 0 --top-k 1`) and checks the model echoes it - a fast coherence gate, not
+a quality run. Stock build: `q4_0` SOUND, `nvfp4` SOUND, `nvfp4-nosubn` GARBAGE (expected - the
+lifted bytes only reconstruct on the matching divide-by-64 build; this is the artifact the clean
+test above replaces).
