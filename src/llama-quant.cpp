@@ -1295,12 +1295,13 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     for (int64_t i = 0; i < nelements; ++i) {
                         global_amax = std::max(global_amax, fabsf(f32_data[i]));
                     }
-                    // NVIDIA's recipe is s_global = global_amax/(fp8_max*fp4_max) = global_amax/(448*6),
-                    // which pins the max-amax block to E4M3's ceiling (0x7e) - where ggml's +/-2 search
-                    // clips and there is no headroom. A margin < 1 lifts s_global to pull block scales
-                    // down: margin=0.5 = one exponent bit of ceiling headroom, still out of subnormal.
-                    const float margin = 0.5f;
-                    nvfp4_s_global = global_amax > 0.0f ? global_amax / (margin * 448.0f * 6.0f) : 1.0f;
+                    // NVIDIA's recipe s_global = global_amax/(448*6) is an ARBITRARY FP32 value, which
+                    // re-rounds (dithers) every block's amax/6 onto a shifted UE4M3 mantissa grid. Round
+                    // it UP to a power of two instead: 1/s_global is then an exact exponent shift, so each
+                    // block scale keeps its natural-magnitude UE4M3 rounding (no dithering). ceil keeps
+                    // s_global >= canonical, so the max block never exceeds E4M3 max (no saturation).
+                    nvfp4_s_global = global_amax > 0.0f
+                        ? exp2f(ceilf(log2f(global_amax / (448.0f * 6.0f)))) : 1.0f;
                     const float inv_s_global = 1.0f / nvfp4_s_global;
                     for (int64_t i = 0; i < nelements; ++i) {
                         f32_data[i] *= inv_s_global;
