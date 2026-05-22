@@ -1295,7 +1295,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     for (int64_t i = 0; i < nelements; ++i) {
                         global_amax = std::max(global_amax, fabsf(f32_data[i]));
                     }
-                    nvfp4_s_global = global_amax > 0.0f ? global_amax / (448.0f * 6.0f) : 1.0f;
+                    // NVIDIA's recipe is s_global = global_amax/(fp8_max*fp4_max) = global_amax/(448*6),
+                    // which pins the max-amax block to E4M3's ceiling (0x7e) - where ggml's +/-2 search
+                    // clips and there is no headroom. A margin < 1 lifts s_global to pull block scales
+                    // down: margin=0.5 = one exponent bit of ceiling headroom, still out of subnormal.
+                    const float margin = 0.5f;
+                    nvfp4_s_global = global_amax > 0.0f ? global_amax / (margin * 448.0f * 6.0f) : 1.0f;
                     const float inv_s_global = 1.0f / nvfp4_s_global;
                     for (int64_t i = 0; i < nelements; ++i) {
                         f32_data[i] *= inv_s_global;
@@ -1372,8 +1377,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             fout.write((const char *) &scale_val, scale_size);
             zeros(fout, GGML_PAD(scale_size, align) - scale_size);
 
-            gguf_set_tensor_data(ctx_outs[cur_split].get(), input_scale_name.c_str(), &scale_val);
-            fout.write((const char *) &scale_val, scale_size);
+            // .input_scale is the activation-scale slot, consumed nowhere today. We have no
+            // activation calibration, so write a neutral 1.0 instead of mirroring the weight
+            // scale (which would be misleading metadata for any future W4A4 consumer).
+            const float input_scale_val = 1.0f;
+            gguf_set_tensor_data(ctx_outs[cur_split].get(), input_scale_name.c_str(), &input_scale_val);
+            fout.write((const char *) &input_scale_val, scale_size);
             zeros(fout, GGML_PAD(scale_size, align) - scale_size);
         }
     } // main loop
