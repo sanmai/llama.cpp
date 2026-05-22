@@ -387,7 +387,7 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q4_K:    return_type = GGML_TYPE_Q5_0;   break;
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
-            case GGML_TYPE_NVFP4:   return_type = GGML_TYPE_Q8_0;   break; // nvfp4 block 64 -> Q8_0 for odd shapes
+            case GGML_TYPE_NVFP4:   return_type = GGML_TYPE_Q8_0;   break;
             default:
                 throw std::runtime_error(format("no tensor type fallback is defined for type %s",
                                                 ggml_type_name(target_type)));
@@ -485,7 +485,7 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
                 new_type = GGML_TYPE_Q4_K;
             }
             else if (ftype == LLAMA_FTYPE_MOSTLY_NVFP4) {
-                new_type = GGML_TYPE_Q8_0; // NVFP4 has no get_rows kernel; embeddings need a get_rows-capable type
+                new_type = GGML_TYPE_Q8_0;
             }
         }
     } else if (ftype == LLAMA_FTYPE_MOSTLY_IQ2_XXS || ftype == LLAMA_FTYPE_MOSTLY_IQ2_XS || ftype == LLAMA_FTYPE_MOSTLY_IQ1_S ||
