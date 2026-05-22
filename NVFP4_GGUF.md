@@ -24,6 +24,15 @@ KL-divergence from its f16 reference (and lower perplexity) than the same model 
 - Null hypothesis: searched KLD/PPL ~= unsearched (the synthetic gain does not survive on real
   weights).
 
+## Prior art
+
+- https://github.com/ggml-org/llama.cpp/pull/22858 ("llama-quantizer has no code to make correct NVFP4 ggufs")
+- https://github.com/ggml-org/llama.cpp/pull/23046 (NvFP4 quantized LM head support)
+- https://github.com/vllm-project/vllm/pull/42124 (LM head quantization support for ModelOpt)
+- https://github.com/ggml-org/llama.cpp/pull/22196 (Blackwell native NVFP4 support)
+- https://github.com/ggml-org/llama.cpp/pull/21074 (generic NVFP4 MMQ kernel)
+- https://github.com/ggml-org/llama.cpp/pull/20506 (Qwen3.5/Qwen3.5MoE tensors for NVFP4)
+
 ## Setup
 
 - Model: Qwen/Qwen3-1.7B-Base (dense), converted to f16 GGUF as the reference.
