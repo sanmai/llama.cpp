@@ -640,7 +640,7 @@ Native, 200 chunks, vs the same f16 base, Q6_K output unless noted:
 | canonical, +1 octave ceiling headroom     | per-tensor arbitrary | on     | 0.07565 +/- 0.00176 | 1.06181   | 89.222% |
 | canonical, Q8_0 output                    | per-tensor arbitrary | on     | 0.07541 +/- 0.00176 | 1.06158   | 89.312% |
 | canonical, no MSE search                  | per-tensor arbitrary | off    | 0.07740 +/- 0.00176 | 1.04991   | 89.069% |
-| canonical, per-tensor pow2 s_global       | per-tensor pow2      | on     | (in flight)         |           |         |
+| canonical, per-tensor pow2 s_global       | per-tensor pow2      | on     | 0.06925 +/- 0.00158 | 1.04100   | 89.539% |
 | q4_0 native (reference)                   | -                    | -      | 0.04852             | 1.03311   | 91.737% |
 
 Single-variable findings:
@@ -683,3 +683,52 @@ variant recovers 0.0688 it **beats NVIDIA's shipped recipe** in ggml's UE4M3 cod
 Converting a real checkpoint (importer for both key schemes + Gemma-4 arch support / a Qwen base) would
 add a real-weights-on-the-native-kernel cross-check, but the recipe match is already established from
 the scale ranges.
+
+## Resolution: per-tensor pow2 s_global is the deployable N4_K (2026-05-22)
+
+The pow2 test landed and confirms the dithering hypothesis:
+
+| variant                               | weight s_global      | Mean KLD            | PPL ratio | top-p   |
+|---------------------------------------|----------------------|---------------------|-----------|---------|
+| uniform LIFT 1/64 (pow2)              | uniform pow2         | 0.06880 +/- 0.00155 | 1.03824   | 89.737% |
+| per-tensor pow2 s_global (deployable) | per-tensor pow2      | 0.06925 +/- 0.00158 | 1.04100   | 89.539% |
+| canonical = NVIDIA recipe             | per-tensor arbitrary | 0.07506 +/- 0.00174 | 1.06192   | 89.320% |
+| q4_0 native (reference)               | -                    | 0.04852             | 1.03311   | 91.737% |
+
+- **pow2 matches uniform-pow2 within noise** (0.0693 vs 0.0688) - so it is the *pow2-ness*, not the
+  uniformity, that mattered. Per-tensor (robust, no hand-tuned constant - derived from `global_amax`)
+  is the deployable form of canon2's accidental fixed `1/64`.
+- **pow2 beats NVIDIA's shipped recipe by -7.6%** (0.0693 vs 0.0750), *in ggml's UE4M3 codec*. Their
+  `weight_scale_2`/`weight_global_scale` are arbitrary FP32; on true-E4M3 hardware that is fine, in
+  ggml it dithers the block scales. Closes this doc's own line: "a power-of-2 scalar is exact; an
+  arbitrary scalar is just dithering."
+- **-12.4% over deployed subnormal native** (0.0791 -> 0.0693), free: a per-tensor pow2 `.scale` on the
+  existing `build_lora_mm` `ggml_mul` epilogue. No new ggml type, block layout unchanged.
+
+### The native kernel was never buggy
+The earlier "native FP4 rejects rebiased scales" (top-p 26%, KLD 3.87) was the *write-back* hack
+missing matmul paths (MMVQ/stream-k/router) plus compounding x64 across 65 layers - not the OMMA. With
+the compensation moved to the graph-level `.scale` (`ggml_mul`, which covers every matmul uniformly),
+normal-range high-variance scales run correctly: smoke SOUND, coherent generation, KLD 0.0693. The PR
+#22196/#21074 reading was right - lanes select rows, not bytes.
+
+### Deployable N4_K recipe (producer-side; ggml stays stock)
+1. Per tensor: `s_global = 2^ceil(log2(global_amax/(448*6)))` (pow2; `ceil` keeps `s_global >=`
+   canonical, so the max block never saturates).
+2. Pre-scale f32 by `1/s_global`; the stock +/-2-search quantizer then emits normal-range block scales.
+3. Store `.scale = s_global * LS_bias` (`sum(f32*dq)/sum(dq^2)`); applied post-matmul via `build_lora_mm`.
+4. Keep the +/-2 MSE search (helps KLD ~0.0024). Output Q6_K (no penalty). `.input_scale = 1.0` (inert).
+5. `token_embd` and the MTP `eh_proj` stay non-NVFP4 (q8_0): `get_rows` / no-`_s` `build_lora_mm` cannot
+   carry a `.scale`. MoE experts are NOT covered (the producer skips `.experts.`; would need an
+   `{n_expert}` s_global + `build_moe_ffn` application) - a real gap for MoE deployables.
+
+### Final verdict
+Native NVFP4 weight quality is maxed and *beats NVIDIA's own recipe* in this codec (0.0693). But the
+deployed path stays **behind q4_0 native** (0.0485): the +0.029 KLD is fp4 *activations* (W4A4),
+intrinsic to the FP4 OMMA and untouched by any weight scaling. So N4_K is a **speed-for-quality trade**
+(+30% prefill at 27B, ~12% better weight quality than stock NVFP4), not a quality win.
+
+NVIDIA's "NVFP4 ~ FP8/Q8 quality" is a **W4A16 weight-format** claim - where no-subnormal nvfp4 (0.0403)
+does beat q4_0 (0.0482) - not the **deployed W4A4** path (0.0693), which trails q4_0's W4A8 (0.0485) and
+is nowhere near Q8. The equivalency holds for the weight code in isolation; it does not survive fp4
+activations.
