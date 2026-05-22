@@ -732,3 +732,52 @@ NVIDIA's "NVFP4 ~ FP8/Q8 quality" is a **W4A16 weight-format** claim - where no-
 does beat q4_0 (0.0482) - not the **deployed W4A4** path (0.0693), which trails q4_0's W4A8 (0.0485) and
 is nowhere near Q8. The equivalency holds for the weight code in isolation; it does not survive fp4
 activations.
+
+
+# N4_K (per-tensor pow2 s_global) vs q4_0 - head-to-head sanity bench
+
+Confirms the native FP4 prefill win survived the producer rework (pow2 `s_global` is
+quantize-time only; inference runs the identical native FP4 OMMA kernels). RTX 5090, build
+`275c3bfe9`, `llama-bench -p 4096 -n 128 -b 4096 -ub 2048 -ngl 999 -r 20`.
+
+| model                | size      | test   | t/s              | vs q4_0 |
+|----------------------|-----------|--------|------------------|---------|
+| qwen35 27B NVFP4 (n4k-pow2) | 15.24 GiB | pp4096 | 4728.96 ± 43.30 | +23.1%  |
+| qwen35 27B NVFP4 (n4k-pow2) | 15.24 GiB | tg128  |   79.39 ± 1.82  | -4.8%   |
+| qwen35 27B Q4_0      | 14.63 GiB | pp4096 | 3842.88 ± 13.85 | -       |
+| qwen35 27B Q4_0      | 14.63 GiB | tg128  |   83.37 ± 1.64  | -       |
+
+- **Prefill +23.1%** - native FP4 OMMA win intact. (The doc's +32% was "full blast"
+  `-b8192 -ub4096`; at `-b4096 -ub2048` the FP4 cores saturate less, so +23% is expected -
+  same story, smaller batch.)
+- **Decode -4.8%** (~1.6 sigma given tg sigma ~1.7) - the per-16 E2M1 LUT + UE4M3 unpack tax
+  on the bandwidth-bound GEMV, where no FP4 cores fire. Consistent with the established small
+  decode tax.
+- Nothing borked: the pow2 producer change does not touch the inference path. Quality of this
+  exact gguf is native KLD 0.0693 (see `NVFP4_GGUF.md` "Resolution" section).
+
+## Full-blast `-b 8192 -ub 4096` + the `.scale` epilogue cost (three-way)
+
+`llama-bench -p 4096 -n 128 -b 8192 -ub 4096 -ngl 999 -r 20`, RTX 5090, build `275c3bfe9`.
+
+| model                         | size      | pp4096          | tg128         |
+|-------------------------------|-----------|-----------------|---------------|
+| nvfp4 scale-less (old, no .scale) | 14.63 GiB | 4851.35 ± 29.44 | 84.19 ± 0.13 |
+| n4k-pow2 (+per-tensor .scale)     | 15.24 GiB | 4474.81 ± 72.29 | 80.31 ± 0.21 |
+| q4_0                              | 14.63 GiB | 3596.77 ± 17.91 | 84.31 ± 0.51 |
+
+- **Inference path intact.** Scale-less nvfp4 pp4096 = 4851 reproduces (slightly beats) the doc's
+  old 4804.5, and its decode 84.19 == q4_0 84.31. So scale-less nvfp4 vs q4_0 = **+34.9% prefill,
+  -0.1% decode** - the original story. No kernel regression.
+- **The `.scale` epilogue is the cost.** n4k-pow2 vs scale-less nvfp4 = **-7.8% prefill
+  (4851->4475), -4.6% decode (84.2->80.3)** - the per-tensor `ggml_mul(res, w_s)` on every matmul,
+  a memory-bound pass that re-reads the whole activation. Expected (price of two-level scaling), not
+  a bug; `token_embd` Q8_0 (the +0.6 GiB size) is `get_rows`, not in the matmul throughput.
+- **Net deployable N4_K vs q4_0: +24.4% prefill, -4.7% decode** at KLD 0.0693. The two-level
+  `.scale` buys -12% KLD (vs stock subnormal nvfp4) for ~8% prefill / ~4.6% decode.
+- Note: `-b8192 -ub4096` is *slower* than `-b4096 -ub2048` for a 4096-token prompt on both arms
+  (n4k 4475<4729, q4_0 3597<3843) - `-ub2048` is optimal at pp4096; full-blast only helps longer
+  prompts.
+- **Optimization target:** fuse the per-tensor `w_s` into the MMQ write-back epilogue (apply it in
+  the matmul kernel when present) instead of a separate `ggml_mul` activation pass - should recover
+  most of the ~8% prefill / ~4.6% decode.
