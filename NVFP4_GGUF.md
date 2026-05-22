@@ -618,3 +618,68 @@ activation error, which the weight scale cannot touch. Follow-up for a deployabl
 uniform LIFT + LS `.scale` with NVIDIA-canonical per-tensor `s_global = global_amax/(448*6)`,
 `s_block = (block_amax/6)/s_global` (robust per-tensor range placement, apples-to-apples vs NVIDIA's
 own NVFP4).
+
+## Deployable N4_K: canonical per-tensor s_global + single-variable sweep (2026-05-22)
+
+Did that follow-up and a sweep, one variable at a time. The recipe is now **producer-only** (the ggml
+quantizer is left stock): in `llama-quant.cpp`, per NVFP4 weight tensor compute `global_amax`, set
+`s_global = global_amax/(448*6)`, pre-scale the f32 by `1/s_global` so the stock quantizer emits
+`s_block = (block_amax/6)/s_global` in E4M3's normal range, and store `.scale = s_global * LS_bias`
+(the #22897 LS pass, run on the pre-scaled f32, supplies the ~1.0 bias). The stored UE4M3 block-scale
+**bytes come out byte-identical to NVIDIA's NVFP4**: ggml's doubled LUT (max 12) and `*0.5` decode
+cancel NVIDIA's (E2M1 max 6, E4M3 max 448), so `global_amax/(448*6)` maps the max block to byte 0x7e
+exactly as NVIDIA does. `.input_scale` is now written as `1.0` (was mirroring the weight scale -
+misleading metadata; it is consumed nowhere, see below).
+
+Native, 200 chunks, vs the same f16 base, Q6_K output unless noted:
+
+| variant                                   | weight s_global      | search | Mean KLD            | PPL ratio | top-p   |
+|-------------------------------------------|----------------------|--------|---------------------|-----------|---------|
+| uniform LIFT 1/64 (pow2) + LS .scale      | uniform pow2         | on     | 0.06880 +/- 0.00155 | 1.03824   | 89.737% |
+| canonical (NVIDIA global_amax/(448*6))    | per-tensor arbitrary | on     | 0.07506 +/- 0.00174 | 1.06192   | 89.320% |
+| canonical, +1 octave ceiling headroom     | per-tensor arbitrary | on     | 0.07565 +/- 0.00176 | 1.06181   | 89.222% |
+| canonical, Q8_0 output                    | per-tensor arbitrary | on     | 0.07541 +/- 0.00176 | 1.06158   | 89.312% |
+| canonical, no MSE search                  | per-tensor arbitrary | off    | 0.07740 +/- 0.00176 | 1.04991   | 89.069% |
+| canonical, per-tensor pow2 s_global       | per-tensor pow2      | on     | (in flight)         |           |         |
+| q4_0 native (reference)                   | -                    | -      | 0.04852             | 1.03311   | 91.737% |
+
+Single-variable findings:
+- **The MSE +/-2 search helps KLD** (off->on: 0.07740 -> 0.07506, top-p 89.07 -> 89.32) even though it
+  *worsens* raw PPL ratio (1.0499 -> 1.0619). The unweighted-SSE search trades a little perplexity for
+  a better full-distribution match; KLD is the target, so keep it. ("E4M3 needs no MSE" is refuted on
+  the primary metric - but it does cost a bit of perplexity, which is real.)
+- **Ceiling headroom is moot.** Pulling the max block one octave below E4M3's ceiling (decoded
+  224 -> 112, byte 0x7e -> 0x76) gives 0.07565 ~= 0.07506. So the canonical-vs-uniform gap is NOT
+  the +/-2 search clipping at the ceiling.
+- **Output precision is moot.** Q8_0 lm_head = 0.07541 ~= Q6_K 0.07565. The residual KLD is the NVFP4
+  body, not the output - keep output at Q6_K (smaller, no penalty).
+- **`.input_scale` is inert.** A per-tensor activation scale cancels algebraically
+  (`cur /= in_s` before the matmul, `* w_s*in_s` after -> `mul_mat(W_real, X_real)`); its only possible
+  effect is the FP4 activation quantization, where a global scale is **fully absorbed by ggml's dynamic
+  per-16 `amax/6` activation scale** (E2M1 codes are scale-invariant). NVIDIA's `input_scale` is a
+  *static* per-tensor activation scale for vLLM's W4A4 path; ggml's dynamic per-block scale strictly
+  subsumes it. Confirmed redundant - the +0.029 W4A4 penalty is intrinsic E2M1 4-bit resolution, not
+  scale placement, so wiring `input_scale` cannot move it.
+
+The open gap: **uniform pow2 (0.0688) beats per-tensor arbitrary canonical (0.0750) by 0.006**, and
+none of {ceiling, search, output} explains it. The remaining structural difference is **pow2 vs
+arbitrary-FP32 `s_global`**. Hypothesis (this doc's own line: "a power-of-2 scalar is exact; an
+arbitrary scalar is just dithering"): an arbitrary `s_global` divides every block's `amax/6` by a
+non-pow2 before UE4M3 encoding, re-rounding the block scales onto a dithered mantissa grid; a **pow2**
+`s_global` is an exact exponent shift that preserves each block's natural-magnitude UE4M3 rounding.
+Test in flight: per-tensor `s_global = 2^ceil(log2(global_amax/(448*6)))` (`ceil` keeps
+`s_global >= canonical`, so the max block never saturates). Prediction: recovers ~0.0688.
+
+Apples-to-apples vs NVIDIA's shipped checkpoints (real artifacts on disk; recipe confirmed *without*
+converting). NVIDIA ModelOpt **Gemma-4-26B-A4B-NVFP4** (`weight_scale_2`/`input_scale`) and vLLM/HF
+**Qwen NVFP4** (`weight_global_scale`/`input_global_scale`) carry the identical three-tier scheme:
+per-block FP8 E4M3 scale + per-tensor F32 global weight scale + per-tensor F32 activation scale
+(group_size 16 = `QK_NVFP4_SUB`, kv-cache FP8, no hadamard/rotation). Their global weight scale (Gemma
+`weight_scale_2`: median 1.21e-4, range 3.6e-5..5.75e-4) **matches our canonical `s_global`** (Qwen
+N4_K median 1.01e-4) - both `global_amax/(448*6)`. So **our 0.0750 is NVIDIA's recipe quality,
+replicated**; and NVIDIA ships *arbitrary* FP32 (none of those values are powers of 2), so if the pow2
+variant recovers 0.0688 it **beats NVIDIA's shipped recipe** in ggml's UE4M3 codec. Their `input_scale`
+(Gemma median 2.2e-3, ~18x the weight scale, normal-range) is the static activation scale - inert here.
+Converting a real checkpoint (importer for both key schemes + Gemma-4 arch support / a Qwen base) would
+add a real-weights-on-the-native-kernel cross-check, but the recipe match is already established from
+the scale ranges.
