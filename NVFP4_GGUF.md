@@ -781,3 +781,53 @@ quantize-time only; inference runs the identical native FP4 OMMA kernels). RTX 5
 - **Optimization target:** fuse the per-tensor `w_s` into the MMQ write-back epilogue (apply it in
   the matmul kernel when present) instead of a separate `ggml_mul` activation pass - should recover
   most of the ~8% prefill / ~4.6% decode.
+
+# MoE: per-expert coverage works, but native FP4 is the wrong format for MoE (2026-05-22)
+
+Extended the producer to cover MoE experts (the last gap) and tested on **Qwen3.6-35B-A3B**
+(`qwen3_5_moe`: 40 layers, 256 experts, 8/tok, `moe_intermediate=512`), converted HF->bf16 (71G).
+
+**Producer change (`llama-quant.cpp`):** `s_global`, the `1/s_global` pre-scale, and the LS bias are
+now **per-i03** (per-expert; dense tensors are the `ne[2]==1` degenerate case). `.scale`/`.input_scale`
+are emitted **`{ne[2]}`-shaped** (one pow2 `s_global` per expert), matching the loader's `ffn_*_exps_s`
+(`{n_expert}`) and `build_moe_ffn`'s per-expert `ggml_mul`. The `.experts.` exclusion is removed.
+`token_embd`/`eh_proj` still forced to q8_0 (get_rows / no-`_s` paths cannot carry a scale).
+
+**Coverage validated:** the 256-expert tensors load (no `done_getting_tensors` mismatch), the model is
+SOUND and coherent, and every expert tensor reads **0% subnormal** with a real `{256}` per-expert
+`.scale` (e.g. `blk.0.ffn_down_exps.scale` spans 3.05e-5..1.22e-4 across its 256 experts) - vs the old
+producer, which left the experts (the bulk of an A3B) single-level subnormal.
+
+**Quality (200-chunk KLD, bf16 base PPL 6.640, all-GPU `-ngl 999`):**
+
+| quant | Mean KLD            | PPL ratio | top-p   |
+|-------|---------------------|-----------|---------|
+| N4_K (per-expert pow2) | 0.08222 +/- 0.00072 | 1.06116   | 87.647% |
+| q4_0                   | 0.05879 +/- 0.00057 | 1.03335   | 89.673% |
+
+N4_K is ~40% worse KLD (-2.0 pp top-p) - the same W4A4-activation gap as the dense 27B (where N4_K was
+~43% worse than q4_0). So the per-expert pow2 recipe holds (experts are correctly two-level); the
+deficit is the intrinsic fp4-activation floor, unchanged by MoE.
+
+**Speed (`llama-bench`, `-b 4096 -ub 2048 -ngl 999 --n-cpu-moe 0 -r 5`, RTX 5090):**
+
+| test   | N4_K (t/s)        | q4_0 (t/s)        | N4_K vs q4_0 |
+|--------|-------------------|-------------------|--------------|
+| pp512  |  9517.5 +/- 27.0  |  8939.6 +/- 289.9 | +6.5% (within q4_0 sigma) |
+| pp2048 | 11292.9 +/- 30.2  | 11514.1 +/- 61.0  | -1.9%        |
+| pp4096 | 11183.7 +/- 74.0  | 11407.0 +/- 47.3  | -2.0%        |
+| tg128  |   241.1 +/-  4.6  |   309.0 +/-  2.7  | -22.0%       |
+
+**The native-FP4 prefill win vanishes on MoE.** The +30% prefill on the dense 27B came from its huge
+FFN GEMMs (`n_ff=17408`) flexing the FP4 `k64` OMMA. This MoE's expert matmuls are tiny
+(`moe_intermediate=512`) and run through `mul_mat_id`; prefill plateaus at ~11.3k t/s for *both*
+formats (bottlenecked by routing/attention, not the expert GEMM), so the FP4 cores never engage.
+Decode is many small expert GEMVs where N4_K's per-element E2M1-LUT + per-16 scale unpack (plus the
+per-expert `.scale` `ggml_mul`) is pure overhead vs q4_0's uniform int4 -> **-22%** (vs the dense 27B's
+-0.4%).
+
+**Verdict:** N4_K is **Pareto-dominated by q4_0 on this MoE** - worse quality (+40% KLD) AND worse
+speed (prefill flat-to-negative, decode -22%). The coverage code is correct and necessary (to *import*
+real NVFP4 MoE checkpoints such as NVIDIA's Gemma-4-26B-A4B, and for completeness), but native FP4 is a
+**dense-large-matmul** win: its non-dominated niche stays dense models with large FFN on Blackwell -
+not MoE, and not quality-per-byte.

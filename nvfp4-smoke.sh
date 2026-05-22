@@ -28,7 +28,7 @@ fi
 models=("$@")
 if [ ${#models[@]} -eq 0 ]; then
     shopt -s nullglob
-    models=(qwen3.6-27b-q4_0.gguf qwen3.6-27b-nvfp4*.gguf)
+    models=(qwen3.6-27b-q4_0.gguf qwen3.6-27b-n*.gguf qwen3.6-35b-a3b-n*.gguf  qwen3.6-35b-a3b-q*.gguf)
     shopt -u nullglob
 fi
 
