@@ -2256,83 +2256,10 @@ size_t quantize_mxfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     return nrow * ggml_row_size(GGML_TYPE_MXFP4, n_per_row);
 }
 
-// imatrix-weighted NVFP4: pick each sub-block's UE4M3 scale by minimizing importance-weighted
-// reconstruction error, weight = qw * sqrt(sigma2 + x^2) (same form as quantize_row_q4_0_impl).
-// The per-element E2M1 codes stay nearest; only the scale choice is importance-aware.
-static void quantize_row_nvfp4_impl(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RESTRICT y, int64_t n_per_row, const float * GGML_RESTRICT quant_weights) {
-    static const int qk     = QK_NVFP4;
-    static const int qk_sub = QK_NVFP4_SUB;
-    static const int n_sub  = QK_NVFP4 / QK_NVFP4_SUB;
-    static const int test_offsets[5] = { 0, -1, 1, -2, 2 };
-
-    assert(n_per_row % qk == 0);
-    const int nb = n_per_row / qk;
-
-    float sum_x2 = 0;
-    for (int j = 0; j < n_per_row; ++j) sum_x2 += x[j]*x[j];
-    const float sigma2 = sum_x2 / n_per_row;
-
-    for (int i = 0; i < nb; i++) {
-        for (int s = 0; s < n_sub; s++) {
-            const float * xb = x             + i*qk + s*qk_sub;
-            const float * qw = quant_weights + i*qk + s*qk_sub;
-
-            float amax = 0.0f;
-            for (int j = 0; j < qk_sub; j++) {
-                amax = fmaxf(amax, fabsf(xb[j]));
-            }
-
-            const int first_code = (int) ggml_fp32_to_ue4m3(amax / 6.0f);
-
-            float   best_err = FLT_MAX;
-            uint8_t best_ue  = 0;
-            float   best_d   = 0.0f;
-            for (int t = 0; t < 5; t++) {
-                const int code = first_code + test_offsets[t];
-                if (code < 0 || code > 0x7e) {
-                    continue;
-                }
-                const float d = ggml_ue4m3_to_fp32((uint8_t) code);
-
-                float err = 0.0f;
-                for (int j = 0; j < qk_sub; j++) {
-                    const float   w = qw[j] * sqrtf(sigma2 + xb[j]*xb[j]);
-                    const uint8_t q = best_index_mxfp4(xb[j], d);
-                    const float   e = xb[j] - kvalues_mxfp4[q]*d;
-                    err += w*e*e;
-                }
-                if (err < best_err) {
-                    best_err = err;
-                    best_ue  = (uint8_t) code;
-                    best_d   = d;
-                }
-            }
-
-            y[i].d[s] = best_ue;
-            const float d = best_d;
-
-            for (int j = 0; j < qk_sub/2; ++j) {
-                const uint8_t x0 = best_index_mxfp4(xb[0        + j], d);
-                const uint8_t x1 = best_index_mxfp4(xb[qk_sub/2 + j], d);
-                y[i].qs[s*(qk_sub/2) + j] = x0 | (x1 << 4);
-            }
-        }
-    }
-}
-
 size_t quantize_nvfp4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
-    if (!quant_weights) {
-        quantize_row_nvfp4_ref(src, dst, (int64_t)nrow*n_per_row);
-        return nrow * ggml_row_size(GGML_TYPE_NVFP4, n_per_row);
-    }
-    const size_t row_size = ggml_row_size(GGML_TYPE_NVFP4, n_per_row);
-    char * qrow = (char *) dst;
-    for (int64_t row = 0; row < nrow; ++row) {
-        quantize_row_nvfp4_impl(src, (block_nvfp4 *) qrow, n_per_row, quant_weights);
-        src  += n_per_row;
-        qrow += row_size;
-    }
-    return nrow * row_size;
+    GGML_UNUSED(quant_weights);
+    quantize_row_nvfp4_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * ggml_row_size(GGML_TYPE_NVFP4, n_per_row);
 }
 
 // ====================== Ternary (de)-quantization (BitNet b1.58 and TriLMs)
