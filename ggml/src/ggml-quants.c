@@ -339,14 +339,6 @@ void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RE
     }
 }
 
-// MEASUREMENT PATCH (revert after): lift the per-16 UE4M3 scale out of UE4M3's subnormal floor
-// into the 3-bit-mantissa normal grid. Store the lifted byte (encode arg *= LIFT) but compute the
-// E2M1 codes against the true-magnitude scale (decode /= LIFT) so the round-trip stays consistent.
-// The global ue4m3 codec stays stock, so the stored byte reads 2^N too large on every dequant /
-// native path; llama-quantize's per-tensor .scale (sum(f32*dq)/sum(dq^2)) absorbs the 2^N as part
-// of the LS bias and re-applies it via build_lora_mm's ggml_mul epilogue. N=6 centers Qwen weights.
-#define NVFP4_SUBNORMAL_LIFT 64.0f
-
 void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RESTRICT y, int64_t k) {
     static const int qk = QK_NVFP4;
     static const int qk_sub = QK_NVFP4_SUB;
@@ -371,7 +363,7 @@ void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RE
 
             // UE4M3 scale: amax / 6.0 maps the max E2M1 value (6.0) to amax.
             // Refine it over first +/- {0,1,2} by min squared reconstruction error.
-            const int first_code = (int) ggml_fp32_to_ue4m3(amax / 6.0f * NVFP4_SUBNORMAL_LIFT);
+            const int first_code = (int) ggml_fp32_to_ue4m3(amax / 6.0f);
 
             float   best_err = FLT_MAX;
             uint8_t best_ue  = 0;
@@ -381,7 +373,7 @@ void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RE
                 if (code < 0 || code > 0x7e) {
                     continue;
                 }
-                const float d = ggml_ue4m3_to_fp32((uint8_t) code) / NVFP4_SUBNORMAL_LIFT;
+                const float d = ggml_ue4m3_to_fp32((uint8_t) code);
 
                 float err = 0.0f;
                 for (int j = 0; j < qk_sub; j++) {
@@ -2290,7 +2282,7 @@ static void quantize_row_nvfp4_impl(const float * GGML_RESTRICT x, block_nvfp4 *
                 amax = fmaxf(amax, fabsf(xb[j]));
             }
 
-            const int first_code = (int) ggml_fp32_to_ue4m3(amax / 6.0f * NVFP4_SUBNORMAL_LIFT);
+            const int first_code = (int) ggml_fp32_to_ue4m3(amax / 6.0f);
 
             float   best_err = FLT_MAX;
             uint8_t best_ue  = 0;
@@ -2300,7 +2292,7 @@ static void quantize_row_nvfp4_impl(const float * GGML_RESTRICT x, block_nvfp4 *
                 if (code < 0 || code > 0x7e) {
                     continue;
                 }
-                const float d = ggml_ue4m3_to_fp32((uint8_t) code) / NVFP4_SUBNORMAL_LIFT;
+                const float d = ggml_ue4m3_to_fp32((uint8_t) code);
 
                 float err = 0.0f;
                 for (int j = 0; j < qk_sub; j++) {

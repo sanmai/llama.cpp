@@ -1195,6 +1195,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         void * new_data;
         size_t new_size;
         float  nvfp4_scale_val = 1.0f;
+        float  nvfp4_s_global  = 1.0f;
 
         if (params->dry_run) {
             // the --dry-run option calculates the final quantization size without quantizing
@@ -1283,6 +1284,24 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 const int64_t nchunk = (nelements_matrix + chunk_size - 1)/chunk_size;
                 const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
 
+                // NVFP4 canonical two-level scaling (NVIDIA recipe): a per-tensor FP32 global scale
+                // s_global = global_amax / (448*6) normalizes the per-16 UE4M3 block scales into
+                // E4M3's normal range. Pre-scaling f32 by 1/s_global makes the stock quantizer emit
+                // s_block = (block_amax/6)/s_global; .scale = s_global*LS_bias is re-applied after the
+                // matmul via build_lora_mm's ggml_mul. Only tensors that receive a .scale are scaled;
+                // excluded NVFP4 tensors (experts, get_rows weights) stay single-level/self-contained.
+                if (new_type == GGML_TYPE_NVFP4 && tm.write_nvfp4_scales) {
+                    float global_amax = 0.0f;
+                    for (int64_t i = 0; i < nelements; ++i) {
+                        global_amax = std::max(global_amax, fabsf(f32_data[i]));
+                    }
+                    nvfp4_s_global = global_amax > 0.0f ? global_amax / (448.0f * 6.0f) : 1.0f;
+                    const float inv_s_global = 1.0f / nvfp4_s_global;
+                    for (int64_t i = 0; i < nelements; ++i) {
+                        f32_data[i] *= inv_s_global;
+                    }
+                }
+
                 // quantize each expert separately since they have different importance matrices
                 new_size = 0;
                 for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
@@ -1318,6 +1337,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                         sum_sq   += (double)dequant_buf[i] * (double)dequant_buf[i];
                     }
                     nvfp4_scale_val = (sum_sq > 1e-10) ? (float)(sum_prod / sum_sq) : 1.0f;
+                    // f32_data was pre-scaled by 1/s_global, so the LS factor above is the residual
+                    // bias on the normalized weights; fold s_global back in to get the true .scale.
+                    nvfp4_scale_val *= nvfp4_s_global;
                 }
             }
             total_size_org += tensor_size;
