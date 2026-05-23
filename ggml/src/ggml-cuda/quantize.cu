@@ -115,7 +115,7 @@ static __global__ void quantize_mmq_nvfp4(
         }
     }
 
-    static constexpr int try_offsets[5] = { 0, -1, 1, -2, 2};
+    static constexpr int test_offsets[5] = { 0, -1, 1, -2, 2};
     const int first_fp8_code = (int) ggml_cuda_fp32_to_ue4m3(amax_raw / 6.0f);
 
     float best_err = FLT_MAX;
@@ -124,8 +124,8 @@ static __global__ void quantize_mmq_nvfp4(
 
 #pragma unroll // Check +/- 2 to find best code to reduce NVFP4 activation loss. Negligible overhead on Blackwell.
     for (int i = 0; i < 5; i++) {
-        const int test_code = first_fp8_code + try_offsets[i];
-        if (test_code < 0 || test_code > GGML_UE4M3_MAX_CODE) {
+        const int test_code = first_fp8_code + test_offsets[i];
+        if (test_code < 0 || test_code > 0x7e) {
             continue;
         }
         const uint8_t code = (uint8_t) test_code;

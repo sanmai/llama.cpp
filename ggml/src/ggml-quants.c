@@ -362,7 +362,7 @@ static inline uint8_t best_scale_nvfp4(const float * GGML_RESTRICT xb, int n) {
         const int code = first_code + try_offsets[t];
 
         // skip underflow/overflow scale codes
-        if (code < 0 || code > GGML_UE4M3_MAX_CODE) {
+        if (code < 0 || code > 0x7E) {
             continue;
         }
         const float d = ggml_ue4m3_to_fp32((uint8_t) code);

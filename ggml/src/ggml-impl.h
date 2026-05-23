@@ -497,14 +497,10 @@ static inline float ggml_e8m0_to_fp32_half(uint8_t x) {
 #define GGML_E8M0_TO_FP32(x) ggml_e8m0_to_fp32(x)
 #define GGML_E8M0_TO_FP32_HALF(x) ggml_e8m0_to_fp32_half(x)
 
-// UE4M3: unsigned, 4 exp bits (bias=7), 3 mantissa bits.
-// 0x7F is reserved (NaN, decoded as 0); the largest finite code is the one just below it.
-#define GGML_UE4M3_NAN_CODE 0x7F
-#define GGML_UE4M3_MAX_CODE (GGML_UE4M3_NAN_CODE - 1) // ggml_fp32_to_ue4m3 saturates here
-
+// UE4M3: unsigned, 4 exp bits (bias=7), 3 mantissa bits
 // Returns value * 0.5 to match kvalues_mxfp4 convention (kvalues = 2 * E2M1_float)
 static inline float ggml_ue4m3_to_fp32(uint8_t x) {
-    if (x == 0 || x == GGML_UE4M3_NAN_CODE) {
+    if (x == 0 || x == 0x7F) {
         return 0.0f;
     }
     int   exp = (x >> 3) & 0xF;
@@ -542,7 +538,7 @@ static inline uint8_t ggml_fp32_to_ue4m3(float x) {
         return (uint8_t) man;
     }
     if (ue4m3_exp >= 15) {
-        return GGML_UE4M3_MAX_CODE;
+        return 0x7E;
     }
     int round_bit = (bits >> 19) & 1;
     int ue4m3_man = fp32_man + round_bit;
@@ -550,7 +546,7 @@ static inline uint8_t ggml_fp32_to_ue4m3(float x) {
         ue4m3_man = 0;
         ue4m3_exp++;
         if (ue4m3_exp >= 15) {
-            return GGML_UE4M3_MAX_CODE;
+            return 0x7E;
         }
     }
     return (uint8_t) ((ue4m3_exp << 3) | ue4m3_man);
