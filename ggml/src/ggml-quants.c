@@ -355,23 +355,26 @@ static inline uint8_t best_scale_nvfp4(const float * GGML_RESTRICT xb, int n) {
 
     const int first_code = (int) ggml_fp32_to_ue4m3(amax / 6.0f);
 
-    float best_mse  = FLT_MAX;
+    // best sum of squared errors
+    float best_sse  = FLT_MAX;
     int   best_code = 0;
     for (int t = 0; t < 5; t++) {
         const int code = first_code + test_offsets[t];
+
+        // skip underflow/overflow scale codes
         if (code < 0 || code > GGML_UE4M3_MAX_CODE) {
             continue;
         }
         const float d = ggml_ue4m3_to_fp32((uint8_t) code);
 
-        float mse = 0.0f;
+        float sse = 0.0f;
         for (int j = 0; j < n; j++) {
             const int   l    = best_index_mxfp4(xb[j], d);
             const float diff = xb[j] - d*kvalues_mxfp4[l];
-            mse += diff*diff;
+            sse += diff*diff;
         }
-        if (mse < best_mse) {
-            best_mse  = mse;
+        if (sse < best_sse) {
+            best_sse  = sse;
             best_code = code;
         }
     }
