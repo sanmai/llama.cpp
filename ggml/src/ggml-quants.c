@@ -343,7 +343,7 @@ void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RE
 // max E2M1 value 6.0 to amax), then iterate over the first +/- {1,2} codes
 // to minimize the squared reconstruction error.
 static inline uint8_t best_scale_nvfp4(const float * GGML_RESTRICT xb, int n) {
-    static const int test_offsets[5] = { 0, -1, 1, -2, 2 };
+    static const int try_offsets[5] = { 0, -1, 1, -2, 2 };
 
     // largest absolute input value
     float amax = 0.0f;
@@ -359,7 +359,7 @@ static inline uint8_t best_scale_nvfp4(const float * GGML_RESTRICT xb, int n) {
     float best_sse  = FLT_MAX;
     int   best_code = 0;
     for (int t = 0; t < 5; t++) {
-        const int code = first_code + test_offsets[t];
+        const int code = first_code + try_offsets[t];
 
         // skip underflow/overflow scale codes
         if (code < 0 || code > GGML_UE4M3_MAX_CODE) {
@@ -369,6 +369,7 @@ static inline uint8_t best_scale_nvfp4(const float * GGML_RESTRICT xb, int n) {
 
         float sse = 0.0f;
         for (int j = 0; j < n; j++) {
+            // find the best code, reconstruct, collect the squared error
             const int   l    = best_index_mxfp4(xb[j], d);
             const float diff = xb[j] - d*kvalues_mxfp4[l];
             sse += diff*diff;
