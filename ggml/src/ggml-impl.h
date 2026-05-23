@@ -498,9 +498,9 @@ static inline float ggml_e8m0_to_fp32_half(uint8_t x) {
 #define GGML_E8M0_TO_FP32_HALF(x) ggml_e8m0_to_fp32_half(x)
 
 // UE4M3: unsigned, 4 exp bits (bias=7), 3 mantissa bits.
-// 0x7E is the largest finite code (ggml_fp32_to_ue4m3 saturates to it); 0x7F is reserved, decoded as 0.
-#define GGML_UE4M3_MAX_CODE 0x7E
+// 0x7F is reserved (NaN, decoded as 0); the largest finite code is the one just below it.
 #define GGML_UE4M3_NAN_CODE 0x7F
+#define GGML_UE4M3_MAX_CODE (GGML_UE4M3_NAN_CODE - 1) // ggml_fp32_to_ue4m3 saturates here
 
 // Returns value * 0.5 to match kvalues_mxfp4 convention (kvalues = 2 * E2M1_float)
 static inline float ggml_ue4m3_to_fp32(uint8_t x) {

@@ -344,7 +344,6 @@ void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RE
 // to minimize the squared reconstruction error.
 static inline uint8_t best_scale_nvfp4(const float * GGML_RESTRICT xb, int n) {
     static const int test_offsets[5] = { 0, -1, 1, -2, 2 };
-    static const int ue4m3_max_code  = 0x7e; // 0x7f is the reserved sentinel
 
     // largest absolute input value
     float amax = 0.0f;
@@ -360,7 +359,7 @@ static inline uint8_t best_scale_nvfp4(const float * GGML_RESTRICT xb, int n) {
     uint8_t best_ue  = 0;
     for (int t = 0; t < 5; t++) {
         const int code = first_code + test_offsets[t];
-        if (code < 0 || code > ue4m3_max_code) {
+        if (code < 0 || code > GGML_UE4M3_MAX_CODE) {
             continue;
         }
         const float d = ggml_ue4m3_to_fp32((uint8_t) code);
