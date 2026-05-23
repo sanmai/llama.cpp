@@ -355,8 +355,8 @@ static inline uint8_t best_scale_nvfp4(const float * GGML_RESTRICT xb, int n) {
 
     const int first_code = (int) ggml_fp32_to_ue4m3(amax / 6.0f);
 
-    float   best_err = FLT_MAX;
-    uint8_t best_ue  = 0;
+    float best_mse  = FLT_MAX;
+    int   best_code = 0;
     for (int t = 0; t < 5; t++) {
         const int code = first_code + test_offsets[t];
         if (code < 0 || code > GGML_UE4M3_MAX_CODE) {
@@ -364,19 +364,19 @@ static inline uint8_t best_scale_nvfp4(const float * GGML_RESTRICT xb, int n) {
         }
         const float d = ggml_ue4m3_to_fp32((uint8_t) code);
 
-        float err = 0.0f;
+        float mse = 0.0f;
         for (int j = 0; j < n; j++) {
-            const uint8_t q = best_index_mxfp4(xb[j], d);
-            const float   e = xb[j] - kvalues_mxfp4[q]*d;
-            err += e*e;
+            const int   l    = best_index_mxfp4(xb[j], d);
+            const float diff = xb[j] - d*kvalues_mxfp4[l];
+            mse += diff*diff;
         }
-        if (err < best_err) {
-            best_err = err;
-            best_ue  = (uint8_t) code;
+        if (mse < best_mse) {
+            best_mse  = mse;
+            best_code = code;
         }
     }
 
-    return best_ue;
+    return (uint8_t) best_code;
 }
 
 void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RESTRICT y, int64_t k) {
