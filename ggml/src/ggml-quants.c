@@ -340,7 +340,7 @@ void quantize_row_mxfp4_ref(const float * GGML_RESTRICT x, block_mxfp4 * GGML_RE
 }
 
 // Choose the UE4M3 micro-scale for a sub-block: seed from amax / 6.0 (maps the
-// max E2M1 magnitude 6.0 to amax), then refine over the first +/- {1,2} codes by
+// max E2M1 value 6.0 to amax), then refine over the first +/- {1,2} codes by
 // minimum squared reconstruction error.
 static inline uint8_t best_scale_nvfp4(const float * GGML_RESTRICT xb, int n) {
     static const int test_offsets[5] = { 0, -1, 1, -2, 2 };
