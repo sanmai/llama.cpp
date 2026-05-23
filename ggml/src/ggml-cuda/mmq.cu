@@ -269,11 +269,6 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
 
-    // local-only: force NVFP4 off the native FP4 OMMA onto the cuBLAS dequant path (W4A16, f16 acts)
-    if (type == GGML_TYPE_NVFP4 && getenv("GGML_NVFP4_FORCE_DEQUANT") != nullptr) {
-        return false;
-    }
-
     bool mmq_supported;
 
     switch (type) {
