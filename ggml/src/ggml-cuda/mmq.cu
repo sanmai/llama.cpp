@@ -81,12 +81,12 @@ void ggml_cuda_mul_mat_q(
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
 
-    // optional NVFP4 weight scale applied to the matmul output:
-    // dense = one per-tensor scalar; mul_mat_id = one scale per expert (src0->ne[2])
+    // optional per-tensor weight scale (NVFP4 weight_scale_2), applied to the matmul output (dense only)
     const float * x_scale_d = nullptr;
     if (x_scale) {
+        GGML_ASSERT(!ids);
         GGML_ASSERT(x_scale->type == GGML_TYPE_F32);
-        GGML_ASSERT(ids ? x_scale->ne[0] == src0->ne[2] : ggml_nelements(x_scale) == 1);
+        GGML_ASSERT(ggml_nelements(x_scale) == 1);
         x_scale_d = (const float *) x_scale->data;
     }
 
@@ -227,7 +227,7 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        use_stream_k, ne12, x_scale_d};
+        use_stream_k, ne12};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
