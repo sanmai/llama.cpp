@@ -567,7 +567,8 @@ static __global__ void mul_mat_vec_q(
             float result = tmp[j][threadIdx.x];
             if constexpr (has_fusion) {
                 if (use_scale) {
-                    result *= x_scale[0];
+                    // dense: a single per-tensor scalar; mul_mat_id: one scale per expert, indexed by ids
+                    result *= x_scale[ids ? channel_x : 0];
                 }
                 if (use_bias) {
                     result += x_biases[j];
@@ -1081,7 +1082,8 @@ void ggml_cuda_mul_mat_vec_q(
         }
         if (fusion->x_scale) {
             GGML_ASSERT(fusion->x_scale->type == GGML_TYPE_F32);
-            GGML_ASSERT(ggml_nelements(fusion->x_scale) == 1);
+            // dense: one per-tensor scalar; mul_mat_id: one scale per expert (src0->ne[2])
+            GGML_ASSERT(ids ? fusion->x_scale->ne[0] == src0->ne[2] : ggml_nelements(fusion->x_scale) == 1);
             fusion_local.x_scale = fusion->x_scale->data;
         }
         if (fusion->gate) {

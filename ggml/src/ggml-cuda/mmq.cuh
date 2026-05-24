@@ -3568,7 +3568,7 @@ static __global__ void mul_mat_q(
     constexpr int qk    = ggml_cuda_type_traits<type>::qk;
     constexpr int mmq_y = get_mmq_y_device();
 
-    const float scale = x_scale ? *x_scale : 1.0f;
+    // optional NVFP4 scale: dense uses x_scale[0]; mul_mat_id uses one scale per expert, indexed per tile by zt below
 
     const uint32_t nty = (nrows_x + mmq_y - 1) / mmq_y; // Number of tiles y
 
@@ -3641,7 +3641,7 @@ static __global__ void mul_mat_q(
         constexpr bool fixup = false;
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, scale);
+             tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z, x_scale ? x_scale[ids_dst ? zt : 0] : 1.0f);
         return;
     }
 #endif // (defined(GGML_USE_HIP) && !defined(CDNA4) && !defined(CDNA3)) || __CUDA_ARCH__ < GGML_CUDA_CC_VOLTA
@@ -3723,7 +3723,7 @@ static __global__ void mul_mat_q(
         // left unscaled and finalized (scaled once) in the stream-k fixup, to stay bit-exact.
         mul_mat_q_process_tile<type, mmq_x, need_check, fixup>
             (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, stride_row_x, ncols_y, stride_col_dst,
-             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, kb0_start == 0 ? scale : 1.0f);
+             tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop, kb0_start == 0 && x_scale ? x_scale[ids_dst ? zt : 0] : 1.0f);
 
         kbc += blocks_per_ne00.z;
         kbc -= fastmodulo(kbc, blocks_per_ne00);
@@ -3809,7 +3809,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
     constexpr int blocks_per_iter = ITER_K / qk;
 
     // split tiles are written unscaled by the main kernel; finalize the assembled sum with one scale here
-    const float scale = x_scale ? *x_scale : 1.0f;
+    // (dense: x_scale[0]; mul_mat_id: per-expert, indexed by zt computed below)
 
     constexpr int nwarps = mmq_get_nwarps_device()/2;
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
@@ -3883,6 +3883,8 @@ static __global__ void mul_mat_q_stream_k_fixup(
     tmp2 = fast_div_modulo(tmp, nsamples_y);
     const int wt = tmp2.y;
     const int it = tmp2.x;
+
+    const float scale = x_scale ? x_scale[ids_dst ? zt : 0] : 1.0f;
 
     if (!ids_dst) {
         const int offset_dst = wt*stride_sample_dst + zt*stride_channel_dst + jt*mmq_x*stride_col_dst + it*mmq_y;
