@@ -2535,39 +2535,6 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
-static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * tensor) {
-    // dense MUL_MAT only; MoE (mul_mat_id) carries a per-expert scale and is deferred
-    if (tensor->op != GGML_OP_MUL_MAT) {
-        return false;
-    }
-
-    const ggml_tensor * src0 = tensor->src[0];
-    const ggml_tensor * src1 = tensor->src[1];
-    const ggml_tensor * dst  = tensor;
-
-    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
-                                   ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
-                                   src0->view_src;
-
-    if (bad_padding_clear || !ggml_is_quantized(src0->type) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
-        return false;
-    }
-
-    const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft) ||
-                       ggml_backend_buft_is_cuda_split(src1->buffer->buft);
-    if (split) {
-        return false;
-    }
-
-    // smaller batches go through mul_mat_vec_q; only the MMQ regime is handled here
-    if (src1->ne[1] <= MMVQ_MAX_BATCH_SIZE) {
-        return false;
-    }
-
-    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    return ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0);
-}
-
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
@@ -4217,29 +4184,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
-    }
-
-    // mul_mat + mul(per-tensor scalar): fuse the NVFP4 global weight scale (weight_scale_2) epilogue
-    // into the MMQ kernel so an imported NVFP4 model matches the scale-free self-quant prefill speed.
-    static const bool disable_scale_fusion = getenv("GGML_CUDA_DISABLE_SCALE_FUSION") != nullptr;
-
-    if (!disable_scale_fusion && ggml_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL })) {
-        ggml_tensor * mm_node  = cgraph->nodes[i];
-        ggml_tensor * mul_node = cgraph->nodes[i + 1];
-
-        ggml_tensor * scale_tensor = nullptr;
-        if (mul_node->src[0] == mm_node) {
-            scale_tensor = mul_node->src[1];
-        } else if (mul_node->src[1] == mm_node) {
-            scale_tensor = mul_node->src[0];
-        }
-
-        const bool is_scalar = scale_tensor && scale_tensor->type == GGML_TYPE_F32 && ggml_nelements(scale_tensor) == 1;
-
-        if (is_scalar && ggml_cuda_should_fuse_mul_mat_q(mm_node)) {
-            ggml_cuda_mul_mat_q(*cuda_ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, scale_tensor);
-            return 1;
-        }
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {

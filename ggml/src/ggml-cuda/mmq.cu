@@ -75,20 +75,10 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
 }
 
 void ggml_cuda_mul_mat_q(
-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
-        const ggml_tensor * x_scale) {
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
-
-    // optional per-tensor weight scale (NVFP4 weight_scale_2), applied to the matmul output (dense only)
-    const float * x_scale_d = nullptr;
-    if (x_scale) {
-        GGML_ASSERT(!ids);
-        GGML_ASSERT(x_scale->type == GGML_TYPE_F32);
-        GGML_ASSERT(ggml_nelements(x_scale) == 1);
-        x_scale_d = (const float *) x_scale->data;
-    }
 
     GGML_TENSOR_BINARY_OP_LOCALS;
 
@@ -168,7 +158,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            use_stream_k, ne1, x_scale_d};
+            use_stream_k, ne1};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
