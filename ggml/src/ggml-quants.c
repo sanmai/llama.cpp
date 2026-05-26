@@ -353,6 +353,7 @@ static inline uint8_t best_scale_nvfp4(const float * GGML_RESTRICT xb, int n) {
         }
     }
 
+    // UE4M3 scale: amax / 6.0 maps the max E2M1 value (6.0) to amax
     const int first_code = (int) ggml_fp32_to_ue4m3(amax / 6.0f);
 
     // best sum of squared errors
