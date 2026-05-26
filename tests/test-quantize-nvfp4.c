@@ -5,7 +5,7 @@
 // reconstruction error. It is reached through the exported quantize_row_nvfp4_ref(),
 // which stores the chosen scale code in block_nvfp4::d[].
 //
-// Each fixture is a fixed sub-block plus the scale code the search must store. The test
+// Each fixture is a fixed sub-block plus the scale value the search must store. The test
 // prints the same per-code error breakdown the search weighs, so every outcome can be
 // followed from the trace alone, e.g. for the "ramp" 1..16:
 //
@@ -14,9 +14,9 @@
 //         code  67  d=1.375  sse=18.0469   baseline
 //         code  68  d=1.5    sse=23
 //
-// i.e. a slightly smaller scale (66) fits the bulk better than the naive amax/6 (67),
-// so the search drops one code. The expected codes were captured from this trace;
-// dropping an offset or flipping the comparison shifts a stored code and trips an assert.
+// i.e. the slightly smaller scale 1.25 fits the bulk better than the naive amax/6 (1.375),
+// so the search drops one code. The expected scales were captured from this trace;
+// dropping an offset or flipping the comparison shifts a stored scale and trips an assert.
 
 #define GGML_COMMON_IMPL_C
 #include "ggml-common.h"
@@ -70,24 +70,26 @@ static int naive_scale_code(const float * xb) {
 
 struct fixture {
     const char * name;
-    int          expected;          // UE4M3 scale code the search must store
+    float        scale;             // UE4M3 scale value the search must store (ue4m3_to_fp32 of its code)
     float        xb[QK_NVFP4_SUB];
 };
 
 static const struct fixture fixtures[] = {
-    // search drops one code: a coarser top, but a far better fit for the bulk
-    { "ramp",  66, { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 } },
+    // search drops to a smaller scale: a coarser top, but a far better fit for the bulk
+    { "ramp",  1.25f, { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 } },
 
-    // baseline already optimal: both neighbouring codes score worse
-    { "geo",   67, { 16, 8, 4, 2, 1, 0.5f, 0.25f, 0.125f,
-                     16, 8, 4, 2, 1, 0.5f, 0.25f, 0.125f } },
+    // naive scale already optimal: both neighbouring scales score worse
+    { "geo",   1.375f, { 16, 8, 4, 2, 1, 0.5f, 0.25f, 0.125f,
+                         16, 8, 4, 2, 1, 0.5f, 0.25f, 0.125f } },
 
-    // all zero -> code 0; the code-1 candidate is below the UE4M3 range and is skipped
-    { "zeros",  0, { 0 } },
+    // all zero -> scale 0; the smaller-scale candidate is below the UE4M3 range and skipped
+    { "zeros", 0.0f, { 0 } },
 
-    // amax/6 saturates UE4M3 -> code 0x7E; the code+1 candidate is above range, skipped
-    { "sat", 0x7E, { 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000,
-                     2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000 } },
+    // amax = 2000 -> amax/6 ~= 333 lands in UE4M3's top exponent octave [256, 512), which
+    // ggml_fp32_to_ue4m3 collapses to the largest code 0x7E (scale 224 = 448/2); the next
+    // code up (0x7F) is UE4M3's reserved slot, so the larger-scale candidate is skipped
+    { "sat", 224.0f, { 2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000,
+                       2000, 2000, 2000, 2000, 2000, 2000, 2000, 2000 } },
 };
 
 // quantize a block built from four copies of the fixture, trace the search, and assert
@@ -111,14 +113,14 @@ static int run_fixture(const struct fixture * f) {
             continue;
         }
         printf("    code %3d  d=%-9.6g sse=%-11.6g%s%s\n",
-               code, ggml_ue4m3_to_fp32((uint8_t) code), subblock_sse(f->xb, code),
+               code, (double) ggml_ue4m3_to_fp32((uint8_t) code), (double) subblock_sse(f->xb, code),
                code == first  ? "baseline" : "",
                code == stored ? "  <- chosen" : "");
     }
 
     // every sub-block is a copy, so all four stored scales must equal the winner
     for (int s = 0; s < QK_NVFP4 / QK_NVFP4_SUB; s++) {
-        assert(y.d[s] == (uint8_t) f->expected);
+        assert(ggml_ue4m3_to_fp32(y.d[s]) == f->scale);
     }
     return stored != first; // moved off the naive scale?
 }
@@ -131,8 +133,9 @@ int main(void) {
         moved += run_fixture(&fixtures[i]);
     }
 
-    // at least one fixture must pick an offset, else the {-1, +1} search is dead code
-    assert(moved > 0);
+    // exactly one fixture (ramp) picks an offset; the rest keep the naive amax/6 scale.
+    // a non-zero count proves the {-1, +1} search is live, the exact count pins which.
+    assert(moved == 1);
 
     printf("test-quantize-nvfp4: %zu fixtures, %d moved off amax/6 -- OK\n", n, moved);
     return 0;
