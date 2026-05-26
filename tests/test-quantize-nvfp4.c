@@ -123,7 +123,7 @@ int main(void) {
     // otherwise the {-1, +1} candidates carry no weight
     assert(improvements > 0);
 
-    printf("test-nvfp4-scale: %d sub-blocks, search beat amax/6 on %d (%.1f%%) -- OK\n",
+    printf("test-quantize-nvfp4: %d sub-blocks, search beat amax/6 on %d (%.1f%%) -- OK\n",
            total, improvements, 100.0*improvements/total);
     return 0;
 }
