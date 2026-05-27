@@ -122,9 +122,7 @@ void ggml_cuda_mul_mat_q(
                             || GGML_CUDA_CC_IS_CDNA(cc);
 
     // TODO: tighter pool buffer size vs q8 path
-    // NVFP4 stays on the q8_1 (W4A8) MMQ path rather than native fp4 (W4A4): 4-bit activations
-    // cost ~0.05 Mean KLD on Qwen3-8B, far more than the prefill speedup is worth.
-    const bool use_native_fp4 = blackwell_mma_available(cc) && src0->type == GGML_TYPE_MXFP4;
+    const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
 
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1 +

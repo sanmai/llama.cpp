@@ -2581,6 +2581,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16   || !fast_fp16_hardware_available(cc);
     }
 
+    // diagnostic: route selected NVFP4 weight matmuls to the cuBLAS (W4A-inf) path to isolate
+    // the per-projection fp4-activation loss. GGML_CUDA_FP4_HIPREC=<substr> matches src0->name.
+    static const char * fp4_hiprec = getenv("GGML_CUDA_FP4_HIPREC");
+    if (fp4_hiprec && src0->type == GGML_TYPE_NVFP4 && strstr(src0->name, fp4_hiprec)) {
+        use_mul_mat_q     = false;
+        use_mul_mat_vec_q = false;
+    }
+
     // debug helpers
     //printf("src0: %8d %8d %8d %8d\n", src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);
     //printf("      %8d %8d %8d %8d\n", src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3]);

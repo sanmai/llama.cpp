@@ -14,6 +14,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <map>
 #include <numeric>
 #include <sstream>
 #include <unordered_set>
@@ -75,6 +76,35 @@ static ggml_tensor * ggml_mul_mat_aux(
     res = ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
 
     return res;
+}
+
+// experimental: orthonormal Walsh-Hadamard matrix (H == H^T, H*H == I), n a power of 2.
+// identical construction to ggml_gen_hadamard so the dense mul_mat fallback (n > 512, e.g. o_proj's
+// 4096) and the FWHT fast path both produce H*x, inverting the offline weight fold in llama-quant.cpp.
+static const std::vector<float> & oproj_hadamard(int64_t n) {
+    static std::map<int64_t, std::vector<float>> cache;
+
+    auto it = cache.find(n);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    std::vector<float> h(n*n, 0.0f);
+    h[0] = 1.0f / sqrtf((float) n);
+
+    for (int64_t s = 1; s < n; s *= 2) {
+        for (int64_t i = 0; i < s; i++) {
+            for (int64_t j = 0; j < s; j++) {
+                const float val = h[i*n + j];
+
+                h[(i + s)*n + (j    )] =  val;
+                h[(i    )*n + (j + s)] =  val;
+                h[(i + s)*n + (j + s)] = -val;
+            }
+        }
+    }
+
+    return cache.emplace(n, std::move(h)).first->second;
 }
 
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
@@ -461,6 +491,11 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
 
     if (self_v_rot) {
         mctx->set_input_v_rot(self_v_rot);
+    }
+
+    if (o_rot) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(o_rot->buffer));
+        memcpy(o_rot->data, oproj_hadamard(o_rot->ne[0]).data(), ggml_nbytes(o_rot));
     }
 }
 
@@ -2245,6 +2280,22 @@ ggml_tensor * llm_graph_context::build_attn(
 
     if (inp->self_v_rot) {
         cur = ggml_mul_mat_aux(ctx0, cur, inp->self_v_rot);
+    }
+
+    // experimental: rotate the o_proj input so the offline-rotated NVFP4 weights are inverted and the
+    // activation is de-outliered before fp4 quantization. n = o_proj input dim (4096 for Qwen3-8B) is
+    // past the FWHT fast path (<= 512), so ggml_mul_mat_aux falls back to a dense H*x mul_mat.
+    if (wo && getenv("GGML_NVFP4_ROTATE_OPROJ")) {
+        if (!inp->o_rot) {
+            const int64_t n = wo->ne[0];
+            inp->o_rot = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n, n);
+            ggml_set_input(inp->o_rot);
+            ggml_set_name(inp->o_rot, "attn_inp_o_rot");
+        }
+        if (!ggml_is_contiguous(cur)) {
+            cur = ggml_cont(ctx0, cur);
+        }
+        cur = ggml_mul_mat_aux(ctx0, cur, inp->o_rot);
     }
 
     if (wo) {

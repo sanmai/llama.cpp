@@ -706,6 +706,35 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
 // quantization implementation
 //
 
+// In-place orthonormal Walsh-Hadamard transform of each row (length n, n a power of 2).
+// Matches ggml_compute_forward_fwht / ggml_gen_hadamard exactly so that the online H*x in
+// the graph (a dense mul_mat against the same matrix, or the FWHT fast path) inverts this fold:
+// rotating a weight row w -> H*w here and the activation x -> H*x at run time leaves w^T x unchanged.
+static void llama_fwht_rows(float * data, int64_t n, int64_t nrows) {
+    GGML_ASSERT((n & (n - 1)) == 0 && "FWHT row length must be a power of 2");
+
+    const float scale = 1.0f / sqrtf((float) n);
+
+    for (int64_t r = 0; r < nrows; ++r) {
+        float * row = data + r * n;
+
+        for (int64_t j = 0; j < n; ++j) {
+            row[j] *= scale;
+        }
+
+        for (int64_t len = 1; len < n; len <<= 1) {
+            for (int64_t i = 0; i < n; i += 2 * len) {
+                for (int64_t j = 0; j < len; ++j) {
+                    const float u = row[i + j];
+                    const float v = row[i + len + j];
+                    row[i + j]       = u + v;
+                    row[i + len + j] = u - v;
+                }
+            }
+        }
+    }
+}
+
 static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t nrows, int64_t n_per_row, const float * imatrix, std::vector<std::thread> & workers, const int nthread) {
     if (nthread < 2) {
         // single-thread
@@ -802,6 +831,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q1_0: return GGML_TYPE_Q1_0;
 
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
+        case LLAMA_FTYPE_MOSTLY_NVFP4:     return GGML_TYPE_NVFP4;
 
         // K-quants
         case LLAMA_FTYPE_MOSTLY_Q2_K_S:
@@ -1236,6 +1266,17 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 const int64_t nelements_matrix = tensor->ne[0] * tensor->ne[1];
                 const int64_t nchunk = (nelements_matrix + chunk_size - 1)/chunk_size;
                 const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
+
+                // experimental: fold a Walsh-Hadamard rotation into NVFP4 attn_output weights so the
+                // online H*x (env GGML_NVFP4_ROTATE_OPROJ at run time) de-outliers the activation before
+                // it is quantized to fp4. invariant: w^T x == (H*w)^T (H*x). see llama-graph.cpp.
+                if (new_type == GGML_TYPE_NVFP4 && getenv("GGML_NVFP4_ROTATE_OPROJ") &&
+                    std::string(tensor->name).find("attn_output.weight") != std::string::npos) {
+                    GGML_ASSERT(f32_data == (const float *) f32_conv_buf.data() &&
+                        "rotate-oproj needs a mutable f32 copy (quantize from bf16, not f32)");
+                    llama_fwht_rows((float *) f32_conv_buf.data(), tensor->ne[0], tensor->ne[1] * tensor->ne[2]);
+                    LLAMA_LOG_INFO("[rotate-oproj] ");
+                }
 
                 // quantize each expert separately since they have different importance matrices
                 new_size = 0;

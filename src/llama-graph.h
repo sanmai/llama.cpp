@@ -314,6 +314,9 @@ public:
     ggml_tensor * self_k_rot = nullptr;
     ggml_tensor * self_v_rot = nullptr;
 
+    // experimental: online Hadamard rotation of the o_proj input (env GGML_NVFP4_ROTATE_OPROJ)
+    ggml_tensor * o_rot = nullptr;
+
     // note: these have to be copies because in order to be able to reuse a graph, its inputs
     //       need to carry these parameters with them. otherwise, they can point to freed
     //       llm_graph_params from a previous batch, causing stack-use-after-return
