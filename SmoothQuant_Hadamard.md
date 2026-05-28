@@ -213,6 +213,64 @@ is ~1σ — direction and mechanism are solid, the precise fraction is not. The 
 28% slice with a far larger ceiling); the only non-shippable piece is the dense `H₄₀₉₆` GEMM, which a
 kernel extension / Kronecker factoring removes once a high-value target justifies the work.
 
+## Phase 2b result — `down_proj` block-diagonal Hadamard (negative)
+
+`down_proj`'s input is 12288 = 3 × 4096, not a power of 2. The simplest grouped form — block-diagonal
+`R = I₃ ⊗ H₄₀₉₆`, i.e. apply the Phase 2a `H₄₀₉₆` independently to each of the three 4096-wide
+slices — reuses every Phase 2a primitive verbatim: the offline `llama_fwht_rows(buf, 4096, 3·nrows)`
+naturally rotates each contiguous 4096-segment of every weight row, and the online
+`ggml_mul_mat_aux(cur, H₄₀₉₆)` reshapes `[…,12288] → [4096, 3·…]` so a single `H₄₀₉₆` covers every group.
+67 MB shared rotation tensor, no new generator or kernel work.
+
+**Implementation** (env `GGML_NVFP4_ROTATE_DOWN`, both sides must agree):
+
+- *Offline fold* — additional branch in `llama-quant.cpp` matched on `ffn_down.weight` substring,
+  calling the same `llama_fwht_rows` with row length 4096 and row count `(ne0/4096)·ne1·ne2`.
+- *Online rotation* — new `llm_graph_input_ffn_rot` carrying a single `H₄₀₉₆`, lazily created and
+  shared across layers (looked up via `ggml_get_tensor(ctx0, "ffn_down_rot")`); `can_reuse()` returns
+  true since the matrix is constant. Insert in `build_ffn` immediately before the `down` matmul.
+
+**Correctness:** with online `H` → coherent text; without it → token salad. The fold is genuinely
+active and the online rotation inverts it.
+
+**Numbers** (Qwen3-8B, 200-chunk wikitext KLD vs bf16; pure-NVFP4 body, Q8_0 embeddings/output):
+
+| config            | unrotated         | rotated           | Δ                  |
+|-------------------|-------------------|-------------------|--------------------|
+| W4A4 (native fp4) | 0.119250 ± 0.0015 | 0.152481 ± 0.0019 | **+0.0332**        |
+| W4A∞ (acts fp32)  | 0.073103 ± 0.0012 | 0.103309 ± 0.0015 | **+0.0302**        |
+| W4A4 − W4A∞ (act cost) | 0.0461       | 0.0492            | +0.003 (noise)     |
+
+**Read — the rotation hurts on both axes.** Unlike o_proj, the W4A∞ invariant does *not* hold: rotated
+weights at fp32 activations are +0.030 KLD *worse* than unrotated, purely a weight-quantization cost.
+And the activation-quantization gap (W4A4 − W4A∞) is essentially unchanged — block-diagonal rotation
+recovered **zero** of the activation loss it was meant to address. Net: about 2.5× the entire
+`ffn_down` ceiling thrown away.
+
+**Asymmetry vs o_proj.** Same FWHT primitive, same NVFP4 quantization, same group size: o_proj's W4A∞
+Δ was 0.00018 (noise); `down_proj`'s is 170× larger. NVFP4's design rests on per-16 UE4M3 sub-block
+scales adapting to local magnitude variation along each row. FWHT spreads each row's energy uniformly
+across its 4096-element block → all per-16 scales within the block converge → the four bits of E2M1
+must now span what used to be several locally-adapted ranges. `o_proj`'s trained weights are diffuse
+enough that this flattening is free; `down_proj`'s are *concentrated* (specific channels carry the
+SwiGLU outlier signal), and flattening them is precisely the wrong move. The same mechanism explains
+the missing activation benefit: block-diagonal mixes within each 4096-block, but the channels that
+need de-outliering aren't all in one block.
+
+**Implication for cross-block mixing.** A full `H₁₂ ⊗ H₁₀₂₄` (mixing across all 12288) would worsen
+the weight-flattening cost, not recover it — the conflict is between any large-radius incoherence
+transform and NVFP4's per-16 scale adaptivity on a concentrated weight distribution, not between
+factorizations of it. The Phase 2b path as the doc originally framed it (extend the same Hadamard
+machinery to `down_proj`) is **closed within the NVFP4 weight format**. A fix for `down_proj`'s 28%
+slice would need either a *smaller-radius* rotation that preserves per-16 locality (e.g. `H₁₆` inside
+each NVFP4 sub-block — preserves scales but gives up almost all activation spreading), a *different
+weight format* with finer-grain scales (the deferred `N4_K` two-level variant would tolerate large
+rotations the way it does any flattening), or accepting the loss.
+
+**State.** The code (`GGML_NVFP4_ROTATE_DOWN`) is left in tree as an env-gated diagnostic, default off,
+mirroring the Phase 2a o_proj path; it does nothing unless the env is set on both quantize and
+inference. The rotated artifact `qwen3-8b-N4_0-drot.gguf` is the measurement-only build.
+
 ## Tooling
 
 - Diagnostic: `GGML_CUDA_FP4_HIPREC=<substr>` (per-name W4A∞ lift), `GGML_CUDA_FP4_NO_MMQ=1` (global
