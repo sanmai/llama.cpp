@@ -1278,6 +1278,19 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     LLAMA_LOG_INFO("[rotate-oproj] ");
                 }
 
+                // experimental: grouped Walsh-Hadamard fold for NVFP4 ffn_down weights. ffn_down's input
+                // (12288 for Qwen3-8B) is not a power of 2, so rotate each 4096-wide group independently
+                // (block-diagonal R = I (x) H_4096); the online H*x in build_ffn (GGML_NVFP4_ROTATE_DOWN)
+                // inverts it group-by-group. invariant: w^T x == (H*w)^T (H*x). see llama-graph.cpp.
+                if (new_type == GGML_TYPE_NVFP4 && getenv("GGML_NVFP4_ROTATE_DOWN") &&
+                    std::string(tensor->name).find("ffn_down.weight") != std::string::npos) {
+                    GGML_ASSERT(f32_data == (const float *) f32_conv_buf.data() &&
+                        "rotate-down needs a mutable f32 copy (quantize from bf16, not f32)");
+                    GGML_ASSERT(tensor->ne[0] % 4096 == 0 && "ffn_down rotate group must divide the input dim");
+                    llama_fwht_rows((float *) f32_conv_buf.data(), 4096, (tensor->ne[0] / 4096) * tensor->ne[1] * tensor->ne[2]);
+                    LLAMA_LOG_INFO("[rotate-down] ");
+                }
+
                 // quantize each expert separately since they have different importance matrices
                 new_size = 0;
                 for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
