@@ -107,15 +107,6 @@ static const std::vector<float> & oproj_hadamard(int64_t n) {
     return cache.emplace(n, std::move(h)).first->second;
 }
 
-void llm_graph_input_ffn_rot::set_input(const llama_ubatch * ubatch) {
-    GGML_UNUSED(ubatch);
-
-    if (rot) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(rot->buffer));
-        memcpy(rot->data, oproj_hadamard(rot->ne[0]).data(), ggml_nbytes(rot));
-    }
-}
-
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -1341,24 +1332,6 @@ ggml_tensor * llm_graph_context::build_ffn(
     if (gate && type_gate == LLM_FFN_PAR) {
         cur = ggml_mul(ctx0, cur, tmp);
         cb(cur, "ffn_gate_par", il);
-    }
-
-    // experimental: rotate the ffn_down input so the offline-rotated NVFP4 weights are inverted and the
-    // activation is de-outliered before fp4 quantization. ffn_down's input (12288 for Qwen3-8B) is not a
-    // power of 2, so apply H_4096 to each 4096-wide group (block-diagonal R = I (x) H_4096); ggml_mul_mat_aux
-    // reshapes [.., 12288] -> [4096, 3*..] so a single H_4096 covers every group. see llama-quant.cpp.
-    if (down && getenv("GGML_NVFP4_ROTATE_DOWN") && cur->ne[0] % 4096 == 0) {
-        ggml_tensor * rot = ggml_get_tensor(ctx0, "ffn_down_rot");
-        if (!rot) {
-            rot = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 4096, 4096);
-            ggml_set_input(rot);
-            ggml_set_name(rot, "ffn_down_rot");
-
-            auto inp = std::make_unique<llm_graph_input_ffn_rot>();
-            inp->rot = rot;
-            res->add_input(std::move(inp));
-        }
-        cur = ggml_mul_mat_aux(ctx0, cur, rot);
     }
 
     if (down) {

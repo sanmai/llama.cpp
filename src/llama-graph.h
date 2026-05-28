@@ -260,23 +260,6 @@ public:
     const llama_cross * cross;
 };
 
-// experimental: online Hadamard rotation matrix for the ffn_down input (env GGML_NVFP4_ROTATE_DOWN).
-// holds a single H_4096 shared across all layers; the constant matrix makes the graph reusable.
-class llm_graph_input_ffn_rot : public llm_graph_input_i {
-public:
-    llm_graph_input_ffn_rot() = default;
-    virtual ~llm_graph_input_ffn_rot() = default;
-
-    void set_input(const llama_ubatch * ubatch) override;
-
-    bool can_reuse(const llm_graph_params & params) override {
-        GGML_UNUSED(params);
-        return true;
-    }
-
-    ggml_tensor * rot = nullptr; // [n_group, n_group]
-};
-
 class llm_graph_input_attn_no_cache : public llm_graph_input_i {
 public:
     llm_graph_input_attn_no_cache(const llama_hparams & hparams, const llama_cparams & cparams) :
