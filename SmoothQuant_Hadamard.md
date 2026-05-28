@@ -271,8 +271,162 @@ rotations the way it does any flattening), or accepting the loss.
 mirroring the Phase 2a o_proj path; it does nothing unless the env is set on both quantize and
 inference. The rotated artifact `qwen3-8b-N4_0-drot.gguf` is the measurement-only build.
 
+## Phase 1 result — per-tensor `scale2` + per-channel SmoothQuant
+
+The Phase 2 attempts addressed `attn_output` (12% slice, ~41% recovered) and `down_proj` (28% slice,
+negative). Phase 1 — SmoothQuant on the ~64% post-norm chunk — was the largest untouched lever, and
+on inspection turned out to require a producer-side step first.
+
+### Diagnostic — UE4M3 sub-block scales sit overwhelmingly in the subnormal band
+
+`scripts/nvfp4-subnormal-stats.py` reports, on the bare `qwen3-8b-N4_0.gguf` (no `weight_scale_2`):
+
+```
+total micro-scale codes : 434,110,464
+subnormal codes (1..7)  : 400,202,766  (92.19%)
+decoded scale min_nz    : 9.766e-04   (= 2^-10, the UE4M3 subnormal floor)
+decoded scale max       : 2.500e-01
+percentiles [.1, 1, 50, 99, 99.9] : 9.77e-4, 9.77e-4, 4.88e-3, 8.79e-3, 1.27e-2
+N to rescue p0.1 : >= 3.00,   N before saturation : < 9.81,   single global N feasible: True
+```
+
+92% of N4_0's per-16 UE4M3 scales live in the coarse subnormal band (codes 1..7, fixed 2⁻¹⁰ spacing,
+~10% relative error per scale) instead of the precise normal band (codes ≥ 8, 3-bit-mantissa float,
+~6% per-octave). The median scale (4.9e-3) is well below normal-region start at 2⁻⁷ = 7.8e-3. The
+last line is the lever's signature: a per-tensor `*2^N` shift with N ∈ [3, 9] lifts the smallest
+meaningful scale above the cliff *and* keeps the largest below UE4M3 saturation. That is exactly
+what `weight_scale_2` is for; the bare N4_0 quantizer doesn't emit it.
+
+### Implementation
+
+Both are gated, additive, no inference-side code changes (both consumers exist already):
+
+- **`weight_scale_2` (env `GGML_NVFP4_SCALE2`)** — for every NVFP4-target weight that has a
+  `build_lora_mm` consumer, emit a sibling `.scale` F32 tensor at shape `{1}` (or `{n_expert}` for
+  MoE expert arrays). `s2 = amax(|W|) / (E2M1_MAX · UE4M3_MAX) = amax / 1344`. Weights are divided
+  by `s2` before NVFP4 quantisation; `s2` itself is written verbatim and the existing scale-fusion
+  epilogue ([[project_nvfp4_scale_fusion]]) multiplies the matmul output by it. token_embd and
+  output are skipped (read via `get_rows`, no epilogue would re-apply `s2`).
+- **SmoothQuant (env `GGML_NVFP4_SMOOTHQUANT`)** — for each shared-input group (FFN: `ffn_norm` →
+  `{ffn_gate, ffn_up}`; ATTN: `attn_norm` → `{attn_q, attn_k, attn_v}`), compute per-channel
+  `act_rms[j] = sqrt(imatrix.values[j])` (the imatrix stores mean-of-squares per input channel),
+  then `s_j = (act_rms[j] / geomean(act_rms))^α`, clamped to `[0.1, 10]`. Geomean normalisation
+  centres `s` on 1 so the per-tensor amax used by `scale2` stays in the same ballpark across
+  α. Fold: divide the preceding `*_norm.weight` elementwise by `s`; multiply every consumer's input
+  columns by `s` before NVFP4 quantisation. The migration is mathematically exact — `(X/s)·(W·s) = X·W` —
+  so faithful at W4A∞ and only the activation quantisation step changes. α exposed via
+  `GGML_NVFP4_SMOOTHQUANT_ALPHA` for sweeping. Requires `--imatrix`.
+
+`scale2` runs unconditionally; SmoothQuant rides on top of it. Order in the quant loop: SmoothQuant
+column scaling → rotate-oproj (if armed) → `scale2` per-tensor fold → quantize.
+
+### Numbers (Qwen3-8B, 200-chunk wikitext KLD vs bf16; Q4_0 embeddings, Q6_K output)
+
+scale2 alone vs the established baseline:
+
+| config                              | W4A4 (native fp4) | W4A∞ (acts fp32) | W4A4 − W4A∞ |
+|-------------------------------------|-------------------|------------------|-------------|
+| N4_0 bare                           | 0.11673           | 0.06887          | 0.04786     |
+| N4_0 + scale2                       | 0.11445 (−0.0023) | 0.06752 (−0.0014)| 0.04693     |
+
+The UE4M3-subnormal share collapses 92.19% → 0.00% on the scale2 build. The W4A4 share of the lift
+(−0.0023) is ~5% of the recoverable 0.0490 — small but real, matching the gap NVIDIA's calibrated
+import gets from `weight_scale_2` alone. (Per the earlier `Findings §1`, the entire weight side is
+~0.0689 at W4A∞ and scale precision is a sub-octave correction within that; UE4M3 normal vs
+subnormal is ~2× per-scale, not 10×, so the move is bounded.)
+
+SmoothQuant on top, α=0.5 (the SmoothQuant default; sweep below):
+
+| config                              | W4A4 (native fp4) | W4A∞ (acts fp32) | W4A4 − W4A∞ |
+|-------------------------------------|-------------------|------------------|-------------|
+| N4_0 + scale2                       | 0.11445           | 0.06752          | 0.04693     |
+| N4_0 + scale2 + SmoothQuant α=0.5   | 0.09463 (−0.0198) | 0.05510 (−0.0124)| 0.03953     |
+
+Per-projection ceiling reminder: 0.0689 W4A∞, 0.0490 W4A4-recoverable, of which ~64% (≈0.031) was
+the post-norm chunk SmoothQuant was supposed to address. We recovered 0.0198 of the W4A4 gap,
+landing at 0.0946 — squarely in the doc's `~0.09-0.10` pre-registered range.
+
+**The mechanism turned out different from the prediction**, and this is the most informative finding.
+The doc framed SmoothQuant as attacking the activation-quantisation chunk: shrink the per-channel
+activation spread → the per-16 UE4M3 *activation* sub-block scales land in the precise band. By that
+framing the W4A∞ number (acts fp32, no activation quant at all) should be invariant. It is not:
+
+  - W4A∞ moved −0.0124 (weight side improved by ~18%)
+  - W4A4 − W4A∞ moved −0.0074 (activation side improved by ~16%)
+
+So of the −0.0198 W4A4 move, ~63% is on the *weight* side and ~37% on the activation side — roughly
+the *opposite* of the framing. Hypothesised mechanism: the migration multiplies outlier-activation
+columns of `W` by `s_j > 1`. In transformers the outlier-activation channels tend to carry
+*smaller* learned weights (the model compensates for large acts), so amplifying those columns makes
+the per-channel weight distribution more uniform → tighter per-16 sub-block amax → finer fp4 grid
+*on the weight side*. Per-tensor `scale2` then re-centres the whole distribution into UE4M3 normal,
+compounding cleanly. The activation-side share (the originally intended payoff) is also real but
+smaller. Net: SmoothQuant on the post-norm groups is a *weight-and-activation* lift, not the
+activation-only lift the literature suggests.
+
+### α sweep — broad strokes
+
+Geomean-normalised act-driven s with α exposed via `GGML_NVFP4_SMOOTHQUANT_ALPHA`. Other knobs
+(clamp range `[0.1, 10]`, RMS activation statistic, per-tensor `scale2`) held fixed.
+
+| α              | W4A4 Mean KLD | Same-top-p | Δ vs scale2-only |
+|----------------|---------------|------------|------------------|
+| 0.0 (= scale2) | 0.11445       | 86.39%     |  —               |
+| 0.3            | 0.09730       | 87.51%     | −0.0172          |
+| **0.5**        | **0.09463**   | **87.76%** | **−0.0198**      |
+| 0.7            | 0.09616       | 87.59%     | −0.0182          |
+| 0.9            | 0.10111       | 87.38%     | −0.0133          |
+| 1.0            | 0.10464       | 87.06%     | −0.0098          |
+
+Parabolic, minimum exactly at the SmoothQuant default. The spread across `[0.3, 0.7]` is only
+~0.003 KLD — α-tuning alone has nothing more to give from this formulation. The shallowness is
+the read: the *next* axis (activation statistic, per-column weight max, or per-group α) will move
+more than fine-grained α.
+
+### State
+
+`scale2` + SmoothQuant are env-gated, off by default; bit-for-bit unchanged behaviour with the envs
+unset. Once turned on they require regenerating the GGUF (the migration bakes into the stored
+weights). The 5 edits live in `src/llama-quant.cpp`; no graph or kernel changes. Reproducible
+artifact: `qwen3-8b-N4_0-sq.gguf` (scale2 + SmoothQuant α=0.5).
+
+### Where the residual loss lives
+
+Updated picture vs Q4_0 (0.0780) at the same size and W4A4 speed:
+
+| build                                | W4A4    | W4A∞    | gap to Q4_0 (W4A4) |
+|--------------------------------------|---------|---------|--------------------|
+| N4_0 bare                            | 0.11673 | 0.06887 | +0.0387            |
+| N4_0 + scale2 + SmoothQuant α=0.5    | 0.09463 | 0.05510 | +0.0166            |
+| Q4_0 reference                       | 0.07800 | n/a     | 0                  |
+
+We close ~57% of the bare→Q4_0 gap at W4A4 *and* now sit *below* the original W4A∞ ceiling
+(0.0689) on the weight side. The remaining +0.0166 splits roughly:
+
+- ~0.010 in the W4A4 − W4A∞ gap = pure activation-quant residual. Untouchable by any weight-side
+  knob; needs activation-side incoherence (Hadamard on `ffn_down` + `attn_output`) or a finer
+  activation grid (W4A8 by `GGML_CUDA_FP4_NO_MMQ`, sacrificing FP4 K=64 speed — the trade we
+  already rejected).
+- ~0.006 in W4A∞ residual vs Q4_0's likely W4A∞ floor (≈0.050 for size-matched Q4_0). This is the
+  4-bit *value* precision floor of E2M1 vs the 4-bit *value* precision of Q4_0's int4. Closeable
+  only by a richer weight format (`N4_K` two-level — deferred, [[project_nvfp4_weights]]).
+
+The α sweep's shallowness suggests the cheap fraction of the +0.0166 residual is already captured.
+Further W4A4 movement from SmoothQuant alone likely needs the **activation statistic** swap
+(max-abs vs RMS — canonical SmoothQuant) or **per-column weight max** in the denominator (proper
+α=0.5, instead of geomean-normalised activation-only).
+
 ## Tooling
 
 - Diagnostic: `GGML_CUDA_FP4_HIPREC=<substr>` (per-name W4A∞ lift), `GGML_CUDA_FP4_NO_MMQ=1` (global
   W4A∞), both in the CUDA matmul dispatch. Require a W4A4-base build.
+- Quantize-side folds (all off by default, all in `src/llama-quant.cpp`):
+  - `GGML_NVFP4_SCALE2=1` — emit per-tensor `.scale` (`weight_scale_2`) for every NVFP4 weight
+    with a `build_lora_mm` consumer. No imatrix required.
+  - `GGML_NVFP4_SMOOTHQUANT=1` — per-channel migration for post-norm groups. Requires `--imatrix`.
+  - `GGML_NVFP4_SMOOTHQUANT_ALPHA=<float>` — overrides α (default 0.5). For sweep experiments.
+  - `GGML_NVFP4_ROTATE_OPROJ=1` / `GGML_NVFP4_ROTATE_DOWN=1` — Phase 2a/2b Hadamard folds; need
+    matching env on inference.
 - KLD board: `scripts/nvfp4-8b-kld.sh`; coherence gate: `nvfp4-smoke.sh`.
+- Distributional diagnostic: `scripts/nvfp4-subnormal-stats.py <gguf>` reports the UE4M3 sub-block
+  scale histogram + global-N feasibility (the readout that flagged the `scale2` lever).

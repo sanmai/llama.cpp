@@ -1227,6 +1227,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     // into the preceding norm weight in the main loop below. Requires --imatrix.
     std::map<std::pair<int, int>, std::vector<float>> sq_scales; // (kind, layer) -> s
     const bool emit_nvfp4_smoothquant = getenv("GGML_NVFP4_SMOOTHQUANT") != nullptr;
+    // Env GGML_NVFP4_SMOOTHQUANT_ALPHA overrides alpha for sweep experiments. 0.5 is
+    // the SmoothQuant paper default; higher pushes more burden onto the weight side.
+    float sq_alpha = 0.5f;
+    if (const char * a = getenv("GGML_NVFP4_SMOOTHQUANT_ALPHA")) {
+        sq_alpha = strtof(a, nullptr);
+    }
     if (emit_nvfp4_smoothquant) {
         if (!imatrix_data) {
             LLAMA_LOG_WARN("%s: GGML_NVFP4_SMOOTHQUANT requires --imatrix; ignoring\n", __func__);
@@ -1264,23 +1270,22 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     if (rms > 0.0f) { log_sum += logf(rms); log_count++; }
                 }
                 const float geomean = log_count > 0 ? expf(log_sum / log_count) : 1.0f;
-                // s_j = (act_rms[j] / geomean(act_rms))^alpha, clamped. alpha=0.5 is the
-                // SmoothQuant default; geomean normalisation keeps per-tensor amax
-                // (and therefore scale2) close to its pre-migration magnitude.
-                const float alpha = 0.5f;
+                // s_j = (act_rms[j] / geomean(act_rms))^alpha, clamped. Geomean normalisation
+                // keeps per-tensor amax (and therefore scale2) close to its pre-migration
+                // magnitude regardless of alpha.
                 const float s_lo  = 0.1f;
                 const float s_hi  = 10.0f;
                 for (int64_t j = 0; j < n_embd; ++j) {
                     const float r = s[j] > 0.0f ? s[j] / geomean : 1.0f;
-                    float sj = powf(r, alpha);
+                    float sj = powf(r, sq_alpha);
                     if (sj < s_lo) { sj = s_lo; }
                     if (sj > s_hi) { sj = s_hi; }
                     s[j] = sj;
                 }
                 sq_scales[kv.first] = std::move(s);
             }
-            LLAMA_LOG_INFO("%s: GGML_NVFP4_SMOOTHQUANT: computed s for %zu (layer, group) pair(s)\n",
-                           __func__, sq_scales.size());
+            LLAMA_LOG_INFO("%s: GGML_NVFP4_SMOOTHQUANT: computed s for %zu (layer, group) pair(s), alpha=%.3f\n",
+                           __func__, sq_scales.size(), sq_alpha);
         }
     }
 
