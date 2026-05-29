@@ -416,10 +416,56 @@ Further W4A4 movement from SmoothQuant alone likely needs the **activation stati
 (max-abs vs RMS — canonical SmoothQuant) or **per-column weight max** in the denominator (proper
 α=0.5, instead of geomean-normalised activation-only).
 
+## FP8 activation probe — the 8-bit-float route is the same K=32 tier
+
+A detour worth recording so it isn't re-attempted: keep activations at 8-bit *float* (e4m3) rather
+than int8 or fp4, hoping e4m3's wider dynamic range beats int8 W4A8 and/or that an FP8 tensor path
+reclaims more speed than the int8 MMQ. Both hopes fail.
+
+**Probe** (env `GGML_CUDA_FP4_FP8=1`, `ggml_cuda_mul_mat_nvfp4_fp8_cublas` in `ggml-cuda.cu`): forces
+NVFP4 off MMQ (like `FP4_NO_MMQ`), dequantizes the weights to f16 at their exact stored 4-bit
+precision, round-trips each activation row through e4m3 with a per-row amax scale
+(`quant_dequant_e4m3_rows_kernel`), then runs a plain f16 GEMM. It is precision-faithful — a native
+`mxf8f6f4` kernel accumulates identically — but NOT a speed path (rides cuBLAS; the point is the KLD).
+`cublasGemmEx` with `CUDA_R_8F_E4M3` was tried first and rejected every config ("unsupported
+parameter"), which is why the probe round-trips through f16 instead of doing a real FP8 GEMM.
+
+**Numbers** (qwen3-8b-N4_0, wikitext KLD vs bf16; same fixed chunk set as the tables above):
+
+| activation                | Mean KLD | scale granularity | MMA  |
+|---------------------------|----------|-------------------|------|
+| W4A∞ (fp32 acts, ceiling) | 0.0689   | —                 | cuBLAS |
+| int8 W4A8 (Findings §1)   | 0.0695   | per-32 along K    | K=32 |
+| **fp8 e4m3, per-tensor**  | 0.0743   | per-tensor        | (K=32) |
+| **fp8 e4m3, per-row**     | 0.0735   | per-token         | (K=32) |
+| W4A4 native               | 0.1167   | per-16 (fp4)      | K=64 |
+| Q4_0 reference            | 0.0780   | —                 | —    |
+
+**Read — fp8 activations are precision-viable but buy nothing over int8, on either axis.**
+
+1. fp8 recovers ~89% of the W4A4→ceiling loss and clears Q4_0 (0.0743 < 0.0780). The format is fine.
+2. But fp8 per-row (0.0743) is *worse* than int8 per-block (0.0695): int8's per-32-along-K scaling
+   captures channel-local range a per-token fp8 scale cannot. Per-row barely beats per-tensor
+   (0.0735 vs 0.0743) — the residual lives *across channels within a token*, not across tokens. A
+   native `mxf8f6f4` kernel carries per-16 block scales and would *match* int8's granularity, but only
+   match — e4m3 is a coarser value grid than int8 at equal scale density.
+3. Speed: 8-bit operands of any kind only exist on the `m16n8k32` MMA. fp8 cannot reach the fp4 K=64
+   rate any more than int8 can (measured fp4-native pp512 ~14.4k vs the cuBLAS-dequant 8-bit path
+   ~3.4k t/s here). A purpose-built `mxf8f6f4` kernel lands in the same ~Q4_0-speed K=32 tier the doc
+   already rejected for W4A8 (Hypothesis, "never reclaim the FP4 K=64 throughput").
+
+So the FP8 route collapses onto the W4A8 conclusion: 8-bit activations solve precision and forfeit the
+FP4 throughput that is the entire point of the format. **No native `mxf8f6f4` kernel is worth
+building** — it is K=32-tier parity with the int8 W4A8 already characterized, at slightly worse
+precision. The only route to Q4_0-precision-at-W4A4-speed remains SmoothQuant + Hadamard (Phase 1 /
+Phase 2). The probe is left in tree as an env-gated diagnostic, default off, mirroring the other
+`FP4_*` envs.
+
 ## Tooling
 
 - Diagnostic: `GGML_CUDA_FP4_HIPREC=<substr>` (per-name W4A∞ lift), `GGML_CUDA_FP4_NO_MMQ=1` (global
-  W4A∞), both in the CUDA matmul dispatch. Require a W4A4-base build.
+  W4A∞), `GGML_CUDA_FP4_FP8=1` (fp8-activation probe: per-row e4m3 round-trip through an f16 GEMM,
+  accuracy-only), all in the CUDA matmul dispatch. Require a W4A4-base build.
 - Quantize-side folds (all off by default, all in `src/llama-quant.cpp`):
   - `GGML_NVFP4_SCALE2=1` — emit per-tensor `.scale` (`weight_scale_2`) for every NVFP4 weight
     with a `build_lora_mm` consumer. No imatrix required.
