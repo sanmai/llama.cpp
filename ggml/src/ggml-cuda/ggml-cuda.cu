@@ -1691,26 +1691,32 @@ static void ggml_cuda_mul_mat_nvfp4_fp8_cublas(
     GGML_ASSERT(to_fp16_cuda != nullptr);
     to_fp16_cuda(src0_dd_i, w_f16.get(), row_diff*ne00, stream);
 
-    // activations -> e4m3 round-trip -> f16, per-row (per-token) amax scale
+    // activations -> f16. fp8 mode (=1) round-trips through e4m3 with a per-row amax scale;
+    // 16 mode (=16) keeps a plain f16 cast, isolating the e4m3 cost from the harness.
+    static const char * fp8_mode = getenv("GGML_CUDA_FP4_FP8");
+    const bool acts_f16 = fp8_mode && atoi(fp8_mode) == 16;
+
     ggml_cuda_pool_alloc<half> a_f16(ctx.pool(id), src1_ncols*ne10);
-    quant_dequant_e4m3_rows_kernel<<<src1_ncols, 256, 0, stream>>>(src1_ddf_i, a_f16.get(), ne10);
+    if (acts_f16) {
+        const to_fp16_cuda_t to_fp16_src1 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
+        GGML_ASSERT(to_fp16_src1 != nullptr);
+        to_fp16_src1(src1_ddf_i, a_f16.get(), src1_ncols*ne10, stream);
+    } else {
+        quant_dequant_e4m3_rows_kernel<<<src1_ncols, 256, 0, stream>>>(src1_ddf_i, a_f16.get(), ne10);
+    }
 
-    ggml_cuda_pool_alloc<half> dst_f16(ctx.pool(id), row_diff*src1_ncols);
-
-    const half alpha = 1.0f;
-    const half beta  = 0.0f;
+    // f32 accumulation so the probe reflects only the activation format, not accumulator slack
+    const float alpha = 1.0f;
+    const float beta  = 0.0f;
     CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
     CUBLAS_CHECK(
         cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
                 row_diff, src1_ncols, ne10,
-                &alpha, w_f16.get(),   CUDA_R_16F, ne00,
-                        a_f16.get(),   CUDA_R_16F, ne10,
-                &beta,  dst_f16.get(), CUDA_R_16F, ldc,
-                CUBLAS_COMPUTE_16F,
+                &alpha, w_f16.get(), CUDA_R_16F, ne00,
+                        a_f16.get(), CUDA_R_16F, ne10,
+                &beta,  dst_dd_i,    CUDA_R_32F, ldc,
+                CUBLAS_COMPUTE_32F,
                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-
-    const to_fp32_cuda_t to_fp32_cuda_dst = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
-    to_fp32_cuda_dst(dst_f16.get(), dst_dd_i, row_diff*src1_ncols, stream);
 #else
     GGML_UNUSED_VARS(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, dst_dd_i, row_low, row_high, src1_ncols, stream);
     GGML_ABORT("GGML_CUDA_FP4_FP8 requires CUDA FP8 support");
