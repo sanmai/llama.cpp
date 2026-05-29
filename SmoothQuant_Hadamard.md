@@ -422,37 +422,44 @@ A detour worth recording so it isn't re-attempted: keep activations at 8-bit *fl
 than int8 or fp4, hoping e4m3's wider dynamic range beats int8 W4A8 and/or that an FP8 tensor path
 reclaims more speed than the int8 MMQ. Both hopes fail.
 
-**Probe** (env `GGML_CUDA_FP4_FP8=1`, `ggml_cuda_mul_mat_nvfp4_fp8_cublas` in `ggml-cuda.cu`): forces
+**Probe** (env `GGML_CUDA_FP4_FP8`, `ggml_cuda_mul_mat_nvfp4_fp8_cublas` in `ggml-cuda.cu`): forces
 NVFP4 off MMQ (like `FP4_NO_MMQ`), dequantizes the weights to f16 at their exact stored 4-bit
-precision, round-trips each activation row through e4m3 with a per-row amax scale
-(`quant_dequant_e4m3_rows_kernel`), then runs a plain f16 GEMM. It is precision-faithful — a native
-`mxf8f6f4` kernel accumulates identically — but NOT a speed path (rides cuBLAS; the point is the KLD).
-`cublasGemmEx` with `CUDA_R_8F_E4M3` was tried first and rejected every config ("unsupported
-parameter"), which is why the probe round-trips through f16 instead of doing a real FP8 GEMM.
+precision, prepares the activations as f16, then runs an f16 GEMM with **f32 accumulation** (so the
+probe reflects only the activation format). Two modes: `=1` round-trips each activation row through
+e4m3 with a per-row amax scale (`quant_dequant_e4m3_rows_kernel`); `=16` keeps a plain f16 cast — the
+control that isolates the e4m3 cost from the harness. Precision-faithful (a native `mxf8f6f4` kernel
+accumulates identically) but NOT a speed path (rides cuBLAS; the point is the KLD). `cublasGemmEx`
+with `CUDA_R_8F_E4M3` was tried first and rejected every config ("unsupported parameter"), which is
+why the probe round-trips through f16 instead of a real FP8 GEMM.
 
 **Numbers** (qwen3-8b-N4_0, wikitext KLD vs bf16; same fixed chunk set as the tables above):
 
-| activation                | Mean KLD | scale granularity | MMA  |
-|---------------------------|----------|-------------------|------|
-| W4A∞ (fp32 acts, ceiling) | 0.0689   | —                 | cuBLAS |
-| int8 W4A8 (Findings §1)   | 0.0695   | per-32 along K    | K=32 |
-| **fp8 e4m3, per-tensor**  | 0.0743   | per-tensor        | (K=32) |
-| **fp8 e4m3, per-row**     | 0.0735   | per-token         | (K=32) |
-| W4A4 native               | 0.1167   | per-16 (fp4)      | K=64 |
-| Q4_0 reference            | 0.0780   | —                 | —    |
+| activation                  | Mean KLD | scale granularity | MMA  |
+|-----------------------------|----------|-------------------|------|
+| W4A∞ (fp32 acts, ceiling)   | 0.068872 | —                 | cuBLAS |
+| **16-bit f16 acts (probe `=16`)** | 0.068861 | —           | (K=16) |
+| int8 W4A8 (Findings §1)     | 0.0695   | per-32 along K    | K=32 |
+| **fp8 e4m3, per-row (`=1`)** | 0.072982 | per-token        | (K=32) |
+| W4A4 native                 | 0.1167   | per-16 (fp4)      | K=64 |
+| Q4_0 reference              | 0.0780   | —                 | —    |
+
+The `=16` control lands on the ceiling to 1e-5 (0.068861 vs 0.068872) — the harness is sound, and
+**any activation precision ≥16-bit is free** (the weight-only ceiling). So the fp8 number is genuinely
+the e4m3 cost: **0.072982 − 0.068861 = 0.0041 pure activation-quantization residual.** (An earlier
+f16-accumulate build read fp8 ~0.0735; f32 accumulate removes that ~0.0005 of accumulator slack.)
 
 **Read — fp8 activations are precision-viable but buy nothing over int8, on either axis.**
 
-1. fp8 recovers ~89% of the W4A4→ceiling loss and clears Q4_0 (0.0743 < 0.0780). The format is fine.
-2. But fp8 per-row (0.0743) is *worse* than int8 per-block (0.0695): int8's per-32-along-K scaling
-   captures channel-local range a per-token fp8 scale cannot. Per-row barely beats per-tensor
-   (0.0735 vs 0.0743) — the residual lives *across channels within a token*, not across tokens. A
-   native `mxf8f6f4` kernel carries per-16 block scales and would *match* int8's granularity, but only
-   match — e4m3 is a coarser value grid than int8 at equal scale density.
-3. Speed: 8-bit operands of any kind only exist on the `m16n8k32` MMA. fp8 cannot reach the fp4 K=64
-   rate any more than int8 can (measured fp4-native pp512 ~14.4k vs the cuBLAS-dequant 8-bit path
-   ~3.4k t/s here). A purpose-built `mxf8f6f4` kernel lands in the same ~Q4_0-speed K=32 tier the doc
-   already rejected for W4A8 (Hypothesis, "never reclaim the FP4 K=64 throughput").
+1. fp8 recovers ~91% of the W4A4→ceiling loss and clears Q4_0 (0.0730 < 0.0780). The format is fine.
+2. But fp8 per-row (0.0730) is *worse* than int8 per-block (0.0695): int8's per-32-along-K scaling
+   captures channel-local range a per-token fp8 scale cannot. Per-row barely beat per-tensor in the
+   earlier build (~0.0735 vs ~0.0743) — the residual lives *across channels within a token*, not
+   across tokens. A native `mxf8f6f4` kernel carries per-16 block scales and would *match* int8's
+   granularity, but only match — e4m3 is a coarser value grid than int8 at equal scale density.
+3. Speed: 8-bit operands only exist on the `m16n8k32` MMA, and 16-bit on `m16n8k16` — neither reaches
+   the fp4 K=64 rate (measured fp4-native pp512 ~14.4k vs the cuBLAS-dequant path ~3.4k t/s here). A
+   purpose-built `mxf8f6f4` kernel lands in the same ~Q4_0-speed K=32 tier the doc already rejected for
+   W4A8 (Hypothesis, "never reclaim the FP4 K=64 throughput"); 16-bit is slower still.
 
 So the FP8 route collapses onto the W4A8 conclusion: 8-bit activations solve precision and forfeit the
 FP4 throughput that is the entire point of the format. **No native `mxf8f6f4` kernel is worth
@@ -464,8 +471,9 @@ Phase 2). The probe is left in tree as an env-gated diagnostic, default off, mir
 ## Tooling
 
 - Diagnostic: `GGML_CUDA_FP4_HIPREC=<substr>` (per-name W4A∞ lift), `GGML_CUDA_FP4_NO_MMQ=1` (global
-  W4A∞), `GGML_CUDA_FP4_FP8=1` (fp8-activation probe: per-row e4m3 round-trip through an f16 GEMM,
-  accuracy-only), all in the CUDA matmul dispatch. Require a W4A4-base build.
+  W4A∞), `GGML_CUDA_FP4_FP8=1` (fp8-activation probe: per-row e4m3 round-trip through an f32-accumulate
+  f16 GEMM, accuracy-only; `=16` keeps f16 activations as the harness control = ceiling), all in the
+  CUDA matmul dispatch. Require a W4A4-base build.
 - Quantize-side folds (all off by default, all in `src/llama-quant.cpp`):
   - `GGML_NVFP4_SCALE2=1` — emit per-tensor `.scale` (`weight_scale_2`) for every NVFP4 weight
     with a `build_lora_mm` consumer. No imatrix required.
