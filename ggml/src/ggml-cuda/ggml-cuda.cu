@@ -1622,11 +1622,114 @@ static const cublas_force_compute_type & ggml_cuda_cublas_get_force_compute_type
     return compute_type;
 }
 
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
+// NVFP4 weight x FP8(e4m3) activation probe (GGML_CUDA_FP4_FP8). Isolates the accuracy of keeping
+// activations at 8-bit float (e4m3) instead of the native W4A4 fp4: weights are dequantized to
+// their exact stored 4-bit values (f16), activations are round-tripped through e4m3 with a single
+// per-tensor amax scale, then a plain f16 GEMM accumulates in fp32. A native mxf8f6f4 tensor-core
+// kernel would accumulate identically, so this is precision-representative (speed is not).
+
+// Round-trip each row through e4m3 with a per-row (per-token) amax scale (amax -> 448), emitting f16.
+// One block per row; the scale cancels in the round-trip so the GEMM downstream uses alpha = 1.
+// Per-row scaling is a proxy for the per-block scales a native mxf8f6f4 kernel would carry.
+static __global__ void quant_dequant_e4m3_rows_kernel(const float * __restrict__ x, half * __restrict__ y,
+                                                      const int64_t ncols) {
+    const int64_t row = blockIdx.x;
+    const float * xr  = x + row*ncols;
+    half        * yr  = y + row*ncols;
+
+    float amax = 0.0f;
+    for (int64_t j = threadIdx.x; j < ncols; j += blockDim.x) {
+        amax = fmaxf(amax, fabsf(xr[j]));
+    }
+    amax = warp_reduce_max(amax);
+
+    __shared__ float s_amax[WARP_SIZE];
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int warp = threadIdx.x / WARP_SIZE;
+    if (lane == 0) {
+        s_amax[warp] = amax;
+    }
+    __syncthreads();
+    if (warp == 0) {
+        amax = lane < (int) (blockDim.x/WARP_SIZE) ? s_amax[lane] : 0.0f;
+        amax = warp_reduce_max(amax);
+    }
+
+    __shared__ float s_scale;
+    __shared__ float s_inv;
+    if (threadIdx.x == 0) {
+        s_scale = amax > 0.0f ? amax*(1.0f/448.0f) : 1.0f;
+        s_inv   = amax > 0.0f ? 448.0f/amax : 0.0f;
+    }
+    __syncthreads();
+
+    for (int64_t j = threadIdx.x; j < ncols; j += blockDim.x) {
+        const float q = (float) __nv_fp8_e4m3(xr[j]*s_inv);
+        yr[j] = __float2half(q*s_scale);
+    }
+}
+#endif // defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
+
+static void ggml_cuda_mul_mat_nvfp4_fp8_cublas(
+        ggml_backend_cuda_context & ctx,
+        const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
+        const char * src0_dd_i, const float * src1_ddf_i, float * dst_dd_i,
+        const int64_t row_low, const int64_t row_high, const int64_t src1_ncols, cudaStream_t stream) {
+#if defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
+    const int     id       = ggml_cuda_get_device();
+    const int64_t ne00     = src0->ne[0];                       // K
+    const int64_t ne10     = src1->ne[0];                       // K
+    const int64_t row_diff = row_high - row_low;                // M
+    const int64_t ldc      = id == ctx.device ? dst->ne[0] : row_diff;
+
+    GGML_ASSERT(ne00 == ne10);
+
+    // weights -> f16 at exact stored (4-bit) precision
+    ggml_cuda_pool_alloc<half> w_f16(ctx.pool(id), row_diff*ne00);
+    const to_fp16_cuda_t to_fp16_cuda = ggml_get_to_fp16_cuda(src0->type);
+    GGML_ASSERT(to_fp16_cuda != nullptr);
+    to_fp16_cuda(src0_dd_i, w_f16.get(), row_diff*ne00, stream);
+
+    // activations -> e4m3 round-trip -> f16, per-row (per-token) amax scale
+    ggml_cuda_pool_alloc<half> a_f16(ctx.pool(id), src1_ncols*ne10);
+    quant_dequant_e4m3_rows_kernel<<<src1_ncols, 256, 0, stream>>>(src1_ddf_i, a_f16.get(), ne10);
+
+    ggml_cuda_pool_alloc<half> dst_f16(ctx.pool(id), row_diff*src1_ncols);
+
+    const half alpha = 1.0f;
+    const half beta  = 0.0f;
+    CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(id), stream));
+    CUBLAS_CHECK(
+        cublasGemmEx(ctx.cublas_handle(id), CUBLAS_OP_T, CUBLAS_OP_N,
+                row_diff, src1_ncols, ne10,
+                &alpha, w_f16.get(),   CUDA_R_16F, ne00,
+                        a_f16.get(),   CUDA_R_16F, ne10,
+                &beta,  dst_f16.get(), CUDA_R_16F, ldc,
+                CUBLAS_COMPUTE_16F,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+
+    const to_fp32_cuda_t to_fp32_cuda_dst = ggml_get_to_fp32_cuda(GGML_TYPE_F16);
+    to_fp32_cuda_dst(dst_f16.get(), dst_dd_i, row_diff*src1_ncols, stream);
+#else
+    GGML_UNUSED_VARS(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, dst_dd_i, row_low, row_high, src1_ncols, stream);
+    GGML_ABORT("GGML_CUDA_FP4_FP8 requires CUDA FP8 support");
+#endif // defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
+}
+
 static void ggml_cuda_op_mul_mat_cublas(
     ggml_backend_cuda_context & ctx,
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream) {
+
+    static const bool fp4_fp8 = getenv("GGML_CUDA_FP4_FP8") != nullptr;
+    if (fp4_fp8 && src0->type == GGML_TYPE_NVFP4) {
+        ggml_cuda_mul_mat_nvfp4_fp8_cublas(ctx, src0, src1, dst, src0_dd_i, src1_ddf_i, dst_dd_i,
+                                           row_low, row_high, src1_ncols, stream);
+        GGML_UNUSED_VARS(src1_ddq_i, src1_padded_row_size);
+        return;
+    }
 
     GGML_ASSERT(src0_dd_i  != nullptr);
     GGML_ASSERT(src1_ddf_i != nullptr);
@@ -2584,7 +2687,8 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // diagnostic: route selected NVFP4 weight matmuls to the cuBLAS (W4A-inf) path to isolate
     // the per-projection fp4-activation loss. GGML_CUDA_FP4_HIPREC=<substr> matches src0->name.
     static const char * fp4_hiprec = getenv("GGML_CUDA_FP4_HIPREC");
-    if (fp4_hiprec && src0->type == GGML_TYPE_NVFP4 && strstr(src0->name, fp4_hiprec)) {
+    static const bool   fp4_fp8    = getenv("GGML_CUDA_FP4_FP8") != nullptr;
+    if (src0->type == GGML_TYPE_NVFP4 && (fp4_fp8 || (fp4_hiprec && strstr(src0->name, fp4_hiprec)))) {
         use_mul_mat_q     = false;
         use_mul_mat_vec_q = false;
     }
