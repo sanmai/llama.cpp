@@ -1631,7 +1631,6 @@ static const cublas_force_compute_type & ggml_cuda_cublas_get_force_compute_type
 
 // Round-trip each row through e4m3 with a per-row (per-token) amax scale (amax -> 448), emitting f16.
 // One block per row; the scale cancels in the round-trip so the GEMM downstream uses alpha = 1.
-// Per-row scaling is a proxy for the per-block scales a native mxf8f6f4 kernel would carry.
 static __global__ void quant_dequant_e4m3_rows_kernel(const float * __restrict__ x, half * __restrict__ y,
                                                       const int64_t ncols) {
     const int64_t row = blockIdx.x;
@@ -1669,6 +1668,27 @@ static __global__ void quant_dequant_e4m3_rows_kernel(const float * __restrict__
         yr[j] = __float2half(q*s_scale);
     }
 }
+
+// Round-trip e4m3 with a per-block amax scale along K: each contiguous `blk` elements share one scale.
+// ncols % blk == 0 so blocks never straddle a row, making a flat 1D pass per-blk-along-K per token.
+// blk=16 matches NVFP4's per-16 weight sub-blocks (and a native mxf8f6f4 block_scale); blk=32 = q8_1.
+static __global__ void quant_dequant_e4m3_blocks_kernel(const float * __restrict__ x, half * __restrict__ y,
+                                                        const int64_t n, const int blk) {
+    const int64_t nb = n / blk;
+    for (int64_t b = blockIdx.x*(int64_t) blockDim.x + threadIdx.x; b < nb; b += (int64_t) gridDim.x*blockDim.x) {
+        const int64_t base = b*blk;
+        float amax = 0.0f;
+        for (int k = 0; k < blk; ++k) {
+            amax = fmaxf(amax, fabsf(x[base + k]));
+        }
+        const float scale = amax > 0.0f ? amax*(1.0f/448.0f) : 1.0f;
+        const float inv   = amax > 0.0f ? 448.0f/amax : 0.0f;
+        for (int k = 0; k < blk; ++k) {
+            const float q = (float) __nv_fp8_e4m3(x[base + k]*inv);
+            y[base + k] = __float2half(q*scale);
+        }
+    }
+}
 #endif // defined(FP8_AVAILABLE) && !defined(GGML_USE_HIP)
 
 static void ggml_cuda_mul_mat_nvfp4_fp8_cublas(
@@ -1691,16 +1711,22 @@ static void ggml_cuda_mul_mat_nvfp4_fp8_cublas(
     GGML_ASSERT(to_fp16_cuda != nullptr);
     to_fp16_cuda(src0_dd_i, w_f16.get(), row_diff*ne00, stream);
 
-    // activations -> f16. fp8 mode (=1) round-trips through e4m3 with a per-row amax scale;
-    // 16 mode (=16) keeps a plain f16 cast, isolating the e4m3 cost from the harness.
+    // activations -> f16. GGML_CUDA_FP4_FP8 selects the scheme:
+    //   "f16"        -> plain f16 cast (control, isolates the e4m3 cost from the harness = ceiling)
+    //   "16" / "32"  -> e4m3, per-blk amax scale along K (blk=16 native granularity, 32 = q8_1)
+    //   anything else (e.g. "1") -> e4m3, per-row (per-token) amax scale
     static const char * fp8_mode = getenv("GGML_CUDA_FP4_FP8");
-    const bool acts_f16 = fp8_mode && atoi(fp8_mode) == 16;
+    const bool acts_f16 = fp8_mode && strcmp(fp8_mode, "f16") == 0;
+    const int  blk      = (fp8_mode && atoi(fp8_mode) >= 16) ? atoi(fp8_mode) : 0;
 
     ggml_cuda_pool_alloc<half> a_f16(ctx.pool(id), src1_ncols*ne10);
     if (acts_f16) {
         const to_fp16_cuda_t to_fp16_src1 = ggml_get_to_fp16_cuda(GGML_TYPE_F32);
         GGML_ASSERT(to_fp16_src1 != nullptr);
         to_fp16_src1(src1_ddf_i, a_f16.get(), src1_ncols*ne10, stream);
+    } else if (blk != 0) {
+        GGML_ASSERT((src1_ncols*ne10) % blk == 0);
+        quant_dequant_e4m3_blocks_kernel<<<256, 256, 0, stream>>>(src1_ddf_i, a_f16.get(), src1_ncols*ne10, blk);
     } else {
         quant_dequant_e4m3_rows_kernel<<<src1_ncols, 256, 0, stream>>>(src1_ddf_i, a_f16.get(), ne10);
     }
