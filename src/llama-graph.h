@@ -199,6 +199,19 @@ public:
     const uint32_t n_outputs;
 };
 
+// experimental: shared per-16 Hadamard for the ffn_down micro-rotation (env GGML_NVFP4_ROTATE_DOWN16).
+// One constant H_16 created on the first layer and reused (looked up by name) across all layers.
+class llm_graph_input_ffn_rot : public llm_graph_input_i {
+public:
+    llm_graph_input_ffn_rot() = default;
+    virtual ~llm_graph_input_ffn_rot() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override { return rot != nullptr; }
+
+    ggml_tensor * rot = nullptr; // F32 [16,16] constant Hadamard
+};
+
 class llm_graph_input_mean : public llm_graph_input_i {
 public:
     llm_graph_input_mean(const llama_cparams & cparams) : cparams(cparams) {}

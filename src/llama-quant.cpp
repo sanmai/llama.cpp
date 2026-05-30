@@ -1233,6 +1233,10 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     if (const char * a = getenv("GGML_NVFP4_SMOOTHQUANT_ALPHA")) {
         sq_alpha = strtof(a, nullptr);
     }
+    // GGML_NVFP4_SMOOTHQUANT_WMAX: canonical SmoothQuant denominator s_j ~ |X_j|^a / max|W_j|^(1-a)
+    // (joint per-input-channel weight max over the group's consumers) instead of the act-only
+    // geomean form. Respects the per-16 NVFP4 weight grid; needs a prelim weight read.
+    const bool sq_wmax = getenv("GGML_NVFP4_SMOOTHQUANT_WMAX") != nullptr;
     if (emit_nvfp4_smoothquant) {
         if (!imatrix_data) {
             LLAMA_LOG_WARN("%s: GGML_NVFP4_SMOOTHQUANT requires --imatrix; ignoring\n", __func__);
@@ -1261,23 +1265,59 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 const int64_t n_embd = (int64_t) vals.size();
                 if (n_embd == 0) { continue; }
 
+                // canonical denominator: joint per-input-channel max|W| over the group's consumers
+                // (FFN gate+up / ATTN q+k+v). Bounds the migration to the per-16 NVFP4 weight grid
+                // so it cannot amplify a column past its sub-block amax. Read once here (mmap).
+                std::vector<float> wmax;
+                if (sq_wmax) {
+                    wmax.assign(n_embd, 0.0f);
+                    std::vector<no_init<float>> wbuf;
+                    std::vector<std::thread>    wworkers;
+                    for (size_t t = 0; t < tensors.size(); ++t) {
+                        ggml_tensor * wt = tensors[t]->tensor;
+                        if (sq_is_norm(wt->name)) { continue; }
+                        const sq_group wg = sq_group_of(wt->name);
+                        if ((int) wg.kind != kv.first.first || wg.layer != kv.first.second) { continue; }
+                        if (wt->ne[0] != n_embd) { continue; }
+                        ml.load_data_for(wt);
+                        const int64_t nel = ggml_nelements(wt);
+                        llama_tensor_dequantize_impl(wt, wbuf, wworkers, nel, nthread);
+                        for (auto & w : wworkers) { w.join(); }
+                        wworkers.clear();
+                        const float * wf = (const float *) wbuf.data();
+                        const int64_t nrow = ggml_nrows(wt);
+                        for (int64_t r = 0; r < nrow; ++r) {
+                            const float * row = wf + r*n_embd;
+                            for (int64_t j = 0; j < n_embd; ++j) {
+                                wmax[j] = std::max(wmax[j], fabsf(row[j]));
+                            }
+                        }
+                    }
+                }
+
                 std::vector<float> s(n_embd);
                 float log_sum = 0.0f;
                 int log_count = 0;
                 for (int64_t j = 0; j < n_embd; ++j) {
                     const float rms = sqrtf(std::max(vals[j], 0.0f));
-                    s[j] = rms; // staged: replaced by normalised form below
-                    if (rms > 0.0f) { log_sum += logf(rms); log_count++; }
+                    // canonical SmoothQuant: s_j ~ |X_j|^a / max|W_j|^(1-a) (RMS proxies max|X|, the
+                    // imatrix has no max); act-only baseline: s_j ~ act_rms_j^a. Both geomean-normalised
+                    // + clamped below, which keeps per-tensor amax (and scale2) stable across alpha.
+                    float raw;
+                    if (sq_wmax) {
+                        const float wm = wmax[j] > 0.0f ? wmax[j] : 1.0f;
+                        raw = powf(rms, sq_alpha) * powf(wm, sq_alpha - 1.0f);
+                    } else {
+                        raw = powf(rms, sq_alpha);
+                    }
+                    s[j] = raw;
+                    if (raw > 0.0f) { log_sum += logf(raw); log_count++; }
                 }
                 const float geomean = log_count > 0 ? expf(log_sum / log_count) : 1.0f;
-                // s_j = (act_rms[j] / geomean(act_rms))^alpha, clamped. Geomean normalisation
-                // keeps per-tensor amax (and therefore scale2) close to its pre-migration
-                // magnitude regardless of alpha.
                 const float s_lo  = 0.1f;
                 const float s_hi  = 10.0f;
                 for (int64_t j = 0; j < n_embd; ++j) {
-                    const float r = s[j] > 0.0f ? s[j] / geomean : 1.0f;
-                    float sj = powf(r, sq_alpha);
+                    float sj = s[j] > 0.0f ? s[j] / geomean : 1.0f;
                     if (sj < s_lo) { sj = s_lo; }
                     if (sj > s_hi) { sj = s_hi; }
                     s[j] = sj;
@@ -1521,6 +1561,19 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                         "rotate-oproj needs a mutable f32 copy (quantize from bf16, not f32)");
                     llama_fwht_rows((float *) f32_conv_buf.data(), tensor->ne[0], tensor->ne[1] * tensor->ne[2]);
                     LLAMA_LOG_INFO("[rotate-oproj] ");
+                }
+
+                // experimental: per-16 Hadamard micro-rotation of NVFP4 ffn_down weights. Radius 16
+                // matches the per-16 UE4M3 sub-block, so the offline flatten stays inside one scale's
+                // jurisdiction (H_4096 converged scales across the block and regressed +0.033). Online
+                // H*x: env GGML_NVFP4_ROTATE_DOWN16. Invariant: w^T x == (H*w)^T (H*x) per 16-block.
+                if (new_type == GGML_TYPE_NVFP4 && getenv("GGML_NVFP4_ROTATE_DOWN16") &&
+                    std::string(tensor->name).find("ffn_down.weight") != std::string::npos) {
+                    GGML_ASSERT(f32_data == (const float *) f32_conv_buf.data() &&
+                        "rotate-down16 needs a mutable f32 copy (quantize from bf16, not f32)");
+                    GGML_ASSERT(tensor->ne[0] % 16 == 0);
+                    llama_fwht_rows((float *) f32_conv_buf.data(), 16, (tensor->ne[0] / 16) * tensor->ne[1] * tensor->ne[2]);
+                    LLAMA_LOG_INFO("[rotate-down16] ");
                 }
 
                 // NVFP4 scale2 fold: pre-divide weights by s2 so per-16 UE4M3 sub-block scales

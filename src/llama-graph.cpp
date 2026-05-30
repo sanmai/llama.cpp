@@ -107,6 +107,14 @@ static const std::vector<float> & oproj_hadamard(int64_t n) {
     return cache.emplace(n, std::move(h)).first->second;
 }
 
+void llm_graph_input_ffn_rot::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    if (rot) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(rot->buffer));
+        memcpy(rot->data, oproj_hadamard(rot->ne[0]).data(), ggml_nbytes(rot));
+    }
+}
+
 void llm_graph_input_embd::set_input(const llama_ubatch * ubatch) {
     if (ubatch->token) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -1332,6 +1340,26 @@ ggml_tensor * llm_graph_context::build_ffn(
     if (gate && type_gate == LLM_FFN_PAR) {
         cur = ggml_mul(ctx0, cur, tmp);
         cb(cur, "ffn_gate_par", il);
+    }
+
+    // experimental: per-16 Hadamard micro-rotation of the down_proj input so the offline-rotated
+    // NVFP4 weights are inverted and the activation is de-outliered within each 16-element sub-block
+    // before fp4 quantization. Radius 16 keeps the flatten inside one UE4M3 scale's jurisdiction
+    // (unlike H_4096). One shared H_16 created on the first layer, reused by name across layers.
+    if (down && getenv("GGML_NVFP4_ROTATE_DOWN16")) {
+        ggml_tensor * rot = ggml_get_tensor(ctx0, "ffn_down_rot");
+        if (!rot) {
+            auto inp = std::make_unique<llm_graph_input_ffn_rot>();
+            inp->rot = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 16, 16);
+            ggml_set_input(inp->rot);
+            ggml_set_name(inp->rot, "ffn_down_rot");
+            rot = inp->rot;
+            res->add_input(std::move(inp));
+        }
+        if (!ggml_is_contiguous(cur)) {
+            cur = ggml_cont(ctx0, cur);
+        }
+        cur = ggml_mul_mat_aux(ctx0, cur, rot);
     }
 
     if (down) {

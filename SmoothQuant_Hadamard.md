@@ -416,6 +416,67 @@ Further W4A4 movement from SmoothQuant alone likely needs the **activation stati
 (max-abs vs RMS — canonical SmoothQuant) or **per-column weight max** in the denominator (proper
 α=0.5, instead of geomean-normalised activation-only).
 
+### Canonical denominator — `max|W_j|` in the denominator (negative)
+
+Tested the per-column-weight-max axis directly (env `GGML_NVFP4_SMOOTHQUANT_WMAX`): replace the
+act-only `s_j ~ act_rms_j^α` with the canonical `s_j ~ act_rms_j^α / max|W_j|^(1-α)`, where `max|W_j|`
+is the joint per-input-channel weight max over the group's consumers (gate+up / q+k+v), read once in
+a prelim mmap pass. RMS still stands in for `max|X_j|` (the imatrix has no max). α=0.5, same geomean
+normalisation + `[0.1,10]` clamp.
+
+| build (Qwen3-8B, 10-chunk KLD)        | W4A4     | W4A∞     | act cost (W4A4−W4A∞) |
+|---------------------------------------|----------|----------|----------------------|
+| scale2 + SmoothQuant α=0.5 (act-only) | 0.094625 | 0.055103 | 0.039522             |
+| + canonical `max|W|` denominator      | 0.096619 | 0.055264 | 0.041355             |
+
+**Negative: W4A4 +0.002, W∞ flat (no weight-quant gain), activation cost up.** The mechanism is the
+inverse of the act-only formula's accidental win. Findings established that *outlier-activation
+channels carry small weights*; the `1/max|W_j|^(1-α)` term amplifies small-weight channels, so those
+outlier-act/small-weight channels get driven *harder* into the clamp ceiling and over-migrated. The
+act-only geomean form is already well-matched to this weight structure — the canonical denominator
+over-corrects. It also dims the `max|X|` numerator follow-up: max would enlarge the numerator for
+exactly those channels, pushing them further into the clamp, so the pathology worsens rather than
+resolves. Conclusion: canonical SmoothQuant is the wrong tool for NVFP4's outlier-acts-have-small-
+weights structure. (The activation residual was then tried with a rotation — H₁₆ below — also
+negative.) Code left in tree as the env-gated `GGML_NVFP4_SMOOTHQUANT_WMAX` diagnostic, default off
+(act-only path is bit-identical when unset).
+
+### H₁₆ micro-rotation on `down_proj` (negative) — and the corrected Phase 2b mechanism
+
+Phase 2b argued H₄₀₉₆ killed `down_proj` by *converging the per-16 scales across a 4096-block*, and
+predicted a radius-16 rotation — matching the UE4M3 sub-block exactly — would keep the flatten "inside
+one scale's jurisdiction" and so be weight-cost-free. Implemented and tested (env
+`GGML_NVFP4_ROTATE_DOWN16`: offline `llama_fwht_rows(buf,16,…)` per 16-input-channel block of every
+`ffn_down` row; online H₁₆·x via `ggml_mul_mat_aux` + `llm_graph_input_ffn_rot`, one shared H₁₆ reused
+across layers).
+
+| build (Qwen3-8B, 10-chunk KLD)        | W4A4     | W4A∞     | act cost (W4A4−W4A∞) |
+|---------------------------------------|----------|----------|----------------------|
+| scale2 (unrotated)                    | 0.114446 | 0.067517 | 0.04693              |
+| scale2 + H₁₆ down                     | 0.138217 | 0.094084 | 0.04413              |
+| scale2 + SmoothQuant α=0.5            | 0.094625 | 0.055103 | 0.03952              |
+| scale2 + SmoothQuant + H₁₆ down       | 0.121122 | 0.081645 | 0.03948              |
+
+**Negative, and the prediction is falsified: W∞ +0.0266 — essentially identical to H₄₀₉₆'s +0.030 —
+with near-zero activation gain** (act cost moves −0.0028 / 0.0000). KLD stays sane (~0.08–0.14), so the
+fold + online inverse are correct; the rotation simply hurts as much at radius 16 as at 4096.
+
+**Corrected mechanism (supersedes the Phase 2b "scale convergence" story).** The damage is not
+cross-block; it is *within* each 16-block. A trained `down_proj` 16-block is concentrated (one large
+weight + small ones), which is exactly what E2M1 + a per-16 UE4M3 scale represents *well*: the scale
+tracks the dominant value, and the small entries carry negligible absolute error. H (any radius)
+spreads the block to near-uniform magnitudes, and now all 16 must sit on E2M1's ~8-level (~1-mantissa-
+bit) grid — E2M1 *hates* uniform distributions and *likes* concentrated ones. The per-16 scale
+re-adapts fine; the flattened *values* are intrinsically harder for 4 bits. Radius is irrelevant
+because the harm lives inside the 16-block.
+
+**Joint conclusion with Path 1.** NVFP4's E2M1 value grid is matched to `down_proj`'s concentrated,
+outlier-bearing weight structure: sharpening the migration scale (canonical denominator) over-amplifies
+it, and any-radius Hadamard flattens it — both regress. The activation residual on the no-norm
+projections (`down_proj`, `attn_output`) is therefore closed *within the NVFP4 weight format*; it is an
+E2M1-value-grid limit, addressable only by a richer format (`N4_K` two-level, deferred). Code left in
+tree as env-gated `GGML_NVFP4_ROTATE_DOWN16`, default off.
+
 ## FP8 activation probe — the 8-bit-float route is the same K=32 tier
 
 A detour worth recording so it isn't re-attempted: keep activations at 8-bit *float* (e4m3) rather
