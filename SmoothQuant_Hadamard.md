@@ -548,8 +548,39 @@ probe is left in tree as an env-gated diagnostic, default off, mirroring the oth
     with a `build_lora_mm` consumer. No imatrix required.
   - `GGML_NVFP4_SMOOTHQUANT=1` — per-channel migration for post-norm groups. Requires `--imatrix`.
   - `GGML_NVFP4_SMOOTHQUANT_ALPHA=<float>` — overrides α (default 0.5). For sweep experiments.
-  - `GGML_NVFP4_ROTATE_OPROJ=1` / `GGML_NVFP4_ROTATE_DOWN=1` — Phase 2a/2b Hadamard folds; need
-    matching env on inference.
+  - `GGML_NVFP4_SMOOTHQUANT_WMAX=1` — canonical `max|W|` denominator (negative; diagnostic).
+  - `GGML_NVFP4_ROTATE_OPROJ=1` — o_proj H₄₀₉₆ fold (Phase 2a); needs matching env on inference.
+  - `GGML_NVFP4_ROTATE_DOWN16=1` — down_proj H₁₆ micro-rotation (negative; diagnostic); needs
+    matching env on inference. (Phase 2b's `GGML_NVFP4_ROTATE_DOWN` H₄₀₉₆ was reverted from the tree.)
 - KLD board: `scripts/nvfp4-8b-kld.sh`; coherence gate: `nvfp4-smoke.sh`.
 - Distributional diagnostic: `scripts/nvfp4-subnormal-stats.py <gguf>` reports the UE4M3 sub-block
   scale histogram + global-N feasibility (the readout that flagged the `scale2` lever).
+
+## Where this lands — the 8-bit tier is the next round (2026-05-30)
+
+Two tiers, both at Q4_0's size (~4.5 bpw):
+
+- **N4 speed (fp4 K=64):** best is scale2 + SmoothQuant α=0.5 = **0.0946** W4A4, still **+0.0166 over
+  Q4_0 (0.078)**. The cheap algorithmic levers are now exhausted — α-sweep flat, canonical `max|W|`
+  denominator negative, H₁₆ negative — and the residual is E2M1-value-grid-bound, so only a richer
+  format (`N4_K`) moves it. Closing the gap *at fp4 speed* is a format project, not a tuning one.
+- **8-bit activations (K=32):** W4A8 ≈ **0.070**, which **beats Q4_0's 0.078**. This is the live
+  direction and the cleanest near-term story.
+
+**The 8-bit-tier claim, stated honestly: more accurate than Q4_0, but slower than Q4_0** — a real
+operating point, not a Pareto win.
+
+- *Precision* — measured (KLD, qwen3-8b-N4_0, this work): fp8 per-16 acts **0.0701**, int8 W4A8
+  **0.0695** (Findings §1), W4A∞ ceiling **0.0689**, vs Q4_0 **0.0780**. The win is solid.
+- *Speed* — **not benchmarked on the current tree.** The only HEAD numbers are W4A4-native 14.4k and
+  the cuBLAS-dequant W4A∞ path 3.4k t/s (pp512) — neither is a real 8-bit kernel. The one real W4A8
+  speed figure is from an earlier session whose int8-MMQ edits were since **reverted**: ~11.9k t/s
+  pp2048 vs Q4_0 ~15.4k, i.e. **~23% slower than Q4_0**. So "Q4_0-class speed" was optimistic; it is
+  slower.
+
+**Open for the next round:**
+
+1. Re-instate (or re-measure) a real W4A8 path on HEAD and `llama-bench` it head-to-head with Q4_0 —
+   precision is in hand, the speed claim needs a fresh number on the current tree.
+2. Decide whether +0.009 KLD over Q4_0 justifies ~23% less prefill — or commit to `N4_K` to chase the
+   fp4-speed win, where neither side of the tradeoff applies.
