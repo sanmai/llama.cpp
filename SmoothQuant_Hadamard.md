@@ -584,3 +584,55 @@ operating point, not a Pareto win.
    precision is in hand, the speed claim needs a fresh number on the current tree.
 2. Decide whether +0.009 KLD over Q4_0 justifies ~23% less prefill — or commit to `N4_K` to chase the
    fp4-speed win, where neither side of the tradeoff applies.
+
+## Does training-time recovery (QAT/QAD) clear the wall? (2026-05-30)
+
+The PTQ levers above leave a format floor. The open question is whether *training-time* recovery —
+quantization-aware training or distillation, which re-fits the weights through the fp4 grid — beats
+plain Q4_0 where static math cannot. Tested against the only publicly downloadable QAD NVFP4
+checkpoint: `nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4` (PTQ-init **then QAD**, README "Stage 4";
+the QAD recovery paper is arXiv 2601.20088). NVIDIA's `Qwen3-8B-NVFP4` is PTQ-only, so it can't
+test this; no dense QAD NVFP4 checkpoint is published — every one is a hybrid Nemotron with selective
+BF16 coverage.
+
+Cross-model (Nemotron is a Mamba/MoE hybrid, not Qwen3-8B) and partial-coverage (only the MoE experts
+and most `ssm_in/out` are 4-bit; attention and the attention-adjacent Mamba layers stay BF16 per
+NVIDIA's `exclude_modules`). So the absolute KLD does **not** transfer to the Qwen3-8B tables above —
+only the direction does. Three arms, coverage matched bit-for-bit (the 126 four-bit tensors and 38
+BF16-pinned tensors are identical across arms, via `llama-quantize --tensor-type` regex), all 19 GB,
+KLD vs the original bf16 base (PPL 7.91, 200-chunk wikitext):
+
+| arm                       | weights   | training | Mean KLD | same-top-p | RMS Δp |
+|---------------------------|-----------|----------|----------|------------|--------|
+| N4_0 self-quant (matched) | original  | none     | 0.07815  | 87.40%     | 7.65%  |
+| QAD-NVFP4 import          | distilled | PTQ+QAD  | 0.05946  | 88.98%     | 6.43%  |
+| Q4_0 (matched)            | original  | none     | **0.04366** | **90.45%** | **5.55%** |
+
+Decomposition:
+
+1. **Pure format penalty — clean.** N4_0 vs Q4_0, same original weights, same domain, no training:
+   0.0781 vs 0.0437, ~1.8×. Reproduces the Qwen3-8B bare-N4_0-loses-to-Q4_0 direction on a different
+   architecture — the E2M1-vs-int4 value-grid deficit is model-independent, not a Qwen artifact.
+2. **QAD recovers ~54% of the format gap** (0.0781 → 0.0595, of the 0.0344 N4_0→Q4_0 gap), and that is
+   measured *out of QAD's training domain* (it distilled on code/math/instruction data, not wikitext).
+   Training-time recovery is real and sizeable — the direction the literature claims holds.
+3. **QAD-NVFP4 still loses to plain Q4_0** (0.0595 vs 0.0437, +0.0158). Either the format floor is
+   deep enough that even QAD can't reach int4 fidelity, or the residual is the confound below — this
+   experiment cannot separate them.
+
+**Confound, stated honestly.** The metric is biased toward Q4_0. The QAD checkpoint's weights are
+*distilled* — a different model from the original bf16 — while Q4_0 is the original weights rounded,
+so Q4_0 mechanically tracks the original's next-token distribution more closely. And wikitext is out
+of QAD's distillation domain. So "QAD-NVFP4 loses to Q4_0 on wikitext KLD" does **not** establish
+"QAD can't beat Q4_0"; it establishes that the off-the-shelf checkpoint is not a faithfulness win on
+general text, and that the pure format penalty (arm 1, confound-free) is the dominant term.
+
+**Conclusion, tied to this doc's thesis.** Grabbing a published QAD NVFP4 checkpoint does not deliver
+Q4_0 faithfulness, and the clean arm confirms the format floor the PTQ work hit: NVFP4 at W4A4 trails
+Q4_0 by the E2M1 value-grid margin, on two unrelated models. Training-time recovery chips ~half of it
+even out-of-domain — encouraging — but the only way to know whether QAD *on our own dense model,
+measured in-domain or on task accuracy* clears the wall is to run it. The upside is bounded (a ~0.016
+residual, partly confound) before any training loop is built; weighed against `N4_K` (which moves the
+floor directly, no training), the format route remains the better bet for fp4-speed parity. Artifacts:
+`nemotron-3-nano-30b-a3b-{bf16,q4_0-cov,n4_0-cov}.gguf`, `nvfp4-import.gguf`, base
+`kld-base/nemotron-3-nano-bf16-kld-base.dat`.
