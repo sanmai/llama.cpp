@@ -636,3 +636,60 @@ residual, partly confound) before any training loop is built; weighed against `N
 floor directly, no training), the format route remains the better bet for fp4-speed parity. Artifacts:
 `nemotron-3-nano-30b-a3b-{bf16,q4_0-cov,n4_0-cov}.gguf`, `nvfp4-import.gguf`, base
 `kld-base/nemotron-3-nano-bf16-kld-base.dat`.
+
+### Replication on a second QAD checkpoint — Nemotron-Nano-12B-v2-VL (2026-05-31)
+
+The 30B is a Mamba/MoE hybrid with attention left in BF16. To check the pattern is not an artifact of
+that one model or that one coverage map, repeated on `nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-NVFP4-QAD`
+(PTQ+QAD, ModelOpt) against its BF16 base. This is the **harder** test: a *dense* model (no experts),
+a different family (a vision-language wrapper around a `nemotron_h` LLM — the vision tower is dropped
+for text KLD), and **broader 4-bit coverage** — QAD's `exclude_modules` here is only `lm_head`, the
+`mlp1` projector, `conv1d`, and the vision tower, so the **attention stack (q/k/v/output) is NVFP4**,
+unlike the 30B. Same protocol: three arms, bit-identical 136-tensor 4-bit set (attn q/k/v/output, ffn
+up/down, ssm in/out), token_embd/output BF16-pinned, KLD vs the original bf16 base (PPL 7.69, 196-chunk
+wikitext — the base `.dat` reads short at chunk 196, all arms truncate identically so the means are over
+the same sample):
+
+| arm                       | weights   | training | Mean KLD | same-top-p | RMS Δp |
+|---------------------------|-----------|----------|----------|------------|--------|
+| N4_0 self-quant (matched) | original  | none     | 0.05634  | 88.92%     | 6.25%  |
+| QAD-NVFP4 import          | distilled | PTQ+QAD  | 0.04272  | 90.41%     | 5.47%  |
+| Q4_0 (matched)            | original  | none     | **0.02949** | **91.91%** | **4.62%** |
+
+The three numbers that characterize the wall reproduce almost exactly, across architecture *and*
+coverage:
+
+| metric                       | 30B-A3B (MoE, attn BF16) | 12B-v2-VL (dense, attn NVFP4) |
+|------------------------------|--------------------------|-------------------------------|
+| format penalty (N4_0 / Q4_0) | 1.79×                    | 1.91×                         |
+| QAD recovers of the gap      | 54%                      | 51%                           |
+| QAD residual vs Q4_0         | +0.0158                  | +0.0132                       |
+
+QAD again lands **between** naive N4_0 and Q4_0 — it claws back ~half the format gap and stops; it does
+not reach Q4_0. That the attention projections are 4-bit here and the result is unchanged kills the
+"maybe attention was carrying it" escape: NVFP4 on attention sits on the same floor. The Jan-28-2026 QAD
+paper (research.nvidia.com/labs/nemotron/nemotron-qad) confirms QAD's objective *is* logit-KLD to the
+frozen BF16 teacher — so this arm is judged on its own metric type, only on an out-of-domain corpus,
+which still under-credits it; even so, the floor holds. Two independent models, same verdict: an
+off-the-shelf QAD NVFP4 checkpoint is not a general-text faithfulness win over Q4_0, and `N4_K` remains
+the lever that moves the floor without a training loop. Artifacts:
+`nemotron-12b-v2-vl-{bf16,q4_0-cov,n4_0-cov,nvfp4-qad-import}.gguf`, base
+`kld-base/nemotron-12b-v2-vl-bf16-kld-base.dat`.
+
+#### Speed — pp/tg on the 5090 (`llama-bench`, `-fa 1 -ngl 999 -b 8192 -ub 4096`)
+
+All three arms are the same 8.27 GiB / 12.32 B footprint, so this is speed-only:
+
+| arm              | pp4096 (t/s) | tg128 (t/s) |
+|------------------|--------------|-------------|
+| N4_0 self-quant  | 9313 ± 98    | 164.8 ± 0.5 |
+| QAD-NVFP4 import | 8689 ± 21    | 163.9 ± 0.7 |
+| Q4_0             | 7253 ± 24    | 166.0 ± 2.3 |
+
+Prefill: both NVFP4 arms beat Q4_0 — N4_0 **+28%**, QAD-NVFP4 **+20%** — the W4A4 fp4 advantage. Decode
+is flat (~165 t/s across all three): same footprint, memory-bound, and the NVFP4 K=32 read buys nothing
+over Q4_0. The import trails the self-quant by ~7% on prefill at identical coverage — it carries `.scale`
+(weight_scale_2) and `.input_scale` siblings per weight that aren't fully fused into the matmul, whereas
+the self-quant folds scale2 offline ([[project_nvfp4_scale_fusion]]). This is the whole tradeoff in one
+frame: NVFP4 buys 20–28% prefill at a cost of +0.013–0.027 KLD vs Q4_0, decode unchanged — N4 has the
+speed and lacks the precision, Q4_0 the reverse, and nothing here closes both at once.
