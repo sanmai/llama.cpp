@@ -690,6 +690,59 @@ Prefill: both NVFP4 arms beat Q4_0 — N4_0 **+28%**, QAD-NVFP4 **+20%** — the
 is flat (~165 t/s across all three): same footprint, memory-bound, and the NVFP4 K=32 read buys nothing
 over Q4_0. The import trails the self-quant by ~7% on prefill at identical coverage — it carries `.scale`
 (weight_scale_2) and `.input_scale` siblings per weight that aren't fully fused into the matmul, whereas
-the self-quant folds scale2 offline ([[project_nvfp4_scale_fusion]]). This is the whole tradeoff in one
+the self-quant folds scale2 offline. This is the whole tradeoff in one
 frame: NVFP4 buys 20–28% prefill at a cost of +0.013–0.027 KLD vs Q4_0, decode unchanged — N4 has the
 speed and lacks the precision, Q4_0 the reverse, and nothing here closes both at once.
+
+## Is FP6 a route? Tensor-core throughput, measured (2026-06-01)
+
+The FP8 probe above parked the 8-bit route on the K=32 tier. FP6 (E2M3 / E3M2, 6-bit) is the obvious
+"more precision than E2M1, less than FP8" middle, so the question is whether its *throughput* buys
+anything over FP8. On Blackwell the answer is set by the datapath: FP8 and FP6 share the `mxf8f6f4`
+MMA (`m16n8k32`), while FP4 has the dedicated `mxf4nvf4` path (`m16n8k64`, double rate). So the ISA
+prediction is **FP4 : FP8 : FP6 = 2 : 1 : 1**. Measured it directly rather than trusting the spec.
+
+**Tooling.** CUTLASS 4.5.2 `cutlass_profiler`, built for `sm_120a`, `--operation=BlockScaledGemm`,
+compute-bound square GEMMs. One clean kernel per format — `f32` accumulate, `C=void`, `D=f32` (no
+format-converting epilogue to muddy the rate), `128x128x128` cooperative, best variant per format:
+
+- NVFP4 `ue4m3xe2m1` (per-16 UE4M3 scale, K=64) and MXFP4 `ue8m0xe2m1` (per-32 UE8M0, K=64) — fp4 path
+- MXFP6 `ue8m0xe3m2` / `ue8m0xe2m3` — fp6, mixed K=32 path
+- MXFP8 `ue8m0xe4m3` / `ue8m0xe5m2` — fp8, mixed K=32 path
+
+Build filter: `CUTLASS_LIBRARY_KERNELS="cutlass3x_sm120_bstensorop_gemm_<fmt>_<fmt>_*_128x128x128_*cooperative*"`
+per format (narrow-N tiles trip the FP6 `ElementD` ≥128 static-assert; unity build fails the whole
+output-element group if one tile asserts). `TMPDIR=./tmp/nvcc` — nvcc spills multi-hundred-MB unity
+intermediates and the system `/tmp` is a 2 GB tmpfs.
+
+**Numbers** (RTX 5090, TFLOPS = 2·n³ / runtime; clock **locked at 2520 MHz** to remove the boost/power
+confound):
+
+| format            | datapath | n=8192 | n=16384 |
+|-------------------|----------|--------|---------|
+| NVFP4 (e2m1)      | K=64     | 1447   | 809     |
+| MXFP4 (e2m1)      | K=64     | 1396   | 858     |
+| MXFP8 (e4m3/e5m2) | K=32     | ~660   | ~448    |
+| MXFP6 (e3m2/e2m3) | K=32     | ~405   | ~416    |
+
+**Read — the ISA ratio holds, but FP6 is the *least* of the three, not equal to FP8.**
+
+1. **It is not throttling** (the first, wrong, guess). Absolute TFLOPS drop from n=8192→16384 for FP4
+   and FP8 even with the clock pinned — so the size-dependence is clock-invariant. The mechanism is
+   **L2 residency**: GB202's L2 is ~96 MB; FP4's A+B at n=8192 is 64 MB → fits → near-peak, at n=16384
+   is 256 MB → spills to DRAM → ~half. FP8's operands are 2× the bytes so it is already below peak at
+   8192 (128 MB) and degrades the same way. Realized fp4/fp8 throughput is L2-working-set-bound, not
+   throttled. (Knee predicted where 2·n²·bpe crosses ~96 MB; the locked-clock size sweep to nail it
+   exactly is a follow-up.)
+2. **FP6 is flat — ~405–420 TFLOPS across every clock and every size.** That flatness is the signature
+   of a fixed bottleneck that is neither the clock nor L2: unpacking the packed 6-bit operands into the
+   8-bit-slot form the `mxf8f6f4` datapath consumes. FP6 is **unpack/ALU-bound, not MMA-bound**, so it
+   never reaches the FP8 tensor-core rate — measured FP6 ≈ 0.6× FP8 and stuck there. CUTLASS's SM120
+   FP6 kernel also only ships the slow `align128_cooperative_q` epilogue (FP4 got a fast `align32_o_vs`
+   variant worth ~3× on the same tile); there is no tuned FP6 GEMM that realizes the datapath peak.
+
+**Conclusion.** FP6 on Blackwell has **no throughput advantage over FP8 — today it is slower** — and the
+shared `mxf8f6f4` K=32 datapath caps it at half the FP4 rate by construction. Combined with a larger
+footprint than Q4_0 (6-bit + UE8M0 micro-scale ≈ 6.5–6.75 bpw vs ~4.5), FP6 is strictly dominated for
+the fp4-speed-parity goal: it is the K=32 tier (same as the already-rejected W4A8/FP8 route) at a bigger
+size and, in practice, a worse kernel. `N4_K` remains the only lever that moves the floor at fp4 speed.
