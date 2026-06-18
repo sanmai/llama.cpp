@@ -957,21 +957,21 @@ private:
                 uint32_t hp_nct = 0;
                 uint32_t hp_nex = 0;
 
-                // a separate draft model whose arch depends on the target context
-                // (gemma4-assistant, eagle3) cannot build a context without ctx_other, so the
-                // probe would fail and --fit would reserve nothing -> the draft OOMs later.
-                // provide a metadata-only (no_alloc) stub of the target model as ctx_other so
-                // the probe succeeds. the stub mirrors the target context (the draft's memory
-                // is sized from ctx_other); no_alloc means no model/backend buffers are
-                // allocated for it. stub_model is declared first so the context (which
-                // references the model) is destroyed before it.
+                // A separate draft model whose arch needs ctx_other (gemma4-assistant, eagle3)
+                // cannot build a context for the probe without it, so --fit would reserve
+                // nothing and the draft would OOM later. Use a no_alloc stub of the target as
+                // ctx_other (mirrors the target; the draft's memory is sized from it).
+                // stub_model is declared first so stub_ctx is destroyed before it.
                 llama_model_ptr   stub_model;
                 llama_context_ptr stub_ctx;
+                bool stub_attempted = false;
 
                 auto ensure_stub_ctx_other = [&]() -> bool {
-                    if (stub_ctx) {
-                        return true;
+                    if (stub_attempted) {
+                        return stub_ctx != nullptr;
                     }
+                    stub_attempted = true;
+
                     llama_model_params stub_mparams = common_model_params_to_llama(params_base);
                     stub_mparams.no_alloc = true;
                     stub_mparams.use_mmap = false;
@@ -990,9 +990,9 @@ private:
                     return true;
                 };
 
-                // proactively build the stub for the known archs (keeps the common path clean
-                // of the ctx_other init error); the catch below also retries with a stub, so a
-                // future draft arch with the same requirement still gets reserved.
+                // Known draft architectures that need ctx_other get a stub up front to avoid
+                // the expected init error. Retry once for future draft architectures with the
+                // same requirement.
                 if (has_draft && (spec_mtp || spec_eagle3)) {
                     ensure_stub_ctx_other();
                 }
@@ -1031,7 +1031,6 @@ private:
                                 total / (1024.0 * 1024.0));
                         break;
                     } catch (const std::exception & e) {
-                        // some other draft arch may also require ctx_other; retry once with a stub
                         if (attempt == 0 && has_draft && cparams_dft.ctx_other == nullptr && ensure_stub_ctx_other()) {
                             continue;
                         }
