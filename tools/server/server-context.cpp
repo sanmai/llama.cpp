@@ -962,64 +962,83 @@ private:
                 // probe would fail and --fit would reserve nothing -> the draft OOMs later.
                 // provide a metadata-only (no_alloc) stub of the target model as ctx_other so
                 // the probe succeeds. the stub mirrors the target context (the draft's memory
-                // is sized from ctx_other) and, being no_alloc, costs no real allocations.
-                llama_model   * stub_model = nullptr;
-                llama_context * stub_ctx   = nullptr;
-                if (has_draft && (spec_mtp || spec_eagle3)) {
+                // is sized from ctx_other); no_alloc means no model/backend buffers are
+                // allocated for it. stub_model is declared first so the context (which
+                // references the model) is destroyed before it.
+                llama_model_ptr   stub_model;
+                llama_context_ptr stub_ctx;
+
+                auto ensure_stub_ctx_other = [&]() -> bool {
+                    if (stub_ctx) {
+                        return true;
+                    }
                     llama_model_params stub_mparams = common_model_params_to_llama(params_base);
                     stub_mparams.no_alloc = true;
                     stub_mparams.use_mmap = false;
-                    stub_model = llama_model_load_from_file(params_base.model.path.c_str(), stub_mparams);
-                    if (stub_model != nullptr) {
-                        llama_context_params stub_cparams = common_context_params_to_llama(params_base);
-                        stub_ctx = llama_init_from_model(stub_model, stub_cparams);
+                    stub_model.reset(llama_model_load_from_file(params_base.model.path.c_str(), stub_mparams));
+                    if (stub_model == nullptr) {
+                        SRV_DBG("%s", "[spec] failed to load target stub for the draft memory probe\n");
+                        return false;
                     }
-                    if (stub_ctx != nullptr) {
-                        cparams_dft.ctx_other = stub_ctx;
+                    llama_context_params stub_cparams = common_context_params_to_llama(params_base);
+                    stub_ctx.reset(llama_init_from_model(stub_model.get(), stub_cparams));
+                    if (stub_ctx == nullptr) {
+                        SRV_DBG("%s", "[spec] failed to create target stub context for the draft memory probe\n");
+                        return false;
                     }
+                    cparams_dft.ctx_other = stub_ctx.get();
+                    return true;
+                };
+
+                // proactively build the stub for the known archs (keeps the common path clean
+                // of the ctx_other init error); the catch below also retries with a stub, so a
+                // future draft arch with the same requirement still gets reserved.
+                if (has_draft && (spec_mtp || spec_eagle3)) {
+                    ensure_stub_ctx_other();
                 }
 
-                try {
-                    auto dmd = common_get_device_memory_data(
-                        params_dft.model.path.c_str(), &mparams_dft, &cparams_dft,
-                        devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+                for (int attempt = 0; attempt < 2; attempt++) {
+                    try {
+                        auto dmd = common_get_device_memory_data(
+                            params_dft.model.path.c_str(), &mparams_dft, &cparams_dft,
+                            devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
 
-                    GGML_ASSERT(!params_base.fit_params_target.empty());
-                    size_t total = 0;
+                        GGML_ASSERT(!params_base.fit_params_target.empty());
+                        size_t total = 0;
 
-                    std::vector<ggml_backend_dev_t> tgt_devices = params.devices;
+                        std::vector<ggml_backend_dev_t> tgt_devices = params.devices;
 
-                    if (tgt_devices.empty()) {
-                        for(size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                           tgt_devices.push_back(ggml_backend_dev_get(i));
-                        }
-                    }
-
-                    for (size_t j = 0; j < devs.size(); ++j) {
-                        const size_t bytes = (measure_model_bytes ? dmd[j].model : 0) + dmd[j].context + dmd[j].compute;
-                        total += bytes;
-                        for (size_t i = 0; i < tgt_devices.size(); i++) {
-                            if (tgt_devices[i] == devs[j]) {
-                                SRV_DBG("[spec] adding %.2f MiB to fit_params_target for device %s\n",
-                                        bytes / (1024.0 * 1024.0), ggml_backend_dev_name(devs[j]));
-                                params_base.fit_params_target[i] += bytes;
-                                break;
+                        if (tgt_devices.empty()) {
+                            for(size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                               tgt_devices.push_back(ggml_backend_dev_get(i));
                             }
                         }
-                    }
-                    SRV_INF("[spec] estimated memory usage of %s is %.2f MiB\n",
-                            has_draft ? "draft model" : "MTP context",
-                            total / (1024.0 * 1024.0));
-                } catch (const std::exception & e) {
-                    SRV_WRN("[spec] failed to measure %s memory: %s\n",
-                            has_draft ? "draft model" : "MTP context", e.what());
-                }
 
-                if (stub_ctx != nullptr) {
-                    llama_free(stub_ctx);
-                }
-                if (stub_model != nullptr) {
-                    llama_model_free(stub_model);
+                        for (size_t j = 0; j < devs.size(); ++j) {
+                            const size_t bytes = (measure_model_bytes ? dmd[j].model : 0) + dmd[j].context + dmd[j].compute;
+                            total += bytes;
+                            for (size_t i = 0; i < tgt_devices.size(); i++) {
+                                if (tgt_devices[i] == devs[j]) {
+                                    SRV_DBG("[spec] adding %.2f MiB to fit_params_target for device %s\n",
+                                            bytes / (1024.0 * 1024.0), ggml_backend_dev_name(devs[j]));
+                                    params_base.fit_params_target[i] += bytes;
+                                    break;
+                                }
+                            }
+                        }
+                        SRV_INF("[spec] estimated memory usage of %s is %.2f MiB\n",
+                                has_draft ? "draft model" : "MTP context",
+                                total / (1024.0 * 1024.0));
+                        break;
+                    } catch (const std::exception & e) {
+                        // some other draft arch may also require ctx_other; retry once with a stub
+                        if (attempt == 0 && has_draft && cparams_dft.ctx_other == nullptr && ensure_stub_ctx_other()) {
+                            continue;
+                        }
+                        SRV_WRN("[spec] failed to measure %s memory: %s\n",
+                                has_draft ? "draft model" : "MTP context", e.what());
+                        break;
+                    }
                 }
             }
         }
