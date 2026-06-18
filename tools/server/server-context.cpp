@@ -953,40 +953,78 @@ private:
                 uint32_t hp_ngl = 0;
                 uint32_t hp_nct = 0;
                 uint32_t hp_nex = 0;
-                try {
-                    auto dmd = common_get_device_memory_data(
-                        params_dft.model.path.c_str(), &mparams_dft, &cparams_dft,
-                        devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
 
-                    GGML_ASSERT(!params_base.fit_params_target.empty());
-                    size_t total = 0;
+                // some draft architectures (gemma4-assistant, eagle3) cannot build a context
+                // without ctx_other (the target context), so the probe below throws. in that
+                // case retry once with a metadata-only (no_alloc) stub of the target model, so
+                // the draft's memory is still reserved by --fit instead of OOM-ing later.
+                llama_model   * stub_model = nullptr;
+                llama_context * stub_ctx   = nullptr;
 
-                    std::vector<ggml_backend_dev_t> tgt_devices = params.devices;
+                for (int attempt = 0; attempt < 2; attempt++) {
+                    try {
+                        auto dmd = common_get_device_memory_data(
+                            params_dft.model.path.c_str(), &mparams_dft, &cparams_dft,
+                            devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
 
-                    if (tgt_devices.empty()) {
-                        for(size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                           tgt_devices.push_back(ggml_backend_dev_get(i));
-                        }
-                    }
+                        GGML_ASSERT(!params_base.fit_params_target.empty());
+                        size_t total = 0;
 
-                    for (size_t j = 0; j < devs.size(); ++j) {
-                        const size_t bytes = (measure_model_bytes ? dmd[j].model : 0) + dmd[j].context + dmd[j].compute;
-                        total += bytes;
-                        for (size_t i = 0; i < tgt_devices.size(); i++) {
-                            if (tgt_devices[i] == devs[j]) {
-                                SRV_DBG("[spec] adding %.2f MiB to fit_params_target for device %s\n",
-                                        bytes / (1024.0 * 1024.0), ggml_backend_dev_name(devs[j]));
-                                params_base.fit_params_target[i] += bytes;
-                                break;
+                        std::vector<ggml_backend_dev_t> tgt_devices = params.devices;
+
+                        if (tgt_devices.empty()) {
+                            for(size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                               tgt_devices.push_back(ggml_backend_dev_get(i));
                             }
                         }
+
+                        for (size_t j = 0; j < devs.size(); ++j) {
+                            const size_t bytes = (measure_model_bytes ? dmd[j].model : 0) + dmd[j].context + dmd[j].compute;
+                            total += bytes;
+                            for (size_t i = 0; i < tgt_devices.size(); i++) {
+                                if (tgt_devices[i] == devs[j]) {
+                                    SRV_DBG("[spec] adding %.2f MiB to fit_params_target for device %s\n",
+                                            bytes / (1024.0 * 1024.0), ggml_backend_dev_name(devs[j]));
+                                    params_base.fit_params_target[i] += bytes;
+                                    break;
+                                }
+                            }
+                        }
+                        SRV_INF("[spec] estimated memory usage of %s is %.2f MiB\n",
+                                has_draft ? "draft model" : "MTP context",
+                                total / (1024.0 * 1024.0));
+                        break;
+                    } catch (const std::exception & e) {
+                        if (attempt == 0 && has_draft && cparams_dft.ctx_other == nullptr) {
+                            // build a cheap stub of the target model (metadata only) to satisfy
+                            // the draft graph's dependency on the target context
+                            llama_model_params stub_mparams = common_model_params_to_llama(params_base);
+                            stub_mparams.no_alloc = true;
+                            stub_mparams.use_mmap = false;
+                            stub_model = llama_model_load_from_file(params_base.model.path.c_str(), stub_mparams);
+                            if (stub_model != nullptr) {
+                                // mirror the target context: the draft's memory is sized from
+                                // ctx_other, so the stub must use the same n_ctx (no_alloc keeps
+                                // it free of real allocations)
+                                llama_context_params stub_cparams = common_context_params_to_llama(params_base);
+                                stub_ctx = llama_init_from_model(stub_model, stub_cparams);
+                            }
+                            if (stub_ctx != nullptr) {
+                                cparams_dft.ctx_other = stub_ctx;
+                                continue; // retry the probe with the stub target context
+                            }
+                        }
+                        SRV_WRN("[spec] failed to measure %s memory: %s\n",
+                                has_draft ? "draft model" : "MTP context", e.what());
+                        break;
                     }
-                    SRV_INF("[spec] estimated memory usage of %s is %.2f MiB\n",
-                            has_draft ? "draft model" : "MTP context",
-                            total / (1024.0 * 1024.0));
-                } catch (const std::exception & e) {
-                    SRV_WRN("[spec] failed to measure %s memory: %s\n",
-                            has_draft ? "draft model" : "MTP context", e.what());
+                }
+
+                if (stub_ctx != nullptr) {
+                    llama_free(stub_ctx);
+                }
+                if (stub_model != nullptr) {
+                    llama_model_free(stub_model);
                 }
             }
         }
