@@ -957,16 +957,14 @@ private:
                 uint32_t hp_nct = 0;
                 uint32_t hp_nex = 0;
 
-                // A separate draft model whose arch needs ctx_other (gemma4-assistant, eagle3)
-                // cannot build a context for the probe without it, so --fit would reserve
-                // nothing and the draft would OOM later. Use a no_alloc stub of the target as
-                // ctx_other (mirrors the target; the draft's memory is sized from it).
+                // Some draft models need a target context to build their graph. Use a no_alloc
+                // target stub during --fit so the draft memory is included in the estimate.
                 // stub_model is declared first so stub_ctx is destroyed before it.
                 llama_model_ptr   stub_model;
                 llama_context_ptr stub_ctx;
                 bool stub_attempted = false;
 
-                auto ensure_stub_ctx_other = [&]() -> bool {
+                auto try_set_stub_ctx_other = [&]() -> bool {
                     if (stub_attempted) {
                         return stub_ctx != nullptr;
                     }
@@ -990,11 +988,9 @@ private:
                     return true;
                 };
 
-                // Known draft architectures that need ctx_other get a stub up front to avoid
-                // the expected init error. Retry once for future draft architectures with the
-                // same requirement.
+                // Avoid the known ctx_other probe failure for MTP/EAGLE3; otherwise retry once.
                 if (has_draft && (spec_mtp || spec_eagle3)) {
-                    ensure_stub_ctx_other();
+                    try_set_stub_ctx_other();
                 }
 
                 for (int attempt = 0; attempt < 2; attempt++) {
@@ -1009,8 +1005,8 @@ private:
                         std::vector<ggml_backend_dev_t> tgt_devices = params.devices;
 
                         if (tgt_devices.empty()) {
-                            for(size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                               tgt_devices.push_back(ggml_backend_dev_get(i));
+                            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                                tgt_devices.push_back(ggml_backend_dev_get(i));
                             }
                         }
 
@@ -1031,7 +1027,7 @@ private:
                                 total / (1024.0 * 1024.0));
                         break;
                     } catch (const std::exception & e) {
-                        if (attempt == 0 && has_draft && cparams_dft.ctx_other == nullptr && ensure_stub_ctx_other()) {
+                        if (attempt == 0 && has_draft && cparams_dft.ctx_other == nullptr && try_set_stub_ctx_other()) {
                             continue;
                         }
                         SRV_WRN("[spec] failed to measure %s memory: %s\n",
