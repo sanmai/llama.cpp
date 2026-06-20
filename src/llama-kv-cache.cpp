@@ -105,6 +105,12 @@ llama_kv_cache::llama_kv_cache(
     // draft default and oversized views would overflow the source tensors
     if (other) {
         const uint32_t size_other = other->get_size();
+        if (getenv("LLAMA_DEBUG_STUB_MEM")) {
+            // validate the --fit stub: the draft inherits its cell count from ctx_other,
+            // so this must match between the no_alloc stub probe and the real target
+            LLAMA_LOG_INFO("%s: [stub-check] ctx_other size_other = %u (requested kv_size = %u)\n",
+                    __func__, size_other, kv_size);
+        }
         if (kv_size != size_other) {
             LLAMA_LOG_WARN("%s: kv_size = %u overridden to %u to match the shared source cache\n", __func__, kv_size, size_other);
             kv_size = size_other;
