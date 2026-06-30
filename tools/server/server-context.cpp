@@ -1083,12 +1083,7 @@ private:
 
         // optionally reserve VRAM for the draft / MTP context before fitting the target model
         if (params_base.fit_params) {
-            const bool spec_mtp = std::find(params_base.speculative.types.begin(),
-                                            params_base.speculative.types.end(),
-                                            COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
-            const bool has_draft = params_base.speculative.has_dft();
-
-            if (has_draft || spec_mtp) {
+            if (has_spec) {
                 common_params params_dft = params_base;
                 bool measure_model_bytes = true;
 
