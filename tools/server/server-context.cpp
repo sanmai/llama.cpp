@@ -1151,8 +1151,8 @@ private:
                     std::vector<ggml_backend_dev_t> tgt_devices = params.devices;
 
                     if (tgt_devices.empty()) {
-                        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                            tgt_devices.push_back(ggml_backend_dev_get(i));
+                        for(size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                           tgt_devices.push_back(ggml_backend_dev_get(i));
                         }
                     }
 
