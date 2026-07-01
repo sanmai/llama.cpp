@@ -1558,7 +1558,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                // honor a per-round cap from the driver (dp.n_max); params.n_max is the ceiling
+                const int cap = dp.n_max > 0 ? std::min(params.n_max, (int) dp.n_max) : params.n_max;
+                if (cap <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;

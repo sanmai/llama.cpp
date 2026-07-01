@@ -297,6 +297,14 @@ struct server_slot {
     int32_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<int32_t> n_accepted_per_pos; // Accepted tokens per draft position
 
+    // adaptive draft depth: throughput hill-climb over depth (extremum seeking); spec_depth 0 = ceiling
+    int32_t spec_depth       = 0;
+    int32_t spec_hc_dir      = -1;    // probe direction (start downward from the ceiling)
+    int32_t spec_hc_steps    = 0;     // verify steps in the current throughput window
+    int32_t spec_hc_tokens   = 0;     // tokens emitted in the current window
+    int64_t spec_hc_t0_us    = 0;     // window start time (us); 0 = uninitialized
+    float   spec_hc_prev_tps = -1.0f; // throughput (tok/s) at the previous depth; -1 = uninitialized
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -324,6 +332,13 @@ struct server_slot {
         n_draft_accepted = 0;
         n_draft_verif_steps = 0;
         n_accepted_per_pos.clear();
+
+        spec_depth       = 0;
+        spec_hc_dir      = -1;
+        spec_hc_steps    = 0;
+        spec_hc_tokens   = 0;
+        spec_hc_t0_us    = 0;
+        spec_hc_prev_tps = -1.0f;
 
         task_prev = std::move(task);
         task.reset();
@@ -442,6 +457,14 @@ struct server_slot {
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
         return n_draft_max;
+    }
+
+    // adaptive draft cap for the next round: the controller's target depth (spec_depth, 0 = the
+    // ceiling) clamped by what fits the context. The configured n_max stays the ceiling so the
+    // output buffer (sized 1 + n_max at init) is never exceeded.
+    int32_t spec_draft_cap(int32_t n_draft_max, int32_t ceiling) const {
+        const int32_t depth = spec_depth > 0 ? spec_depth : ceiling;
+        return std::min(n_draft_max, depth);
     }
 
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
@@ -2977,9 +3000,16 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
+                        // adaptive draft depth (opt-in): throttle this round's cap toward the
+                        // acceptance-optimal depth; the configured n_max stays the ceiling.
+                        static const bool adaptive = getenv("LLAMA_SPEC_ADAPTIVE_DEPTH") != nullptr;
+                        const int32_t n_draft_cap = adaptive
+                            ? slot.spec_draft_cap(n_draft_max, common_speculative_n_max(&params_base.speculative))
+                            : n_draft_max;
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
+                            /* .n_max    = */ n_draft_cap,
                             /* .n_past   = */ slot.prompt.n_tokens(),
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
@@ -3841,6 +3871,38 @@ private:
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
+
+                // adaptive draft depth: hill-climb the depth toward peak throughput (tok/s). A pure
+                // acceptance signal can't locate the peak (it sits at acc ~0.83 for echo but ~0.71
+                // for reasoning), so we optimize measured throughput directly: sample tok/s over a
+                // window of verify steps, step depth +/-1, and reverse when it regresses. This is
+                // stable (oscillates +/-1 around the peak) and pulls a too-high ceiling back down.
+                // Runs every round (before any early return); spec_draft_cap() applies it next round.
+                static const bool adaptive = getenv("LLAMA_SPEC_ADAPTIVE_DEPTH") != nullptr;
+                if (adaptive) {
+                    constexpr int32_t hc_window   = 16;    // verify steps per throughput sample
+                    constexpr float   hc_deadband = 0.99f; // reverse only on a >1% regression
+
+                    const int32_t ceiling = common_speculative_n_max(&params_base.speculative);
+                    const int64_t now = ggml_time_us();
+                    if (slot.spec_hc_t0_us == 0) {
+                        slot.spec_hc_t0_us = now;
+                        slot.spec_depth    = ceiling;
+                    }
+                    slot.spec_hc_tokens += (int32_t) accepted.size();
+                    if (++slot.spec_hc_steps >= hc_window) {
+                        const float dt  = (float) (now - slot.spec_hc_t0_us) * 1e-6f;
+                        const float tps = dt > 0.0f ? (float) slot.spec_hc_tokens / dt : 0.0f;
+                        if (slot.spec_hc_prev_tps >= 0.0f && tps < slot.spec_hc_prev_tps * hc_deadband) {
+                            slot.spec_hc_dir = -slot.spec_hc_dir; // regressed -> reverse
+                        }
+                        slot.spec_depth = std::min(ceiling, std::max<int32_t>(1, slot.spec_depth + slot.spec_hc_dir));
+                        slot.spec_hc_prev_tps = tps;
+                        slot.spec_hc_steps    = 0;
+                        slot.spec_hc_tokens   = 0;
+                        slot.spec_hc_t0_us    = now;
+                    }
+                }
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
