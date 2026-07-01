@@ -222,6 +222,20 @@ is ~1.6-1.8x. This is the number to quote, not the "+89% vs n=4" framing. Both m
 a near-identical no-spec floor (~40 t/s) and a ~2x floor at n=1; they diverge at depth -
 gemma peaks then collapses, Qwen plateaus.
 
+### p_min ablation at n_max=16 (what the gate is worth)
+
+```
+task       p_min=0.0   p_min=0.8   draft toks (0.0 -> 0.8)   acc (0.0 -> 0.8)
+replace    187 t/s     218 t/s     6113 -> 4529              0.61 -> 0.83
+refactor   143 t/s     163 t/s     8251 -> 5044              0.43 -> 0.71
+```
+
+The gate prunes 30-60% of proposed tokens - the low-confidence tail that gets rejected anyway
+- for ~+15% throughput on both echo and reasoning, at the same accepted run length. Note
+`p_min=0.0` at n=16 (187/143) still beats n=4 (118/112): most of the 2x is the higher cap;
+`p_min` is the multiplier that also makes the cap safe on low-confidence content. This is why
+per-token gating beats the round-level controller.
+
 ## Recommendation
 
 1. **Static bump first (no code):** `n_max = 12`, `p_min ~= 0.80-0.85`. Robust +42% to +89%
