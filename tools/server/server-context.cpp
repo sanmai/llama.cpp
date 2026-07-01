@@ -297,9 +297,9 @@ struct server_slot {
     int32_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<int32_t> n_accepted_per_pos; // Accepted tokens per draft position
 
-    // adaptive draft depth (AIMD on the EWMA of per-round acceptance); spec_depth 0 = "use ceiling"
+    // adaptive draft depth: aim one past the EWMA of the accepted run length; spec_depth 0 = ceiling
     int32_t spec_depth    = 0;
-    float   spec_acc_ewma = -1.0f; // -1 = uninitialized
+    float   spec_len_ewma = -1.0f; // EWMA of accepted tokens per verify round; -1 = uninitialized
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -330,7 +330,7 @@ struct server_slot {
         n_accepted_per_pos.clear();
 
         spec_depth    = 0;
-        spec_acc_ewma = -1.0f;
+        spec_len_ewma = -1.0f;
 
         task_prev = std::move(task);
         task.reset();
@@ -3864,27 +3864,21 @@ private:
 
                 GGML_ASSERT(accepted.size() >= 1);
 
-                // adaptive draft depth: update the EWMA of this round's acceptance and AIMD the
-                // target depth toward where marginal acceptance ~ acc_grow_above. Runs every round
+                // adaptive draft depth: aim one past the EWMA of the accepted run length. Drafting
+                // well beyond the typical run just gets rejected; drafting under it leaves
+                // acceptance on the table; the +1 is the probe that lets depth climb when runs
+                // lengthen. Threshold-free, self-tuning to the content's regime. Runs every round
                 // (before any early return); spec_draft_cap() applies spec_depth next round.
                 {
-                    constexpr float acc_ewma_alpha   = 0.5f;  // EWMA responsiveness
-                    constexpr float acc_grow_above   = 0.80f; // additive-increase threshold
-                    constexpr float acc_shrink_below = 0.50f; // multiplicative-decrease threshold
-
-                    const float acc = (float) (accepted.size() - 1) / (float) n_draft;
-                    slot.spec_acc_ewma = slot.spec_acc_ewma < 0.0f
-                        ? acc
-                        : acc_ewma_alpha * acc + (1.0f - acc_ewma_alpha) * slot.spec_acc_ewma;
+                    constexpr float alpha = 0.5f; // EWMA responsiveness
+                    const int32_t n_acc = (int32_t) (accepted.size() - 1); // accepted draft tokens
+                    slot.spec_len_ewma = slot.spec_len_ewma < 0.0f
+                        ? (float) n_acc
+                        : alpha * (float) n_acc + (1.0f - alpha) * slot.spec_len_ewma;
 
                     const int32_t ceiling = common_speculative_n_max(&params_base.speculative);
-                    int32_t depth = slot.spec_depth > 0 ? slot.spec_depth : ceiling;
-                    if (slot.spec_acc_ewma > acc_grow_above) {
-                        depth = std::min(ceiling, depth + 1);
-                    } else if (slot.spec_acc_ewma < acc_shrink_below) {
-                        depth = std::max<int32_t>(1, depth / 2);
-                    }
-                    slot.spec_depth = depth;
+                    const int32_t target  = (int32_t) (slot.spec_len_ewma + 0.5f) + 1; // round(run) + 1
+                    slot.spec_depth = std::min(ceiling, std::max<int32_t>(1, target));
                 }
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
