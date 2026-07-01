@@ -222,19 +222,44 @@ is ~1.6-1.8x. This is the number to quote, not the "+89% vs n=4" framing. Both m
 a near-identical no-spec floor (~40 t/s) and a ~2x floor at n=1; they diverge at depth -
 gemma peaks then collapses, Qwen plateaus.
 
-### p_min ablation at n_max=16 (what the gate is worth)
+### Cap vs gate: the full 2x2 (tok/s), and its model-dependence
+
+Measured no-spec floor (pure target, draft disabled): gemma 47, Qwen 50 (the earlier ~40/42
+estimate from tg/mean_len at n=1 undercounted - n=1 carries draft overhead). So n=16 is ~4.5x
+no-spec on both.
+
+gemma (echo=replace / reasoning=refactor):
 
 ```
-task       p_min=0.0   p_min=0.8   draft toks (0.0 -> 0.8)   acc (0.0 -> 0.8)
-replace    187 t/s     218 t/s     6113 -> 4529              0.61 -> 0.83
-refactor   143 t/s     163 t/s     8251 -> 5044              0.43 -> 0.71
+             p_min=0.0   p_min=0.8
+replace  n4    121.7       118.2
+replace  n16   187.5       218.4
+refactor n4    107.6       112.2
+refactor n16   143.2       163.5
 ```
 
-The gate prunes 30-60% of proposed tokens - the low-confidence tail that gets rejected anyway
-- for ~+15% throughput on both echo and reasoning, at the same accepted run length. Note
-`p_min=0.0` at n=16 (187/143) still beats n=4 (118/112): most of the 2x is the higher cap;
-`p_min` is the multiplier that also makes the cap safe on low-confidence content. This is why
-per-token gating beats the round-level controller.
+Gate at n=16, both models x both content types (tok/s):
+
+```
+model  content     p=0.0   p=0.8   gate
+gemma  recitation  187     218     +16%
+gemma  reasoning   143     163     +14%
+Qwen   recitation  227     225     ~0
+Qwen   reasoning   140     178     +27%
+```
+
+Clean decomposition:
+- Cap (n4 -> n16, gate off): +54%/+33% (gemma echo/reason), +60% (Qwen echo). The cap is the
+  primary lever - beats n=4 on its own.
+- Gate (p 0.0 -> 0.8) is **waste-dependent, not model-dependent**: it pays wherever the head
+  drafts deep-but-wrong. On reasoning BOTH heads guess badly at depth (Qwen acc 0.40 -> 0.95,
+  draft tokens 8862 -> 3727), so the gate is a big win on both (+14% to +27%). The lone neutral
+  cell is Qwen on pure recitation - its growing-KV head is actually accurate that deep, so
+  there's no tail to prune. At n=4 the gate is neutral on both (no deep tail yet). So on
+  realistic mixed traffic the gate helps both models; the earlier "neutral on Qwen" was an
+  echo-only artifact. Still not a global default (inert at the shipped n_max=3, and a global
+  param governing draft-model/n-gram paths too). This is also why per-token gating beats the
+  round-level controller.
 
 ## Recommendation
 
