@@ -297,6 +297,10 @@ struct server_slot {
     int32_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<int32_t> n_accepted_per_pos; // Accepted tokens per draft position
 
+    // adaptive draft depth (AIMD on the EWMA of per-round acceptance); spec_depth 0 = "use ceiling"
+    int32_t spec_depth    = 0;
+    float   spec_acc_ewma = -1.0f; // -1 = uninitialized
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -324,6 +328,9 @@ struct server_slot {
         n_draft_accepted = 0;
         n_draft_verif_steps = 0;
         n_accepted_per_pos.clear();
+
+        spec_depth    = 0;
+        spec_acc_ewma = -1.0f;
 
         task_prev = std::move(task);
         task.reset();
@@ -442,6 +449,14 @@ struct server_slot {
         SLT_DBG(*this, "max possible draft: %d\n", n_draft_max);
 
         return n_draft_max;
+    }
+
+    // adaptive draft cap for the next round: the controller's target depth (spec_depth, 0 = the
+    // ceiling) clamped by what fits the context. The configured n_max stays the ceiling so the
+    // output buffer (sized 1 + n_max at init) is never exceeded.
+    int32_t spec_draft_cap(int32_t n_draft_max, int32_t ceiling) const {
+        const int32_t depth = spec_depth > 0 ? spec_depth : ceiling;
+        return std::min(n_draft_max, depth);
     }
 
     // add sampled token of this slot to the batch, optionally add the speculative draft tokens if any
@@ -2977,9 +2992,16 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
+                        // adaptive draft depth (opt-in): throttle this round's cap toward the
+                        // acceptance-optimal depth; the configured n_max stays the ceiling.
+                        static const bool adaptive = getenv("LLAMA_SPEC_ADAPTIVE_DEPTH") != nullptr;
+                        const int32_t n_draft_cap = adaptive
+                            ? slot.spec_draft_cap(n_draft_max, common_speculative_n_max(&params_base.speculative))
+                            : n_draft_max;
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
+                            /* .n_max    = */ n_draft_cap,
                             /* .n_past   = */ slot.prompt.n_tokens(),
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
@@ -3841,6 +3863,29 @@ private:
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
+
+                // adaptive draft depth: update the EWMA of this round's acceptance and AIMD the
+                // target depth toward where marginal acceptance ~ acc_grow_above. Runs every round
+                // (before any early return); spec_draft_cap() applies spec_depth next round.
+                {
+                    constexpr float acc_ewma_alpha   = 0.5f;  // EWMA responsiveness
+                    constexpr float acc_grow_above   = 0.80f; // additive-increase threshold
+                    constexpr float acc_shrink_below = 0.50f; // multiplicative-decrease threshold
+
+                    const float acc = (float) (accepted.size() - 1) / (float) n_draft;
+                    slot.spec_acc_ewma = slot.spec_acc_ewma < 0.0f
+                        ? acc
+                        : acc_ewma_alpha * acc + (1.0f - acc_ewma_alpha) * slot.spec_acc_ewma;
+
+                    const int32_t ceiling = common_speculative_n_max(&params_base.speculative);
+                    int32_t depth = slot.spec_depth > 0 ? slot.spec_depth : ceiling;
+                    if (slot.spec_acc_ewma > acc_grow_above) {
+                        depth = std::min(ceiling, depth + 1);
+                    } else if (slot.spec_acc_ewma < acc_shrink_below) {
+                        depth = std::max<int32_t>(1, depth / 2);
+                    }
+                    slot.spec_depth = depth;
+                }
 
                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
 
