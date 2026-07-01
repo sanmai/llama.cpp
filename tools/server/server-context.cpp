@@ -1115,6 +1115,26 @@ private:
                 uint32_t hp_ngl = 0;
                 uint32_t hp_nct = 0;
                 uint32_t hp_nex = 0;
+
+                // Gemma4-assistant's separate draft model needs a target context (ctx_other)
+                // to build its graph, but the target does not exist yet during --fit. Build a
+                // no_alloc target stub so the draft memory probe succeeds and its VRAM is
+                // reserved. stub_model is declared first so stub_ctx is destroyed before it.
+                llama_model_ptr   stub_model;
+                llama_context_ptr stub_ctx;
+
+                if (has_draft && spec_mtp) {
+                    llama_model_params stub_mparams = common_model_params_to_llama(params_base);
+                    stub_mparams.no_alloc = true;
+                    stub_mparams.use_mmap = false;
+                    stub_model.reset(llama_model_load_from_file(params_base.model.path.c_str(), stub_mparams));
+                    if (stub_model != nullptr) {
+                        llama_context_params stub_cparams = common_context_params_to_llama(params_base);
+                        stub_ctx.reset(llama_init_from_model(stub_model.get(), stub_cparams));
+                        cparams_dft.ctx_other = stub_ctx.get();
+                    }
+                }
+
                 try {
                     auto dmd = common_get_device_memory_data(
                         params_dft.model.path.c_str(), &mparams_dft, &cparams_dft,
