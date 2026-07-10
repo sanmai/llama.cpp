@@ -2538,6 +2538,49 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * tensor) {
+    const bool is_id = tensor->op == GGML_OP_MUL_MAT_ID;
+    if (tensor->op != GGML_OP_MUL_MAT && !is_id) {
+        return false;
+    }
+
+    const ggml_tensor * src0 = tensor->src[0];
+    const ggml_tensor * src1 = tensor->src[1];
+    const ggml_tensor * dst  = tensor;
+
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                                   ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) &&
+                                   src0->view_src;
+
+    if (bad_padding_clear || !ggml_is_quantized(src0->type) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft) ||
+                       ggml_backend_buft_is_cuda_split(src1->buffer->buft);
+    if (split) {
+        return false;
+    }
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+    // mul_mat_id: mirror the routing in ggml_cuda_mul_mat_id - mmq is used only when the
+    // mul_mat_vec_q path is not eligible (otherwise the dedicated MoE vec kernel handles it).
+    if (is_id) {
+        const int64_t ne2 = dst->ne[2];
+        const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+        const bool vec_q_eligible = ne2 <= MMVQ_MAX_BATCH_SIZE && ne2 <= mmvq_mmid_max;
+        return !vec_q_eligible && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], /*n_experts=*/src0->ne[2]);
+    }
+
+    // dense: smaller batches go through mul_mat_vec_q; only the MMQ regime is handled here
+    if (src1->ne[1] <= MMVQ_MAX_BATCH_SIZE) {
+        return false;
+    }
+
+    return ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts=*/0);
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     const bool split = ggml_backend_buft_is_cuda_split(src0->buffer->buft);
 
@@ -4192,6 +4235,113 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (fused_mul_mat_vec) {
         return fused_node_count - 1;
+    }
+
+    // mul_mat + mul(per-tensor scalar): fuse the NVFP4 global weight scale (weight_scale_2) epilogue
+    // into mmvq so an imported NVFP4 model matches the scale-free self-quant speed.
+    static const bool disable_scale_fusion = getenv("GGML_CUDA_DISABLE_SCALE_FUSION") != nullptr;
+    static const bool debug_scale_fusion   = getenv("GGML_CUDA_DEBUG_SCALE_FUSION")   != nullptr;
+
+    // Probe: for every mul_mat / mul_mat_id, find the first downstream mul that consumes it and
+    // report distance (adjacency), the scale operand shape, and mmvq/mmq eligibility.
+    if (debug_scale_fusion && (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID)) {
+        for (int j = i + 1; j < cgraph->n_nodes; ++j) {
+            const ggml_tensor * c = cgraph->nodes[j];
+            if (c->op != GGML_OP_MUL || (c->src[0] != node && c->src[1] != node)) {
+                continue;
+            }
+            const ggml_tensor * s = c->src[0] == node ? c->src[1] : c->src[0];
+            GGML_LOG_WARN("scale-fuse probe: %s=%s scale-mul@+%d adjacent=%d s.ne=[%ld,%ld,%ld,%ld] s.op=%s nelem=%ld\n",
+                          node->op == GGML_OP_MUL_MAT_ID ? "mmid" : "mm", node->name, j - i, (int) (j == i + 1),
+                          (long) s->ne[0], (long) s->ne[1], (long) s->ne[2], (long) s->ne[3],
+                          ggml_op_name(s->op), (long) ggml_nelements(s));
+            break;
+        }
+    }
+
+    if (!disable_scale_fusion && ggml_can_fuse(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL })) {
+        ggml_tensor * mm_node  = cgraph->nodes[i];
+        ggml_tensor * mul_node = cgraph->nodes[i + 1];
+
+        ggml_tensor * scale_tensor = nullptr;
+        if (mul_node->src[0] == mm_node) {
+            scale_tensor = mul_node->src[1];
+        } else if (mul_node->src[1] == mm_node) {
+            scale_tensor = mul_node->src[0];
+        }
+
+        const bool is_scalar = scale_tensor && scale_tensor->type == GGML_TYPE_F32 && ggml_nelements(scale_tensor) == 1;
+
+        if (is_scalar && ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
+            if (debug_scale_fusion) {
+                GGML_LOG_WARN("scale-fuse HIT (mmvq): %s\n", mul_node->name);
+            }
+            ggml_cuda_mm_fusion_args_host fusion_data{};
+            fusion_data.x_scale = scale_tensor;
+
+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, &fusion_data);
+            return 1;
+        }
+
+        if (is_scalar && ggml_cuda_should_fuse_mul_mat_q(mm_node)) {
+            if (debug_scale_fusion) {
+                GGML_LOG_WARN("scale-fuse HIT (mmq): %s\n", mul_node->name);
+            }
+            ggml_cuda_mul_mat_q(*cuda_ctx, mm_node->src[0], mm_node->src[1], mm_node->src[2], mul_node, scale_tensor);
+            return 1;
+        }
+    }
+
+    // mul_mat_id + reshape + repeat + get_rows + mul: fuse the per-expert NVFP4 scale (exps weight_scale_2).
+    // The reshape/repeat/get_rows gather exps_s[selected_experts]; the kernel reproduces that by indexing the
+    // raw {n_expert} scale per routed expert, eliding the whole gather and the mul. ggml_can_fuse_subgraph
+    // can't be used here: its view-source check rejects the reshape that views the external exps_s leaf.
+    if (!disable_scale_fusion && node->op == GGML_OP_MUL_MAT_ID && i + 4 < cgraph->n_nodes) {
+        ggml_tensor * mm_id    = cgraph->nodes[i];
+        ggml_tensor * reshape  = cgraph->nodes[i + 1];
+        ggml_tensor * repeat   = cgraph->nodes[i + 2];
+        ggml_tensor * get_rows = cgraph->nodes[i + 3];
+        ggml_tensor * mul      = cgraph->nodes[i + 4];
+        ggml_tensor * exps_s   = reshape->src[0];
+
+        const bool ok =
+            reshape->op  == GGML_OP_RESHAPE && repeat->op == GGML_OP_REPEAT &&
+            get_rows->op == GGML_OP_GET_ROWS && mul->op   == GGML_OP_MUL    &&
+            repeat->src[0]   == reshape  && get_rows->src[0] == repeat &&
+            get_rows->src[1] == mm_id->src[2] &&                          // same routing ids
+            (mul->src[0] == mm_id    || mul->src[1] == mm_id)    &&
+            (mul->src[0] == get_rows || mul->src[1] == get_rows) &&
+            exps_s && exps_s->type == GGML_TYPE_F32 &&
+            ggml_nelements(exps_s) == mm_id->src[0]->ne[2] &&             // one scale per expert
+            // the gather + matmul are elided, so they must feed only this subgraph
+            ggml_node_get_use_count(cgraph, i)     == 1 &&
+            ggml_node_get_use_count(cgraph, i + 1) == 1 &&
+            ggml_node_get_use_count(cgraph, i + 2) == 1 &&
+            ggml_node_get_use_count(cgraph, i + 3) == 1 &&
+            !(mm_id->flags & GGML_TENSOR_FLAG_OUTPUT);
+
+        if (ok) {
+            ggml_tensor * src0 = mm_id->src[0];
+            ggml_tensor * src1 = mm_id->src[1];
+            ggml_tensor * ids  = mm_id->src[2];
+
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_id)) {
+                if (debug_scale_fusion) {
+                    GGML_LOG_WARN("scale-fuse HIT (mmvq id): %s\n", mul->name);
+                }
+                ggml_cuda_mm_fusion_args_host fusion_data{};
+                fusion_data.x_scale = exps_s;
+                ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, mul, &fusion_data);
+                return 4;
+            }
+            if (ggml_cuda_should_fuse_mul_mat_q(mm_id)) {
+                if (debug_scale_fusion) {
+                    GGML_LOG_WARN("scale-fuse HIT (mmq id): %s\n", mul->name);
+                }
+                ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, ids, mul, exps_s);
+                return 4;
+            }
+        }
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
