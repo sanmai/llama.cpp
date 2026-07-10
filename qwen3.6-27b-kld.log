@@ -1,0 +1,165 @@
+# Qwen3.6-27B NVFP4 no-subnormal ceiling KLD (200 chunks, wikitext-2 test, c=512)
+
+Base: qwen3.6-27b-f16-kld-base.dat  (f16, -ngl 28 partial offload)
+Final f16 PPL = 6.7988 +/- 0.07550
+
+## Step 1 - UE4M3 subnormal-scale stats (scripts/nvfp4-subnormal-stats.py)
+qwen3.6-27b-nvfp4.gguf: 99.94% of 1.63e9 micro-scale codes subnormal.
+decoded scale: min_nz 9.77e-4, median 2.93e-3, p99.9 6.84e-3 (largest subnormal), max 0.117.
+=> the 3-bit-mantissa normal grid is essentially unused; per-16 scale is a 7-level log grid.
+N feasible [3, 10.9]; chose N=6 (encode *64, decode *2^-6).
+
+## Baselines (clean build, native FP4 / int MMQ, -ngl 999)
+
+nvfp4 (native FP4):
+  Mean PPL(Q)/PPL(base) : 1.057766 +/- 0.002385
+  Mean KLD              : 0.079068 +/- 0.001752
+  Same top p            : 89.041 +/- 0.138 %
+
+q4_0:
+  Mean PPL(Q)/PPL(base) : 1.033111 +/- 0.001835
+  Mean KLD              : 0.048516 +/- 0.001490
+  Same top p            : 91.737 +/- 0.122 %
+
+gap: nvfp4 0.079 vs q4_0 0.0485 -> nvfp4 ~63% worse KLD (gap 0.0306).
+
+## Ceiling (patched N=6 build, force-dequant path)
+nvfp4-nosubn:
+  Mean PPL(Q)/PPL(base) : 1.020608 +/- 0.001611
+  Mean KLD              : 0.040284 +/- 0.001395
+  Same top p            : 92.490 +/- 0.117 %
+
+RESULT: nvfp4-nosubn 0.0403 vs baseline nvfp4 0.0791 (-49%) and BEATS q4_0 0.0485 on all 3
+metrics (KLD, PPL ratio, top-p), at the same 4.6 bpw. The single global exponent shift (no
+per-tensor storage, no new type) more than closes the gap to q4_0.
+
+## N=0 control (standard nvfp4 gguf on force-dequant path = W4A16)
+  Mean PPL(Q)/PPL(base) : 1.035339 +/- 0.001857
+  Mean KLD              : 0.050030 +/- 0.001504
+  Same top p            : 91.482 +/- 0.124 %
+
+=> CONFOUND FOUND: native nvfp4 0.0791 vs dequant nvfp4 0.0500 for the SAME gguf. The 0.029 gap is
+the native FP4 path quantizing ACTIVATIONS to fp4 (W4A4) vs the dequant path keeping f16 (W4A16).
+Decompose:
+  - subnormal rescue (weight format), W4A16: 0.0500 -> 0.0403 = -19% (NOT -49%).
+  - activation fp4 (W4A4 vs W4A16): +0.029 KLD (dominant; weight fix can't touch it).
+  - "nvfp4-nosubn beats q4_0" was W4A16-vs-W4A8 -> RETRACTED. q4_0-W4A16 pending for fair compare.
+
+## Path/precision matrix (200 chunks, vs f16 base PPL 6.7930)
+config                       activations  weight scales  Mean KLD
+nvfp4 native (deployed)      fp4  (W4A4)  subnormal      0.07907
+nvfp4 dequant N=0 (control)  f16  (W4A16) subnormal      0.05003
+nvfp4 dequant no-subnormal   f16  (W4A16) normal         0.04028
+q4_0 native (deployed)       int8 (W4A8)  fp16           0.04852
+q4_0 dequant (W4A16)         f16  (W4A16) fp16           0.04815
+
+## Weight-format comparison (all W4A16, f16 acts, apples-to-apples)
+nvfp4 standard scales : 0.05003   (slightly worse than q4_0)
+q4_0                  : 0.04815
+nvfp4 no-subnormal    : 0.04028   <- BEATS q4_0 by -16%
+
+CONCLUSION:
+- subnormal fix flips nvfp4 weight format from behind q4_0 (0.0500) to ahead (0.0403 vs 0.0482).
+  Free, global exponent shift, no per-tensor storage, no new type.
+- DEPLOYED native FP4 (W4A4) stays behind q4_0 native (W4A8): activation-limited (+0.029 from fp4
+  acts). Native FP4 requires W4A4 (OMMA is fp4xfp4), so the activation penalty is intrinsic to the
+  speed path. q4_0 is ~insensitive to A8-vs-A16 (int8 acts near-lossless).
+
+## Native FP4 epilogue attempt (lifted gguf on the OMMA) - BROKEN
+[SUPERSEDED 2026-05-22 - the "kernel bug" diagnosis below is REFUTED. The breakage was the
+ write-back hack's path-coverage gap, not the OMMA. See "Native kernel WORKS" at the end.]
+Tried lifting scales + write-back compensation (mmq.cuh:3257, *2^-6 gated NVFP4):
+  lifted, dequant W4A16        : KLD 0.0403, top-p 92.49%  (correct, same hardware __nv_fp8_e4m3 decode)
+  lifted, native W4A4, no epi  : KLD 12.64,  top-p 0.000%  (catastrophic, non-uniform)
+  lifted, native W4A4, *2^-6   : KLD 3.87,   top-p 26.05%  (still broken, non-uniform)
+  N4_0  , native W4A4, *2^-6   : KLD 11.77,  top-p 0.05%   (expected - unlifted corrupted by /64)
+
+=> native FP4 OMMA rejects rebiased (normal-range) weight scales NON-uniformly. Uniform 2^-N can't
+fix (global factor preserves argmax; top-p ->0 means per-block corruption). Same lifted gguf is fine
+on dequant. LIKELY A GGML KERNEL BUG: real NVFP4 runs block scales up to 448 on this OMMA; ggml's
+native NVFP4 path only ever saw subnormal scales (99.94%), normal-range untested. Suspect
+load_tiles_nvfp4 scale packing / scale_vec::4X setup (mma.cuh:1145).
+
+FORK: weight-quality fix works only W4A16 (0.0403, beats q4_0, no FP4 speed) XOR native FP4 speed
+(stuck ~0.0791, W4A4-activation-limited, behind q4_0). Unlocking N4_K on the speed path needs the
+native kernel's normal-range scale handling fixed first.
+
+## Native-kernel bug LOCALIZED (2026-05-22) - warp-cooperative A-scale operand, masked by uniformity
+[SUPERSEDED / REFUTED 2026-05-22 - this localization was WRONG. The native OMMA handles
+ normal-range high-variance scales correctly; proof in "Native kernel WORKS" at the end. The
+ 26% was the *write-back* compensation missing matmul paths (MMVQ/stream-k/router) + compounding
+ across layers, exactly as PR #22196/#21074 review predicted (lanes select rows, not bytes).]
+Re-ran lifted gguf on stock-codec build (common.cuh NOT patched) + epilogue only: top-p 26.05%,
+PPL ratio 40.8 - IDENTICAL to the old run. So the codec patch was never the cause; the activation
+quantizer (quantize.cu:132) was a red herring.
+
+Instrumented the native path (host + device printf, --chunks 1) for absolute clarity:
+  [N4_K-DISPATCH] use_native_fp4=1 ids=0 (blk.0.attn_qkv) -> native OMMA path confirmed.
+  [N4_K-LT] load_tiles_nvfp4_nvfp4 runs; scale bytes load correctly and VARY within each 4-block
+            group (e.g. "29 40 25 28", "30 48 42 41"; exp 3-6, all normal range).
+  [N4_K-WB] write-back epilogue fires, exact /64 (0.013245->0.000207, 0.014732->0.000230).
+=> epilogue path is used and uniform /64 is applied. 26% is NOT a skipped/misapplied epilogue.
+   no-epi top-p 0% was mostly compounding 64x overflow across 65 layers, not per-block corruption.
+
+ROOT CAUSE (localized): the scale_vec::4X MMA (mma.cuh:1145) consumes the four per-16 UE4M3 weight
+scales as a WARP-COOPERATIVE packed register (vec_dot_fp4_fp4_mma:1020 "2 threads per quad supply
+the packed scale register", PTX {0,0} thread/byte selectors; lane map tidx_A = tx/4 + (tx%2)*8 at
+mmq.cuh:1022). That lane->sub-block mapping is only correct-by-coincidence when the 4 scales are
+near-equal. test-backend-ops PASSES because uniform[-1,1] init -> per-16 amax ~0.94 -> scales ~0.157
+with TINY variance -> a lane permutation swaps near-equal values -> error under NMSE tol. The
+all-subnormal deployed format (99.94% subnormal ~ equal tiny scales) hid it the same way. Lifted
+gguf has HIGH per-block amax variance -> the 4 scales differ a lot -> permutation swaps very
+different values -> per-block corruption -> top-p collapse. Dequant is immune (decodes each block's
+scale independently, no warp cooperation). Only the WEIGHT (A) scale changed between standard (89%,
+works) and lifted (26%, broken); both share the same B/activation path -> bug is in the A-scale
+operand assembly.
+
+NEXT: deterministic high-variance test (per-16 scales deliberately spread, e.g. 0.5 vs 0.01 in
+adjacent sub-blocks) comparing native MMQ vs CPU dequant -> will fail and pin the exact permutation;
+candidate fix sites: tidx_A lane map, x_sc column index (k0/tile_A::J), or the {0,0} PTX selectors.
+
+## Native kernel WORKS - subnormal rescue runs on the FP4 OMMA via the .scale epilogue (2026-05-22)
+
+The "kernel bug" above is refuted. PR review (#22196/#21074) showed the native scale operand is
+magnitude-independent (the four UE4M3 scales travel in one register, scale_vec::4X selectors {0,0};
+tidx_A picks the row, not the byte) and the generic path decodes each scale independently. The clean
+test confirms it: do the magnitude compensation in the GRAPH (per-tensor .scale via build_lora_mm's
+ggml_mul), not in the MMQ write-back. Then it covers EVERY matmul uniformly, kernel-agnostic.
+
+Mechanism (all on a STOCK inference binary, no write-back hack):
+- Quantizer (ggml-quants.c quantize_row_nvfp4_ref/_impl): encode the scale lifted into the normal
+  UE4M3 grid (arg *= 64) but compute E2M1 codes against the true-magnitude scale (decode /= 64).
+  Global ue4m3 codec stays stock, so the stored byte reads 64x too large on every path.
+- Producer (#22897 port in llama-quant.cpp): per-tensor .scale = sum(f32*dq)/sum(dq^2). Because the
+  stock decode reads the lifted byte at 64x, the LS formula AUTO-derives .scale = 2^-6 * bias
+  (measured ~0.01564, bias ~1.001) - no hand-coded 2^-6 needed.
+- Consumer: build_lora_mm / build_ffn apply .scale as ggml_mul after the matmul.
+
+Coverage caveat (the load-failure debugging): the .scale epilogue only covers matmul weights. Two
+NVFP4 paths have no .scale application and MUST stay unlifted (quantized q8_0):
+  - token_embd (read via get_rows) -> 64x embeddings from layer 0.
+  - nextn.eh_proj (build_lora_mm with no _s arg) + #22897 over-emits its scale -> done_getting_tensors
+    "expected 1874, got 1872" load failure (2 unconsumed scale tensors).
+Built with --token-embedding-type q8_0 --tensor-type eh_proj=q8_0 -> loads, runs, coherent.
+
+Result (qwen3.6-27b-nvfp4-canon2.gguf, 200 chunks, native FP4 path, vs the same f16 base):
+
+| config                              | acts        | weight scales | Mean KLD            | top-p   |
+|-------------------------------------|-------------|---------------|---------------------|---------|
+| nvfp4 native, OLD (subnormal)       | fp4  (W4A4) | subnormal     | 0.07907 +/- 0.00175 | 89.041% |
+| nvfp4 native, NEW (lift + .scale)   | fp4  (W4A4) | normal        | 0.06880 +/- 0.00155 | 89.737% |
+| nvfp4 dequant, canon2 (W4A16)       | f16  (W4A16)| normal        | 0.03961 +/- 0.00134 | 92.461% |
+| q4_0 native                         | int8 (W4A8) | fp16          | 0.04852 +/- 0.00149 | 91.737% |
+
+(W4A16 control: GGML_NVFP4_FORCE_DEQUANT=1, env gate in ggml_cuda_should_use_mmq -> cuBLAS dequant.)
+
+- Subnormal rescue NOW lands on the native speed path: 0.07907 -> 0.06880, -13% KLD, free (no new
+  type; normal-grid placement + .scale epilogue). The doc's "speed XOR quality" fork is half-closed:
+  the weight rescue is no longer dequant-only.
+- As a WEIGHT format (W4A16), canon2 nvfp4 0.03961 BEATS q4_0 0.04852 by -18% (top-p 92.46 vs
+  91.74), and edges the old global-pow2 ceiling (0.04028) - the per-tensor LS .scale is a touch
+  better than a uniform 2^-6 shift.
+- Still activation-limited on the speed path: 0.06880 (native W4A4) - 0.03961 (canon2 W4A16) =
+  0.02919 = the fp4 activation penalty (matches the prior +0.029). So native nvfp4 stays ~42% behind
+  q4_0 native (0.0688 vs 0.0485); the weight fix narrows but cannot close it (W4A4 is intrinsic to
+  the OMMA - fp4 x fp4, no int8-activation option).

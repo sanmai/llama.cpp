@@ -203,6 +203,7 @@ struct tensor_metadata {
     std::string     remapped_imatrix_name;
     bool            allows_quantization;
     bool            requires_imatrix;
+    bool            write_nvfp4_scales = false;
 };
 
 //
@@ -387,6 +388,7 @@ static ggml_type tensor_type_fallback(quantize_state_impl & qs, const ggml_tenso
             case GGML_TYPE_Q4_K:    return_type = GGML_TYPE_Q5_0;   break;
             case GGML_TYPE_Q5_K:    return_type = GGML_TYPE_Q5_1;   break;
             case GGML_TYPE_Q6_K:    return_type = GGML_TYPE_Q8_0;   break;
+            case GGML_TYPE_NVFP4:   return_type = GGML_TYPE_Q8_0;   break; // nvfp4 block 64 -> Q8_0 for odd shapes
             default:
                 throw std::runtime_error(format("no tensor type fallback is defined for type %s",
                                                 ggml_type_name(target_type)));
@@ -802,6 +804,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q1_0: return GGML_TYPE_Q1_0;
 
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
+        case LLAMA_FTYPE_MOSTLY_NVFP4:     return GGML_TYPE_NVFP4;
 
         // K-quants
         case LLAMA_FTYPE_MOSTLY_Q2_K_S:
@@ -848,6 +851,43 @@ static void init_quantize_state_counters(quantize_state_impl & qs, std::vector<t
         }
     }
     qs.n_ffn_down = qs.n_ffn_gate = qs.n_ffn_up = (int)qs.model.hparams.n_layer_all;
+}
+
+//
+// NVFP4 scale tensor helpers
+//
+
+static void add_f32_scale_tensor(struct gguf_context * ctx, const char * name, int64_t n) {
+    struct ggml_init_params iparams = {
+        /*.mem_size   =*/ ggml_tensor_overhead(),
+        /*.mem_buffer =*/ NULL,
+        /*.no_alloc   =*/ true,
+    };
+    struct ggml_context * gctx = ggml_init(iparams);
+    struct ggml_tensor * t = ggml_new_tensor_1d(gctx, GGML_TYPE_F32, n);
+    ggml_set_name(t, name);
+    gguf_add_tensor(ctx, t);
+    ggml_free(gctx);
+}
+
+static void add_nvfp4_scale_tensors(struct gguf_context * ctx, const char * weight_name, int64_t n_expert) {
+    std::string base(weight_name);
+
+    auto pos = base.rfind(".weight");
+    std::string scale_name = (pos != std::string::npos)
+        ? base.substr(0, pos) + ".scale"
+        : base + ".scale";
+    std::string input_scale_name = (pos != std::string::npos)
+        ? base.substr(0, pos) + ".input_scale"
+        : base + ".input_scale";
+
+    // one scale per expert (n_expert == ne[2]; just 1 for dense tensors)
+    if (gguf_find_tensor(ctx, scale_name.c_str()) == -1) {
+        add_f32_scale_tensor(ctx, scale_name.c_str(), n_expert);
+    }
+    if (gguf_find_tensor(ctx, input_scale_name.c_str()) == -1) {
+        add_f32_scale_tensor(ctx, input_scale_name.c_str(), n_expert);
+    }
 }
 
 //
@@ -1038,6 +1078,12 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
         metadata[i].requires_imatrix = tensor_requires_imatrix(tensor->name, metadata[i].target_type, ftype);
 
+        if (metadata[i].target_type == GGML_TYPE_NVFP4) {
+            // one .scale/.input_scale per expert (tensor->ne[2]); experts are included (MoE)
+            add_nvfp4_scale_tensors(ctx_outs[i_split].get(), tensor->name, tensor->ne[2]);
+            metadata[i].write_nvfp4_scales = true;
+        }
+
         if (params->imatrix) {
             metadata[i].remapped_imatrix_name = remap_imatrix(tensor->name, mapped);
         } else if (metadata[i].allows_quantization && metadata[i].requires_imatrix) {
@@ -1149,6 +1195,7 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
         void * new_data;
         size_t new_size;
+        std::vector<float> nvfp4_scale_vals;  // per-expert .scale (shape {ne[2]}); filled for NVFP4
 
         if (params->dry_run) {
             // the --dry-run option calculates the final quantization size without quantizing
@@ -1237,6 +1284,31 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 const int64_t nchunk = (nelements_matrix + chunk_size - 1)/chunk_size;
                 const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
 
+                // NVFP4 two-level scaling: a per-expert (per-i03; one for dense tensors) global scale
+                // normalizes the per-16 UE4M3 block scales into E4M3's normal range. s_global is rounded
+                // UP to a power of two so 1/s_global is an exact exponent shift - each block keeps its
+                // natural-magnitude UE4M3 rounding (an arbitrary FP32 s_global would dither it); ceil
+                // keeps s_global >= canonical so the max block never saturates. Pre-scaling f32 by
+                // 1/s_global makes the stock quantizer emit s_block = (block_amax/6)/s_global; the matching
+                // .scale (shape {ne[2]}, one per expert) is re-applied after the matmul via ggml_mul.
+                if (new_type == GGML_TYPE_NVFP4 && tm.write_nvfp4_scales) {
+                    nvfp4_scale_vals.resize(tensor->ne[2]);
+                    for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
+                        float * f32_expert = f32_data + i03 * nelements_matrix;
+                        float global_amax = 0.0f;
+                        for (int64_t i = 0; i < nelements_matrix; ++i) {
+                            global_amax = std::max(global_amax, fabsf(f32_expert[i]));
+                        }
+                        const float s_global = global_amax > 0.0f
+                            ? exp2f(ceilf(log2f(global_amax / (448.0f * 6.0f)))) : 1.0f;
+                        const float inv_s_global = 1.0f / s_global;
+                        for (int64_t i = 0; i < nelements_matrix; ++i) {
+                            f32_expert[i] *= inv_s_global;
+                        }
+                        nvfp4_scale_vals[i03] = s_global;  // LS bias folded in after quantize
+                    }
+                }
+
                 // quantize each expert separately since they have different importance matrices
                 new_size = 0;
                 for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
@@ -1247,6 +1319,32 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                     new_size += llama_tensor_quantize_impl(new_type, f32_data_03, new_data_03, chunk_size, nrows, n_per_row, imatrix_03, workers, nthread_use);
                 }
                 LLAMA_LOG_INFO("size = %8.2f MiB -> %8.2f MiB\n", tensor_size/1024.0/1024.0, new_size/1024.0/1024.0);
+
+                if (new_type == GGML_TYPE_NVFP4 && tm.write_nvfp4_scales) {
+                    const int64_t nvfp4_row_size = ggml_row_size(GGML_TYPE_NVFP4, n_per_row);
+                    const ggml_type_traits * nvfp4_traits = ggml_get_type_traits(GGML_TYPE_NVFP4);
+
+                    std::vector<float> dequant_buf(nelements_matrix);
+
+                    // LS-optimal per-expert scale: dequantize each expert, fit sum(f32*dq)/sum(dq^2),
+                    // then fold in the pre-scale s_global stored in nvfp4_scale_vals[i03].
+                    for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
+                        const float * f32_expert = f32_data + i03 * nelements_matrix;
+                        for (int64_t i02 = 0; i02 < nrows; ++i02) {
+                            const void * row = (const char *)new_data
+                                + i03 * nrows * nvfp4_row_size + i02 * nvfp4_row_size;
+                            nvfp4_traits->to_float(row, dequant_buf.data() + i02 * n_per_row, n_per_row);
+                        }
+                        double sum_prod = 0.0;
+                        double sum_sq   = 0.0;
+                        for (int64_t i = 0; i < nelements_matrix; ++i) {
+                            sum_prod += (double)f32_expert[i] * (double)dequant_buf[i];
+                            sum_sq   += (double)dequant_buf[i] * (double)dequant_buf[i];
+                        }
+                        const float bias = (sum_sq > 1e-10) ? (float)(sum_prod / sum_sq) : 1.0f;
+                        nvfp4_scale_vals[i03] *= bias;
+                    }
+                }
             }
             total_size_org += tensor_size;
             total_size_new += new_size;
@@ -1260,6 +1358,30 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             fout.write((const char *) new_data, new_size);
             zeros(fout, GGML_PAD(new_size, align) - new_size);
         } // no --dry-run
+
+        if (!params->dry_run && tm.write_nvfp4_scales) {
+            const size_t scale_size = nvfp4_scale_vals.size() * sizeof(float);
+
+            std::string base(tm.name);
+            auto pos = base.rfind(".weight");
+            std::string scale_name = (pos != std::string::npos)
+                ? base.substr(0, pos) + ".scale"
+                : base + ".scale";
+            std::string input_scale_name = (pos != std::string::npos)
+                ? base.substr(0, pos) + ".input_scale"
+                : base + ".input_scale";
+
+            gguf_set_tensor_data(ctx_outs[cur_split].get(), scale_name.c_str(), nvfp4_scale_vals.data());
+            fout.write((const char *) nvfp4_scale_vals.data(), scale_size);
+            zeros(fout, GGML_PAD(scale_size, align) - scale_size);
+
+            // .input_scale is the activation-scale slot, consumed nowhere today. We have no activation
+            // calibration, so write a neutral 1.0 per expert instead of mirroring the weight scale.
+            std::vector<float> input_scale_vals(nvfp4_scale_vals.size(), 1.0f);
+            gguf_set_tensor_data(ctx_outs[cur_split].get(), input_scale_name.c_str(), input_scale_vals.data());
+            fout.write((const char *) input_scale_vals.data(), scale_size);
+            zeros(fout, GGML_PAD(scale_size, align) - scale_size);
+        }
     } // main loop
 
     if (!params->dry_run) {
