@@ -269,6 +269,14 @@ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t
     return false;
 #endif // GGML_CUDA_FORCE_CUBLAS
 
+    // Experiment: keep NVFP4 off MMQ so the batched path dequantizes to float and runs
+    // cuBLAS with full-precision activations, instead of the Blackwell native-fp4 kernel
+    // that quantizes activations to fp4 (W4A4). Used to measure the activation-precision loss.
+    static const bool fp4_no_mmq = getenv("GGML_CUDA_FP4_NO_MMQ") != nullptr;
+    if (fp4_no_mmq && (type == GGML_TYPE_NVFP4 || type == GGML_TYPE_MXFP4)) {
+        return false;
+    }
+
     bool mmq_supported;
 
     switch (type) {

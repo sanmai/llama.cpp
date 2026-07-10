@@ -706,6 +706,102 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
 // quantization implementation
 //
 
+// In-place orthonormal Walsh-Hadamard transform of each row (length n, n a power of 2).
+// Matches ggml_compute_forward_fwht / ggml_gen_hadamard exactly so that the online H*x in
+// the graph (a dense mul_mat against the same matrix, or the FWHT fast path) inverts this fold:
+// rotating a weight row w -> H*w here and the activation x -> H*x at run time leaves w^T x unchanged.
+static void llama_fwht_rows(float * data, int64_t n, int64_t nrows) {
+    GGML_ASSERT((n & (n - 1)) == 0 && "FWHT row length must be a power of 2");
+
+    const float scale = 1.0f / sqrtf((float) n);
+
+    for (int64_t r = 0; r < nrows; ++r) {
+        float * row = data + r * n;
+
+        for (int64_t j = 0; j < n; ++j) {
+            row[j] *= scale;
+        }
+
+        for (int64_t len = 1; len < n; len <<= 1) {
+            for (int64_t i = 0; i < n; i += 2 * len) {
+                for (int64_t j = 0; j < len; ++j) {
+                    const float u = row[i + j];
+                    const float v = row[i + len + j];
+                    row[i + j]       = u + v;
+                    row[i + len + j] = u - v;
+                }
+            }
+        }
+    }
+}
+
+// NVFP4 per-tensor scale2 (".scale" sibling): lift the per-16 UE4M3 sub-block scales
+// out of the coarse subnormal band (codes 1..7) into the precise normal range. About
+// 92% of N4_0's micro-scales sit subnormal on Qwen3-8B today; emitting weight_scale_2
+// recovers that precision and is consumed for free by the existing scale-fusion
+// epilogue in build_lora_mm. Cost: +1 fp32 per tensor (or n_expert for MoE).
+//
+// Convention: bake s2 into the WEIGHT side (W' = W / s2), store s2 verbatim, and let
+// the inference epilogue multiply the matmul output by s2. Matches NVIDIA's
+// TensorRT-Model-Optimizer per-tensor weight_scale_2.
+static std::string nvfp4_scale_name_for_weight(const std::string & weight_name) {
+    static const std::string suffix = ".weight";
+    if (weight_name.size() < suffix.size() ||
+        weight_name.compare(weight_name.size() - suffix.size(), suffix.size(), suffix) != 0) {
+        return {};
+    }
+    return weight_name.substr(0, weight_name.size() - suffix.size()) + ".scale";
+}
+
+static float nvfp4_compute_scale2(const float * data, int64_t n) {
+    float amax = 0.0f;
+    for (int64_t j = 0; j < n; ++j) {
+        const float a = fabsf(data[j]);
+        if (a > amax) { amax = a; }
+    }
+    // place the largest sub-block UE4M3 scale at UE4M3_MAX: s2 = amax / (E2M1_MAX * UE4M3_MAX).
+    // an all-zero tensor leaves s2 == 1.0 so dequant is bit-exact zero.
+    return amax > 0.0f ? amax / (6.0f * 224.0f) : 1.0f;
+}
+
+// SmoothQuant group helpers: per-(layer, group) shared-input migration.
+//   X · diag(s)^-1 · diag(s) · W is faithful for any positive s. We fold diag(s)^-1
+//   into the preceding RMSNorm weight (so its output is X/s for free) and bake
+//   diag(s) into the consumer weight columns. With activation-driven s, outlier
+//   input channels are squashed before fp4 quantization, recovering the per-16
+//   UE4M3 sub-block scale precision on the W4A4 path.
+//
+// Qwen3-style groupings (shared inputs that must use the SAME s):
+//   FFN : ffn_norm -> { ffn_gate, ffn_up }
+//   ATTN: attn_norm -> { attn_q, attn_k, attn_v }
+// attn_output and ffn_down are NOT here — they consume non-norm activations.
+enum sq_group_kind { SQ_NONE, SQ_FFN, SQ_ATTN };
+struct sq_group { sq_group_kind kind; int layer; };
+
+static sq_group sq_group_of(const std::string & name) {
+    if (name.compare(0, 4, "blk.") != 0) {
+        return {SQ_NONE, -1};
+    }
+    const size_t dot = name.find('.', 4);
+    if (dot == std::string::npos) {
+        return {SQ_NONE, -1};
+    }
+    const int layer = atoi(name.c_str() + 4);
+    const std::string piece = name.substr(dot + 1);
+    if (piece == "ffn_gate.weight" || piece == "ffn_up.weight" || piece == "ffn_norm.weight") {
+        return {SQ_FFN, layer};
+    }
+    if (piece == "attn_q.weight" || piece == "attn_k.weight" || piece == "attn_v.weight" || piece == "attn_norm.weight") {
+        return {SQ_ATTN, layer};
+    }
+    return {SQ_NONE, -1};
+}
+
+static bool sq_is_norm(const std::string & name) {
+    return name.find("ffn_norm.weight")  != std::string::npos ||
+           name.find("attn_norm.weight") != std::string::npos;
+}
+
 static size_t llama_tensor_quantize_impl(enum ggml_type new_type, const float * f32_data, void * new_data, const int64_t chunk_size, int64_t nrows, int64_t n_per_row, const float * imatrix, std::vector<std::thread> & workers, const int nthread) {
     if (nthread < 2) {
         // single-thread
@@ -802,6 +898,7 @@ ggml_type llama_ftype_get_default_type(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q1_0: return GGML_TYPE_Q1_0;
 
         case LLAMA_FTYPE_MOSTLY_MXFP4_MOE: return GGML_TYPE_MXFP4;
+        case LLAMA_FTYPE_MOSTLY_NVFP4:     return GGML_TYPE_NVFP4;
 
         // K-quants
         case LLAMA_FTYPE_MOSTLY_Q2_K_S:
@@ -1055,6 +1152,183 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         }
     }
 
+    // experimental (env GGML_NVFP4_SCALE2): reserve a ".scale" sibling tensor for every
+    // weight that will be quantized to NVFP4. The actual fp32 values are computed during
+    // the main quantization loop below and written out after it. Adding the entries here
+    // appends them to the end of each split's metadata so their file offsets land after
+    // all weight bytes (no reshuffling needed).
+    struct nvfp4_scale_record {
+        std::string        weight_name;
+        std::string        scale_name;
+        uint16_t           i_split;
+        int64_t            n_experts;     // ne[2] (1 for dense)
+        std::vector<float> values;        // size = n_experts
+    };
+    std::vector<nvfp4_scale_record> scale_records;          // in metadata-add order (= write order)
+    std::unordered_map<std::string, size_t> scale_record_by_weight;
+    const bool emit_nvfp4_scale2 = getenv("GGML_NVFP4_SCALE2") != nullptr;
+
+    if (emit_nvfp4_scale2) {
+        if (n_split > 1) {
+            LLAMA_LOG_WARN("%s: GGML_NVFP4_SCALE2 with --keep-split is not supported; ignoring\n", __func__);
+        } else {
+            for (size_t i = 0; i < tensors.size(); ++i) {
+                const auto & tm = metadata[i];
+                if (!tm.allows_quantization || tm.target_type != GGML_TYPE_NVFP4) {
+                    continue;
+                }
+                const struct ggml_tensor * src_t = tensors[i]->tensor;
+                // skip embed / output: read via get_rows (not build_lora_mm), so no
+                // scale-fusion epilogue would re-apply s2 at inference.
+                if (tensor_name_match_token_embd(src_t->name) ||
+                    tensor_name_match_output_weight(src_t->name)) {
+                    continue;
+                }
+                const std::string scale_name = nvfp4_scale_name_for_weight(src_t->name);
+                if (scale_name.empty()) {
+                    continue;
+                }
+                if (gguf_find_tensor(ctx_outs[0].get(), scale_name.c_str()) != -1) {
+                    continue; // already present in source (e.g. import gguf); don't double-emit
+                }
+
+                const int64_t n_experts = src_t->ne[2] > 1 ? src_t->ne[2] : 1;
+
+                struct ggml_tensor placeholder = {};
+                placeholder.type  = GGML_TYPE_F32;
+                placeholder.ne[0] = n_experts;
+                placeholder.ne[1] = 1;
+                placeholder.ne[2] = 1;
+                placeholder.ne[3] = 1;
+                placeholder.nb[0] = sizeof(float);
+                placeholder.nb[1] = placeholder.nb[0] * placeholder.ne[0];
+                placeholder.nb[2] = placeholder.nb[1] * placeholder.ne[1];
+                placeholder.nb[3] = placeholder.nb[2] * placeholder.ne[2];
+                snprintf(placeholder.name, GGML_MAX_NAME, "%s", scale_name.c_str());
+                gguf_add_tensor(ctx_outs[0].get(), &placeholder);
+
+                scale_record_by_weight[src_t->name] = scale_records.size();
+                scale_records.push_back(nvfp4_scale_record{
+                    src_t->name,
+                    scale_name,
+                    /*i_split*/ 0,
+                    n_experts,
+                    std::vector<float>(n_experts, 0.0f),
+                });
+            }
+            LLAMA_LOG_INFO("%s: GGML_NVFP4_SCALE2 enabled; registered %zu .scale tensor(s)\n",
+                           __func__, scale_records.size());
+        }
+    }
+
+    // experimental (env GGML_NVFP4_SMOOTHQUANT): producer-side per-channel migration
+    // for shared-input groups. Uses imatrix activation stats to derive s, normalized to
+    // geomean=1 and clamped, then bakes diag(s) into consumer columns and diag(s)^-1
+    // into the preceding norm weight in the main loop below. Requires --imatrix.
+    std::map<std::pair<int, int>, std::vector<float>> sq_scales; // (kind, layer) -> s
+    const bool emit_nvfp4_smoothquant = getenv("GGML_NVFP4_SMOOTHQUANT") != nullptr;
+    // Env GGML_NVFP4_SMOOTHQUANT_ALPHA overrides alpha for sweep experiments. 0.5 is
+    // the SmoothQuant paper default; higher pushes more burden onto the weight side.
+    float sq_alpha = 0.5f;
+    if (const char * a = getenv("GGML_NVFP4_SMOOTHQUANT_ALPHA")) {
+        sq_alpha = strtof(a, nullptr);
+    }
+    // GGML_NVFP4_SMOOTHQUANT_WMAX: canonical SmoothQuant denominator s_j ~ |X_j|^a / max|W_j|^(1-a)
+    // (joint per-input-channel weight max over the group's consumers) instead of the act-only
+    // geomean form. Respects the per-16 NVFP4 weight grid; needs a prelim weight read.
+    const bool sq_wmax = getenv("GGML_NVFP4_SMOOTHQUANT_WMAX") != nullptr;
+    if (emit_nvfp4_smoothquant) {
+        if (!imatrix_data) {
+            LLAMA_LOG_WARN("%s: GGML_NVFP4_SMOOTHQUANT requires --imatrix; ignoring\n", __func__);
+        } else {
+            // pick a representative consumer per (group, layer) to read imatrix from.
+            // FFN uses ffn_gate, ATTN uses attn_q; both share their group's activation,
+            // so imatrix from any one of them is equivalent.
+            std::map<std::pair<int, int>, std::string> repr;
+            for (size_t i = 0; i < tensors.size(); ++i) {
+                const std::string & n = tensors[i]->tensor->name;
+                if (sq_is_norm(n)) { continue; }
+                const sq_group g = sq_group_of(n);
+                if (g.kind == SQ_NONE) { continue; }
+                const bool is_repr =
+                    (g.kind == SQ_FFN  && n.find("ffn_gate.weight") != std::string::npos) ||
+                    (g.kind == SQ_ATTN && n.find("attn_q.weight")   != std::string::npos);
+                if (is_repr) { repr[{(int)g.kind, g.layer}] = n; }
+            }
+            for (const auto & kv : repr) {
+                auto it = imatrix_data->find(kv.second);
+                if (it == imatrix_data->end()) {
+                    LLAMA_LOG_WARN("%s: missing imatrix for %s; group skipped\n", __func__, kv.second.c_str());
+                    continue;
+                }
+                const std::vector<float> & vals = it->second; // mean(x^2) per input channel
+                const int64_t n_embd = (int64_t) vals.size();
+                if (n_embd == 0) { continue; }
+
+                // canonical denominator: joint per-input-channel max|W| over the group's consumers
+                // (FFN gate+up / ATTN q+k+v). Bounds the migration to the per-16 NVFP4 weight grid
+                // so it cannot amplify a column past its sub-block amax. Read once here (mmap).
+                std::vector<float> wmax;
+                if (sq_wmax) {
+                    wmax.assign(n_embd, 0.0f);
+                    std::vector<no_init<float>> wbuf;
+                    std::vector<std::thread>    wworkers;
+                    for (size_t t = 0; t < tensors.size(); ++t) {
+                        ggml_tensor * wt = tensors[t]->tensor;
+                        if (sq_is_norm(wt->name)) { continue; }
+                        const sq_group wg = sq_group_of(wt->name);
+                        if ((int) wg.kind != kv.first.first || wg.layer != kv.first.second) { continue; }
+                        if (wt->ne[0] != n_embd) { continue; }
+                        ml.load_data_for(wt);
+                        const int64_t nel = ggml_nelements(wt);
+                        llama_tensor_dequantize_impl(wt, wbuf, wworkers, nel, nthread);
+                        for (auto & w : wworkers) { w.join(); }
+                        wworkers.clear();
+                        const float * wf = (const float *) wbuf.data();
+                        const int64_t nrow = ggml_nrows(wt);
+                        for (int64_t r = 0; r < nrow; ++r) {
+                            const float * row = wf + r*n_embd;
+                            for (int64_t j = 0; j < n_embd; ++j) {
+                                wmax[j] = std::max(wmax[j], fabsf(row[j]));
+                            }
+                        }
+                    }
+                }
+
+                std::vector<float> s(n_embd);
+                float log_sum = 0.0f;
+                int log_count = 0;
+                for (int64_t j = 0; j < n_embd; ++j) {
+                    const float rms = sqrtf(std::max(vals[j], 0.0f));
+                    // canonical SmoothQuant: s_j ~ |X_j|^a / max|W_j|^(1-a) (RMS proxies max|X|, the
+                    // imatrix has no max); act-only baseline: s_j ~ act_rms_j^a. Both geomean-normalised
+                    // + clamped below, which keeps per-tensor amax (and scale2) stable across alpha.
+                    float raw;
+                    if (sq_wmax) {
+                        const float wm = wmax[j] > 0.0f ? wmax[j] : 1.0f;
+                        raw = powf(rms, sq_alpha) * powf(wm, sq_alpha - 1.0f);
+                    } else {
+                        raw = powf(rms, sq_alpha);
+                    }
+                    s[j] = raw;
+                    if (raw > 0.0f) { log_sum += logf(raw); log_count++; }
+                }
+                const float geomean = log_count > 0 ? expf(log_sum / log_count) : 1.0f;
+                const float s_lo  = 0.1f;
+                const float s_hi  = 10.0f;
+                for (int64_t j = 0; j < n_embd; ++j) {
+                    float sj = s[j] > 0.0f ? s[j] / geomean : 1.0f;
+                    if (sj < s_lo) { sj = s_lo; }
+                    if (sj > s_hi) { sj = s_hi; }
+                    s[j] = sj;
+                }
+                sq_scales[kv.first] = std::move(s);
+            }
+            LLAMA_LOG_INFO("%s: GGML_NVFP4_SMOOTHQUANT: computed s for %zu (layer, group) pair(s), alpha=%.3f\n",
+                           __func__, sq_scales.size(), sq_alpha);
+        }
+    }
+
     // Set split info if needed
     if (n_split > 1) {
         for (size_t i = 0; i < ctx_outs.size(); ++i) {
@@ -1173,6 +1447,24 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             if (!quantize) {
                 new_data = tensor->data;
                 new_size = tensor_size;
+                // SmoothQuant: fold diag(s)^-1 into the preceding RMSNorm weight so that
+                // the activation arriving at every consumer in this group is X/s. Copy
+                // out of the mmap-backed source into a writable buffer before mutating.
+                if (emit_nvfp4_smoothquant && sq_is_norm(tensor->name) && tensor->type == GGML_TYPE_F32) {
+                    const sq_group g = sq_group_of(tensor->name);
+                    auto it = sq_scales.find({(int)g.kind, g.layer});
+                    if (it != sq_scales.end()) {
+                        GGML_ASSERT((int64_t) it->second.size() == ggml_nelements(tensor));
+                        if (work.size() < tensor_size) { work.resize(tensor_size); }
+                        memcpy(work.data(), tensor->data, tensor_size);
+                        float * w = (float *) work.data();
+                        for (int64_t j = 0; j < ggml_nelements(tensor); ++j) {
+                            w[j] /= it->second[j];
+                        }
+                        new_data = work.data();
+                        LLAMA_LOG_INFO("[sq-norm] ");
+                    }
+                }
                 LLAMA_LOG_INFO("size = %8.3f MiB\n", tensor_size/1024.0/1024.0);
             } else {
                 const int64_t nelements = ggml_nelements(tensor);
@@ -1237,6 +1529,73 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 const int64_t nchunk = (nelements_matrix + chunk_size - 1)/chunk_size;
                 const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
 
+                // SmoothQuant fold: bake diag(s) into the consumer columns. Must run BEFORE
+                // the scale2 fold so the per-tensor amax used for scale2 reflects the migrated
+                // weight distribution. Skip norm tensors (they go through the no-quantize path).
+                if (emit_nvfp4_smoothquant && !sq_is_norm(tensor->name)) {
+                    const sq_group g = sq_group_of(tensor->name);
+                    auto it = sq_scales.find({(int)g.kind, g.layer});
+                    if (it != sq_scales.end()) {
+                        GGML_ASSERT(f32_data == (const float *) f32_conv_buf.data() &&
+                            "SmoothQuant fold needs a mutable f32 copy (quantize from bf16, not f32)");
+                        const std::vector<float> & s = it->second;
+                        GGML_ASSERT((int64_t) s.size() == tensor->ne[0]);
+                        const int64_t n0 = tensor->ne[0];
+                        const int64_t n1 = tensor->ne[1] * tensor->ne[2];
+                        float * buf = (float *) f32_conv_buf.data();
+                        for (int64_t i = 0; i < n1; ++i) {
+                            for (int64_t j = 0; j < n0; ++j) {
+                                buf[i * n0 + j] *= s[j];
+                            }
+                        }
+                        LLAMA_LOG_INFO("[sq] ");
+                    }
+                }
+
+                // experimental: fold a Walsh-Hadamard rotation into NVFP4 attn_output weights so the
+                // online H*x (env GGML_NVFP4_ROTATE_OPROJ at run time) de-outliers the activation before
+                // it is quantized to fp4. invariant: w^T x == (H*w)^T (H*x). see llama-graph.cpp.
+                if (new_type == GGML_TYPE_NVFP4 && getenv("GGML_NVFP4_ROTATE_OPROJ") &&
+                    std::string(tensor->name).find("attn_output.weight") != std::string::npos) {
+                    GGML_ASSERT(f32_data == (const float *) f32_conv_buf.data() &&
+                        "rotate-oproj needs a mutable f32 copy (quantize from bf16, not f32)");
+                    llama_fwht_rows((float *) f32_conv_buf.data(), tensor->ne[0], tensor->ne[1] * tensor->ne[2]);
+                    LLAMA_LOG_INFO("[rotate-oproj] ");
+                }
+
+                // experimental: per-16 Hadamard micro-rotation of NVFP4 ffn_down weights. Radius 16
+                // matches the per-16 UE4M3 sub-block, so the offline flatten stays inside one scale's
+                // jurisdiction (H_4096 converged scales across the block and regressed +0.033). Online
+                // H*x: env GGML_NVFP4_ROTATE_DOWN16. Invariant: w^T x == (H*w)^T (H*x) per 16-block.
+                if (new_type == GGML_TYPE_NVFP4 && getenv("GGML_NVFP4_ROTATE_DOWN16") &&
+                    std::string(tensor->name).find("ffn_down.weight") != std::string::npos) {
+                    GGML_ASSERT(f32_data == (const float *) f32_conv_buf.data() &&
+                        "rotate-down16 needs a mutable f32 copy (quantize from bf16, not f32)");
+                    GGML_ASSERT(tensor->ne[0] % 16 == 0);
+                    llama_fwht_rows((float *) f32_conv_buf.data(), 16, (tensor->ne[0] / 16) * tensor->ne[1] * tensor->ne[2]);
+                    LLAMA_LOG_INFO("[rotate-down16] ");
+                }
+
+                // NVFP4 scale2 fold: pre-divide weights by s2 so per-16 UE4M3 sub-block scales
+                // land in UE4M3's precise normal range. s2 is recorded for the post-loop write
+                // of the ".scale" sibling tensor; runtime epilogue multiplies output by s2.
+                const auto sr_it = scale_record_by_weight.find(tensor->name);
+                if (sr_it != scale_record_by_weight.end()) {
+                    GGML_ASSERT(f32_data == (const float *) f32_conv_buf.data() &&
+                        "NVFP4 scale2 needs a mutable f32 copy (quantize from bf16, not f32)");
+                    auto & rec = scale_records[sr_it->second];
+                    for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
+                        float * f32_expert = (float *) f32_conv_buf.data() + i03 * nelements_matrix;
+                        const float s2 = nvfp4_compute_scale2(f32_expert, nelements_matrix);
+                        rec.values[i03] = s2;
+                        const float inv_s2 = 1.0f / s2;
+                        for (int64_t j = 0; j < nelements_matrix; ++j) {
+                            f32_expert[j] *= inv_s2;
+                        }
+                    }
+                    LLAMA_LOG_INFO("[scale2 s=%.3e] ", rec.values[0]);
+                }
+
                 // quantize each expert separately since they have different importance matrices
                 new_size = 0;
                 for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
@@ -1261,6 +1620,19 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             zeros(fout, GGML_PAD(new_size, align) - new_size);
         } // no --dry-run
     } // main loop
+
+    // append the .scale tensor data after every weight has been written. Offsets were
+    // assigned at gguf_add_tensor time; we just stream the floats out in the same order
+    // and pad each to the file alignment, matching the main loop's convention above.
+    if (!params->dry_run && !scale_records.empty()) {
+        for (const auto & rec : scale_records) {
+            gguf_set_tensor_data(ctx_outs[rec.i_split].get(), rec.scale_name.c_str(), rec.values.data());
+            const size_t bytes = rec.values.size() * sizeof(float);
+            fout.write((const char *) rec.values.data(), bytes);
+            zeros(fout, GGML_PAD(bytes, align) - bytes);
+        }
+        LLAMA_LOG_INFO("%s: wrote %zu NVFP4 .scale tensor(s)\n", __func__, scale_records.size());
+    }
 
     if (!params->dry_run) {
         close_ofstream();
