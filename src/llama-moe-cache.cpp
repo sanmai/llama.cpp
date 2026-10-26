@@ -267,7 +267,7 @@ static bool llama_moe_cache_same_layout(const std::vector<ggml_tensor *> & a, co
 // TODO: [TAG_MUL_MAT_ID_SKIP] remove once CUDA skips the -1 ids of MUL_MAT_ID
 static bool llama_moe_cache_skips_ids(ggml_backend_t backend) {
     const char * name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend)));
-    return strcmp(name, "CUDA") != 0 && strcmp(name, "ROCm") != 0 && strcmp(name, "MUSA") != 0;
+    return strcmp(name, "ROCm") != 0 && strcmp(name, "MUSA") != 0; // local: CUDA skip support from #26631 (1a2a346fae reverted)
 }
 
 static bool llama_moe_cache_is_host_weight(const ggml_tensor * t) {
