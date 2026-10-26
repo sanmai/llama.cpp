@@ -2819,6 +2819,10 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         }
 
         st.ids = ids;
+
+        if (lctx->moe_cache) {
+            lctx->moe_cache->trace_large(src, ids, st.ids_data.data());
+        }
     }
 
     // group consecutive experts and copy them together
