@@ -343,6 +343,7 @@ struct llama_moe_cache::impl {
 
     // env LLAMA_MOE_CACHE_TRACE = file for the experts selected in each layer and ubatch, read by tmp/moe-split/trace.py
     FILE * trace = nullptr;
+    int64_t t_flush = 0;
 
     // slot maps in host memory
     ggml_context_ptr ctx_host;
@@ -609,7 +610,7 @@ struct llama_moe_cache::impl {
         if (trace == nullptr) {
             throw std::runtime_error(std::string("failed to open the MoE cache trace: ") + path);
         }
-        std::vector<int32_t> hdr = { 0x54454f4d, 1, (int32_t) layers.size(), n_expert_used, (int32_t) groups.size() };
+        std::vector<int32_t> hdr = { 0x54454f4d, 2, (int32_t) layers.size(), n_expert_used, (int32_t) groups.size() };
         for (const group & g : groups) {
             hdr.push_back(g.n_slots);
         }
@@ -627,11 +628,17 @@ struct llama_moe_cache::impl {
         LLAMA_LOG_INFO("%s: writing the MoE cache trace to %s\n", __func__, path);
     }
 
-    // record: kind (0 = planned by the cache, 1 = large batch), il, n_used, n_tokens, n_hit, n_fill, n_cpu (-1 for large batches), then the ids
+    // record: kind (0 = planned by the cache, 1 = large batch), il, n_used, n_tokens, n_hit, n_fill, n_cpu (-1 for large batches), time in us (low, high word), then the ids
     void trace_write(int32_t kind, int32_t il, const int32_t * ids, int32_t n_used, int32_t n_tokens, int32_t n_hit, int32_t n_fill, int32_t n_cpu) {
-        const int32_t rec[7] = { kind, il, n_used, n_tokens, n_hit, n_fill, n_cpu };
-        fwrite(rec, sizeof(int32_t), 7, trace);
+        const int64_t t = ggml_time_us();
+        const int32_t rec[9] = { kind, il, n_used, n_tokens, n_hit, n_fill, n_cpu, (int32_t) (t & 0xffffffff), (int32_t) (t >> 32) };
+        fwrite(rec, sizeof(int32_t), 9, trace);
         fwrite(ids, sizeof(int32_t), (size_t) n_used*n_tokens, trace);
+        // a killed server loses at most 1 s of the trace
+        if (t - t_flush > 1000000) {
+            fflush(trace);
+            t_flush = t;
+        }
     }
 
     void trace_large(const ggml_tensor * w, const ggml_tensor * sel, const int32_t * data) {
