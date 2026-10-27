@@ -1226,12 +1226,14 @@ struct llm_graph_context {
                    float   post_exp_norm_eps = 1e-5f) const;
 
     // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache
+    // if ids_cpu is set and the cache splits, it is set to the ids of the experts to compute on the CPU, -1 for the others
     ggml_tensor * build_moe_cache_slots(
              ggml_tensor * selected_experts,
              ggml_tensor * up_exps,
              ggml_tensor * gate_exps,
              ggml_tensor * down_exps,
              ggml_tensor * gate_up_exps,
+             ggml_tensor ** ids_cpu,
                      int   il) const;
 
     //
