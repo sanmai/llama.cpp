@@ -18,7 +18,7 @@
 namespace {
 
 // SLRU or ClassLRU of the experts of a group of layers, the slot of each expert is kept in the slot map of its layer
-// ClassLRU: one LRU list per class floor(log2(CRF)) of the last use, evicts the max (age + 1) / 2^class
+// ClassLRU: one LRU list per class floor(log2(CRF)) of the last use, evicts the max age / 2^class
 struct moe_cache_slru {
     static constexpr int   n_class  = 4;
     static constexpr float crf_half = 128.0f; // tokens
@@ -26,6 +26,7 @@ struct moe_cache_slru {
     int32_t n_expert = 0;
     int32_t n_slots  = 0;
     bool    by_class = false;
+    int32_t max_protected = 0; // SLRU: zero for plain LRU
 
     std::vector<int32_t *> slot_map; // [n_layer] data of the slot maps
     std::vector<int32_t>   key_of;   // [n_slots] il*n_expert + expert, -1 if empty
@@ -59,10 +60,11 @@ struct moe_cache_slru {
         slot_map[il][2*e + 1] = s < 0 ? e : -1;
     }
 
-    void init(int32_t n_layer, int32_t n_expert, int32_t n_slots, bool by_class) {
+    void init(int32_t n_layer, int32_t n_expert, int32_t n_slots, bool by_class, int32_t max_protected) {
         this->n_expert = n_expert;
         this->n_slots  = n_slots;
         this->by_class = by_class;
+        this->max_protected = max_protected;
         slot_map.assign(n_layer, nullptr);
         key_of.assign(n_slots, -1);
         prev.resize(n_slots);
@@ -128,8 +130,8 @@ struct moe_cache_slru {
             move(s, class_of(key_of[s]));
             return;
         }
-        move(s, 1);
-        if (n_in[1] > n_slots/2) {
+        move(s, max_protected > 0 ? 1 : 0);
+        if (n_in[1] > max_protected) {
             move(head[1], 0);
         }
     }
@@ -327,6 +329,7 @@ struct llama_moe_cache::impl {
     int32_t n_expert_used;
     int32_t n_upload_max = -1;
     bool    by_class     = false; // env LLAMA_MOE_CACHE_POLICY=class: ClassLRU in place of SLRU
+    bool    ramp         = false; // env LLAMA_MOE_CACHE_POLICY=ramp: SLRU with the protected share of PR 30848
 
     stats stats_small; // up to 8 tokens per ubatch
     stats stats_large;
@@ -360,6 +363,7 @@ struct llama_moe_cache::impl {
         }
         if (const char * env = getenv("LLAMA_MOE_CACHE_POLICY")) {
             by_class = strcmp(env, "class") == 0;
+            ramp     = strcmp(env, "ramp") == 0;
         }
         for (size_t i = 0; i < backends.size(); ++i) {
             const auto dev_type = ggml_backend_dev_type(ggml_backend_get_device(backends[i]));
@@ -470,7 +474,17 @@ struct llama_moe_cache::impl {
                 g.n_slots = 0;
                 continue;
             }
-            g.slru.init(model.layers.size(), n_expert, g.n_slots, by_class);
+            int32_t max_protected = g.n_slots/2;
+            if (ramp) {
+                // PR 30848: grow the protected fraction from zero at 1x to one half at 1.8x the experts used by one token
+                int64_t n_expert_token = 0;
+                for (int32_t il : g.layers) {
+                    n_expert_token += model.hparams.n_expert_used(il);
+                }
+                const double ramp_progress = std::clamp(((double) g.n_slots/n_expert_token - 1.0)/0.8, 0.0, 1.0);
+                max_protected = (int32_t) (g.n_slots*ramp_progress*0.5);
+            }
+            g.slru.init(model.layers.size(), n_expert, g.n_slots, by_class, max_protected);
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
             n_tensors_host  += g.layers.size();
         }
@@ -590,7 +604,7 @@ struct llama_moe_cache::impl {
                 continue;
             }
             LLAMA_LOG_INFO("%s: %10s MoE cache size = %8.2f MiB for %.2f MiB of host experts, %s\n", __func__,
-                ggml_backend_buft_name(d.buft), d.buf_size/1024.0/1024.0, d.host_bytes/1024.0/1024.0, by_class ? "ClassLRU" : "SLRU");
+                ggml_backend_buft_name(d.buft), d.buf_size/1024.0/1024.0, d.host_bytes/1024.0/1024.0, by_class ? "ClassLRU" : ramp ? "SLRU with the PR 30848 ramp" : "SLRU");
             for (const group & g : groups) {
                 if (g.id == (int32_t) id) {
                     LLAMA_LOG_INFO("%s: %2zu layers, %s: %5d slots (%.1f%%)\n", __func__,
