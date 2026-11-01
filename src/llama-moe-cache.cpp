@@ -19,9 +19,11 @@ namespace {
 // CRF (combined recency and frequency) = uses of an expert, decayed with a half-life of N tokens, retained across evictions
 // class = floor(log2(CRF)), at most n_class - 1; each slot is in the LRU list of the class, as of its last use
 // victim: an empty slot, or the least recently used slot of each list not in the current plan() with the max age/2^class
+// guard: the experts that the previous token used in the next n_guard layers of the group are not victims, if possible
 struct moe_cache_lru {
     static constexpr int   n_class  = 8; // floor(log2(1/(1 - 2^(-1/crf_half_life)))) = 7, class of CRF_max for half-life of 128
     static constexpr float crf_half_life = 128.0f; // tokens
+    static constexpr int   n_guard_skip  = 5; // n_guard = layers of the group - 5; a guard of almost all layers leaves too few victims in a small cache
 
     int32_t n_expert = 0;
     int32_t n_slots  = 0;
@@ -44,10 +46,23 @@ struct moe_cache_lru {
     uint32_t seen_gen = 0;
     std::vector<int32_t> uniq;  // the distinct selected experts
 
-    void init(int32_t n_layer, int32_t n_expert, int32_t n_slots) {
+    int32_t n_guard = 0;                         // layers after the current one that the guard covers
+    std::vector<int32_t> next_layer;             // [n_layer] the layer planned after il, -1 if not known yet
+    int32_t last_layer = -1;                     // the layer of the last plan()
+    std::vector<std::vector<int32_t>> last_uniq; // [n_layer] the distinct experts of the last plan() of the layer
+    std::vector<uint32_t> guard;                 // [n_layer*n_expert] guard[key] == guard_gen if the key is guarded
+    uint32_t guard_gen = 0;
+    bool guarded = false;                        // some key is guarded
+
+    // n_layer_group: the layers that share the slots
+    void init(int32_t n_layer, int32_t n_expert, int32_t n_slots, int32_t n_layer_group) {
         GGML_ASSERT(n_class == (int) std::log2(1.0f/(1.0f - std::exp2(-1.0f/crf_half_life))) + 1);
         this->n_expert = n_expert;
         this->n_slots  = n_slots;
+        n_guard = std::max(0, n_layer_group - n_guard_skip);
+        next_layer.assign(n_layer, -1);
+        last_uniq.assign(n_layer, {});
+        guard.assign((size_t) n_layer*n_expert, 0);
         slot_map.assign(n_layer, nullptr);
         key_of.assign(n_slots, -1);
         prev.resize(n_slots);
@@ -129,17 +144,49 @@ struct moe_cache_lru {
         return seen[key_expert(key)] == seen_gen;
     }
 
-    // the least recently used slot of list c that this plan() does not select, -1 if none
+    bool is_guarded(int32_t key) const {
+        return key >= 0 && guard[key] == guard_gen;
+    }
+
+    // a new generation: no key is guarded
+    void clear_guard() {
+        if (++guard_gen == 0) {
+            std::fill(guard.begin(), guard.end(), 0);
+            guard_gen = 1;
+        }
+        guarded = false;
+    }
+
+    // guard the cached experts that the previous token used in the next n_guard layers
+    void set_guard(int32_t il) {
+        clear_guard();
+        int32_t l = il;
+        for (int32_t i = 0; i < n_guard; ++i) {
+            l = next_layer[l];
+            if (l < 0 || l == il) {
+                return;
+            }
+            for (int32_t e : last_uniq[l]) {
+                const int32_t key = make_key(l, e);
+                if (slot_map[l][e] >= 0 && last_use[key] == clock[l] - 1) {
+                    guard[key] = guard_gen;
+                    guarded    = true;
+                }
+            }
+        }
+    }
+
+    // the least recently used slot of list c that this plan() does not select and the guard does not cover, -1 if none
     int32_t candidate(int c, int32_t il) const {
         for (int32_t s = head[c]; s >= 0; s = next[s]) {
-            if (!is_selected(il, key_of[s])) {
+            if (!is_selected(il, key_of[s]) && !is_guarded(key_of[s])) {
                 return s;
             }
         }
         return -1;
     }
 
-    int32_t victim(int32_t il) const {
+    int32_t victim(int32_t il) {
         int32_t res = -1;
         double res_score = -1.0;
         for (int c = 0; c < n_class; ++c) {
@@ -158,6 +205,11 @@ struct moe_cache_lru {
                 res_score = score;
             }
         }
+        if (res < 0 && guarded) {
+            // all candidates are guarded: no guard for the rest of this plan()
+            clear_guard();
+            return victim(il);
+        }
         if (res < 0) {
             GGML_ABORT("no MoE cache victim");
         }
@@ -175,6 +227,11 @@ struct moe_cache_lru {
         fills.clear();
         n_hit = 0;
 
+        if (last_layer >= 0) {
+            next_layer[last_layer] = il;
+        }
+        last_layer = il;
+
         if (++seen_gen == 0) {
             std::fill(seen.begin(), seen.end(), 0);
             seen_gen = 1;
@@ -190,6 +247,9 @@ struct moe_cache_lru {
         if (uniq.size() > (size_t) n_slots) {
             return false;
         }
+
+        set_guard(il);
+        last_uniq[il] = uniq;
 
         int32_t * slots = slot_map[il];
 
@@ -428,7 +488,7 @@ struct llama_moe_cache::impl {
                 g.n_slots = 0;
                 continue;
             }
-            g.lru.init(model.layers.size(), n_expert, g.n_slots);
+            g.lru.init(model.layers.size(), n_expert, g.n_slots, g.layers.size());
             n_tensors[g.id] += g.ref.size()*(1 + g.layers.size());
             n_tensors_host  += g.layers.size();
         }
