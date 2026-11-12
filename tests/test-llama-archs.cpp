@@ -1871,9 +1871,13 @@ static int test_chunk(const std::string & arch_filter, const size_t seed, const 
         n_tests++;
         try {
             gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, true);
-            if (arch == LLM_ARCH_QWEN4EXP) {
+            if (arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_GLM5_NEXT) {
                 // a realistic top-k, so that the selection depends on the indexer query
                 gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_ATTENTION_INDEXER_TOP_K).c_str(), 8);
+            }
+            if (arch == LLM_ARCH_GLM5_NEXT) {
+                // every layer has its own indexer: a layer that shares a selection disables the chunks
+                gguf_remove_key(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_ATTENTION_INDEXER_TYPES).c_str());
             }
             llama_model_ptr model = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
 
