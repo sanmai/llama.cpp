@@ -178,7 +178,7 @@ static void usage(char ** argv) {
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
-    LOG("  --chunk <n>              Check that token chunks of n tokens (LLAMA_MOE_CHUNK, LLAMA_QSA_CHUNK) match the graph without chunks (CPU only)\n");
+    LOG("  --chunk <n>              Check that token chunks of n tokens (LLAMA_QSA_CHUNK) match the graph without chunks (CPU only)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -1794,13 +1794,9 @@ static void set_env(const char * name, const char * value) {
 // a fresh context for each chunk size, as the context reads it when it is created
 // batches of n_ubatch/2, n_ubatch and n_ubatch/2 tokens give ubatches with different chunk counts
 static std::vector<float> get_logits_chunk(llama_model * model, const llama_context_params & ctx_params, const std::vector<llama_token> & tokens, const char * n_chunk) {
-    for (const char * name : { "LLAMA_MOE_CHUNK", "LLAMA_QSA_CHUNK" }) {
-        set_env(name, n_chunk);
-    }
+    set_env("LLAMA_QSA_CHUNK", n_chunk);
     llama_context_ptr lctx(llama_init_from_model(model, ctx_params));
-    for (const char * name : { "LLAMA_MOE_CHUNK", "LLAMA_QSA_CHUNK" }) {
-        set_env(name, "0");
-    }
+    set_env("LLAMA_QSA_CHUNK", "0");
     if (!lctx) {
         throw std::runtime_error("failed to create llama context");
     }
@@ -1823,10 +1819,9 @@ static std::vector<float> get_logits_chunk(llama_model * model, const llama_cont
     return ret;
 }
 
-// the experts of a token and its QSA attention do not depend on the other tokens of the ubatch, so the token chunks
-// (LLAMA_MOE_CHUNK, LLAMA_QSA_CHUNK) match the graph without chunks
-// for every MoE arch: the chunks of the expert FFN are built by llm_graph_context::build_moe_ffn
-// flash attention is off: the CPU tiles it by batch size, and the rounding of the QSA chunks would differ from the reference
+// the sparse attention of a token does not depend on the other tokens of the ubatch, so the token chunks
+// (LLAMA_QSA_CHUNK) match the graph without chunks
+// not bit-exact with flash attention: the CPU tiles it by batch size, so its rounding follows the chunk size
 static int test_chunk(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const char * n_chunk) {
     struct user_data_t {
         struct {
@@ -1856,14 +1851,11 @@ static int test_chunk(const std::string & arch_filter, const size_t seed, const 
     size_t n_tests  = 0;
     size_t n_failed = 0;
     for (const llm_arch & arch : llama_arch_all()) {
-        if (arch == LLM_ARCH_UNKNOWN || !arch_matches(arch_filter, arch) || !arch_supported(arch) || !moe_implemented(arch)) {
+        // the archs that build their sparse attention with llm_graph_context::build_chunked
+        if (arch != LLM_ARCH_QWEN4EXP && arch != LLM_ARCH_GLM5_NEXT && arch != LLM_ARCH_DEEPSEEK41) {
             continue;
         }
-        if (arch == LLM_ARCH_EAGLE3 || arch == LLM_ARCH_DFLASH || arch == LLM_ARCH_GEMMA4_ASSISTANT) {
-            continue;
-        }
-        const bool encode = arch == LLM_ARCH_T5 || arch == LLM_ARCH_DREAM || arch == LLM_ARCH_LLADA || arch == LLM_ARCH_LLADA_MOE || arch == LLM_ARCH_RND1;
-        if (encode) {
+        if (!arch_matches(arch_filter, arch) || !arch_supported(arch)) {
             continue;
         }
 

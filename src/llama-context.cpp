@@ -394,19 +394,12 @@ llama_context::llama_context(
     }
 
     {
-        const auto n_chunk = [](const char * name, const char * block) -> uint32_t {
-            const char * value = getenv(name);
-            const int    res   = value ? std::max(0, atoi(value)) : 0;
+        const char * value = getenv("LLAMA_QSA_CHUNK");
+        cparams.n_qsa_chunk = value ? std::max(0, atoi(value)) : 0;
 
-            if (res > 0) {
-                LLAMA_LOG_INFO("%s: %s set, %s runs in chunks of %d tokens\n", "llama_context", name, block, res);
-            }
-
-            return res;
-        };
-
-        cparams.n_moe_chunk = n_chunk("LLAMA_MOE_CHUNK", "the expert FFN");
-        cparams.n_qsa_chunk = n_chunk("LLAMA_QSA_CHUNK", "the QSA");
+        if (cparams.n_qsa_chunk > 0) {
+            LLAMA_LOG_INFO("%s: LLAMA_QSA_CHUNK set, the sparse attention runs in chunks of %u tokens\n", "llama_context", cparams.n_qsa_chunk);
+        }
     }
 
     // initialized later
@@ -2957,9 +2950,6 @@ uint32_t llama_context::graph_max_nodes() const {
     }
 
     // each token chunk of a block of a layer has its own nodes, see llm_graph_context::build_chunked
-    if (cparams.n_moe_chunk > 0) {
-        res += model.layers.size()*(cparams.n_ubatch/cparams.n_moe_chunk)*(128 + 2*model.hparams.n_expert_used_max());
-    }
     if (cparams.n_qsa_chunk > 0) {
         res += model.layers.size()*(cparams.n_ubatch/cparams.n_qsa_chunk)*96;
     }
@@ -3203,9 +3193,7 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         return false;
     }
 
-    // a chunk of the expert FFN has the ids of all tokens in src[3]: the scheduler copies the experts once per graph,
-    // so the other chunks read this copy (see llm_graph_context::build_moe_ffn)
-    const ggml_tensor * ids = node->src[3] ? node->src[3] : node->src[2];
+    const ggml_tensor * ids = node->src[2];
     if (ggml_nelements(ids) == 0) {
         return true;
     }

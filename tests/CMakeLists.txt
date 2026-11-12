@@ -257,7 +257,7 @@ set_tests_properties(test-generate-models PROPERTIES
     FIXTURES_SETUP generate-models
 )
 
-# the expert FFN and the QSA of large ubatches run in token chunks, small chunks cover it with the dummy models of all MoE archs
+# the sparse attention of large ubatches runs in token chunks, small chunks cover it with the dummy models
 llama_test(
     test-llama-archs
     NAME test-llama-archs-chunk
