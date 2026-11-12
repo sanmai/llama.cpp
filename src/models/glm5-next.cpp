@@ -1116,9 +1116,8 @@ llama_model_glm5_next::graph::build_dsa_layer(
 
     // the selection and the attention of a token read the cache and not the other tokens of the ubatch,
     // and the selection has n_kv values per token
-    ggml_tensor * sel  = prev_sel;
-    ggml_tensor * like = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, layer.wo->ne[0], n_tokens);
-    ggml_tensor * out  = build_chunked(like, inp_kpool->chunks, [&](size_t ic, const llm_graph_chunk & chunk) {
+    ggml_tensor * sel = prev_sel;
+    ggml_tensor * out = build_chunked(inp_kpool->chunks, [&](size_t ic, const llm_graph_chunk & chunk) {
         if (full) {
             sel = build_kpool_select(layer, inp_kpool, idx, ic, il);
 

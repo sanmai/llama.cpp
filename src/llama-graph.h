@@ -1261,10 +1261,10 @@ struct llm_graph_context {
     // one chunk with all the tokens if n_chunk is 0
     std::vector<llm_graph_chunk> get_chunks(int64_t n_tokens, int64_t n_chunk) const;
 
-    // fn builds the rows [ne0, chunk.n] of the tokens of chunk ic, the result is [ne0, n_tokens]: the shape and the type of like
+    // fn builds the rows [ne0, chunk.n] of the tokens of chunk ic, the result is [ne0, n_tokens]
     // with one chunk the result is the result of fn
     using llm_chunk_fn = std::function<ggml_tensor * (size_t ic, const llm_graph_chunk & chunk)>;
-    ggml_tensor * build_chunked(ggml_tensor * like, const std::vector<llm_graph_chunk> & chunks, const llm_chunk_fn & fn) const;
+    ggml_tensor * build_chunked(const std::vector<llm_graph_chunk> & chunks, const llm_chunk_fn & fn) const;
 
     // the tokens of chunk in dimension dim (1 or 2) of t: t if the chunk has all of them, nullptr if t is nullptr
     ggml_tensor * build_chunk_view(ggml_tensor * t, int dim, const llm_graph_chunk & chunk) const;

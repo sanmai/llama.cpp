@@ -1021,8 +1021,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     // the selection and the attention of a token read the cache and not the other tokens of the ubatch,
     // and the selection has n_kv values per token
-    ggml_tensor * like = ggml_reshape_2d(ctx0, q_cur, q_cur->ne[0]*q_cur->ne[1], q_cur->ne[2]);
-    ggml_tensor * cur  = build_chunked(like, inp_kpool->chunks, [&](size_t ic, const llm_graph_chunk & chunk) {
+    ggml_tensor * cur = build_chunked(inp_kpool->chunks, [&](size_t ic, const llm_graph_chunk & chunk) {
         ggml_tensor * sel = build_qsa_sel(inp_kpool, idx, ic, il);
 
         // the selection replaces the kq_mask: split it into the streams of the K view
