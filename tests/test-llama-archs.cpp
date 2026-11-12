@@ -1871,7 +1871,7 @@ static int test_chunk(const std::string & arch_filter, const size_t seed, const 
         n_tests++;
         try {
             gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, true);
-            if (arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_GLM5_NEXT) {
+            if (arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_GLM5_NEXT || arch == LLM_ARCH_DEEPSEEK41) {
                 // a realistic top-k, so that the selection depends on the indexer query
                 gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_ATTENTION_INDEXER_TOP_K).c_str(), 8);
             }
@@ -1886,12 +1886,17 @@ static int test_chunk(const std::string & arch_filter, const size_t seed, const 
             ctx_params.n_threads       = 4;
             ctx_params.n_threads_batch = 4;
             ctx_params.n_ubatch        = n_ubatch;
-            ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
 
-            const std::vector<float> logits_ref   = get_logits_chunk(model.get(), ctx_params, tokens, "0");
-            const std::vector<float> logits_chunk = get_logits_chunk(model.get(), ctx_params, tokens, n_chunk);
+            // with flash attention the masks are F16, which the fused indexer and mask ops need
+            double nmse_val = 0.0;
+            for (const llama_flash_attn_type fa : { LLAMA_FLASH_ATTN_TYPE_DISABLED, LLAMA_FLASH_ATTN_TYPE_ENABLED }) {
+                ctx_params.flash_attn_type = fa;
 
-            const double nmse_val = nmse(logits_ref, logits_chunk);
+                const std::vector<float> logits_ref   = get_logits_chunk(model.get(), ctx_params, tokens, "0");
+                const std::vector<float> logits_chunk = get_logits_chunk(model.get(), ctx_params, tokens, n_chunk);
+
+                nmse_val = std::max(nmse_val, nmse(logits_ref, logits_chunk));
+            }
             const bool   ok       = nmse_val <= 1e-10;
             n_failed += ok ? 0 : 1;
 
