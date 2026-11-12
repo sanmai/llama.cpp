@@ -753,11 +753,10 @@ public:
     ggml_tensor * new_pool_rep  = nullptr; // I64 [n_new]          cell to write each new pooled key into
     ggml_tensor * new_pool_pos  = nullptr; // I32 [4*n_new]        M-RoPE position of each new block's first member
 
-    // the token chunks of the QSA (see build_attn_qsa) with their rows of pool_mask and tail_idxs
+    // the rows of pool_mask and tail_idxs of each token chunk of the QSA (see build_attn_qsa)
     // the views are made once per graph: each view of a host input is a separate upload
-    std::vector<llm_graph_chunk> chunks;
-    std::vector<ggml_tensor *>   chunks_pool_mask;
-    std::vector<ggml_tensor *>   chunks_tail_idxs;
+    std::vector<ggml_tensor *> chunks_pool_mask;
+    std::vector<ggml_tensor *> chunks_tail_idxs;
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t kpool;
@@ -791,9 +790,7 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     ggml_build_forward_expand(gf, inp->pool_mask);
     ggml_build_forward_expand(gf, inp->tail_idxs);
 
-    // the mask streams are not split: a split cache with several sequences has one chunk
-    inp->chunks = get_chunks(n_tokens, cparams.kv_unified || cparams.n_seq_max == 1 ? cparams.n_qsa_chunk : 0);
-    for (const auto & chunk : inp->chunks) {
+    for (const auto & chunk : chunks) {
         inp->chunks_pool_mask.push_back(build_chunk_view(inp->pool_mask, 1, chunk));
         inp->chunks_tail_idxs.push_back(build_chunk_view(inp->tail_idxs, 1, chunk));
     }
@@ -884,7 +881,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
         const qsa_idx &         idx,
         size_t                  ic,
         int                     il) {
-    const llm_graph_chunk & chunk = inp_kpool->chunks[ic];
+    const llm_graph_chunk & chunk = chunks[ic];
 
     const int64_t n_tokens = chunk.n;
     const int64_t idx_dim  = hparams.indexer_head_size;
@@ -1021,7 +1018,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     // the selection and the attention of a token read the cache and not the other tokens of the ubatch,
     // and the selection has n_kv values per token
-    ggml_tensor * cur = build_chunked(inp_kpool->chunks, [&](size_t ic, const llm_graph_chunk & chunk) {
+    ggml_tensor * cur = build_chunked(chunks, [&](size_t ic, const llm_graph_chunk & chunk) {
         ggml_tensor * sel = build_qsa_sel(inp_kpool, idx, ic, il);
 
         // the selection replaces the kq_mask: split it into the streams of the K view

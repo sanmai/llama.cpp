@@ -324,13 +324,13 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
         }
     }
 
-    // the mask streams are not split: a split cache with several sequences has one chunk
     // a layer that shares the selection of the layer before it needs the selection of all the tokens: one chunk
-    bool chunked = cparams.kv_unified || cparams.n_seq_max == 1;
+    inp->chunks = chunks;
     for (uint32_t il = 0; il < hparams.n_layer(); il++) {
-        chunked = chunked && hparams.is_indexer_full(il);
+        if (!hparams.is_indexer_full(il)) {
+            inp->chunks = { { 0, n_tokens } };
+        }
     }
-    inp->chunks = get_chunks(n_tokens, chunked ? cparams.n_qsa_chunk : 0);
 
     ggml_tensor * sel_mask = inp->sel_mask ? ggml_reshape_2d(ctx0, inp->sel_mask, inp->n_sel, n_tokens) : nullptr;
     for (const auto & chunk : inp->chunks) {

@@ -393,15 +393,6 @@ llama_context::llama_context(
         }
     }
 
-    {
-        const char * value = getenv("LLAMA_QSA_CHUNK");
-        cparams.n_qsa_chunk = value ? std::max(0, atoi(value)) : 0;
-
-        if (cparams.n_qsa_chunk > 0) {
-            LLAMA_LOG_INFO("%s: LLAMA_QSA_CHUNK set, the sparse attention runs in chunks of %u tokens\n", "llama_context", cparams.n_qsa_chunk);
-        }
-    }
-
     // initialized later
     cparams.pipeline_parallel = false;
     cparams.training = false;
@@ -2950,8 +2941,8 @@ uint32_t llama_context::graph_max_nodes() const {
     }
 
     // each token chunk of a block of a layer has its own nodes, see llm_graph_context::build_chunked
-    if (cparams.n_qsa_chunk > 0) {
-        res += model.layers.size()*(cparams.n_ubatch/cparams.n_qsa_chunk)*96;
+    if (const uint32_t n_chunk = llm_graph_n_chunk(cparams)) {
+        res += model.layers.size()*((cparams.n_ubatch + n_chunk - 1)/n_chunk)*96;
     }
 
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling

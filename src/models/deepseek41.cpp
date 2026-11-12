@@ -528,9 +528,6 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
         GGML_ASSERT(comp_all->ne[0] == n_embd_head + n_idx_embd && n_comp <= comp_all->ne[2]);
         const int64_t n_stream = comp_all->ne[3];
 
-        // the token chunks of the selection mask and the attention; the masks of several streams are not split
-        const std::vector<llm_graph_chunk> chunks = get_chunks(nt, n_stream == 1 ? cparams.n_qsa_chunk : 0);
-
         ggml_tensor * top_k = topk_of[hparams.dsv41_topk_src[il]];
         if (hparams.dsv41_topk_src[il] == il) {
             ggml_tensor * ik = ggml_view_4d(ctx0, comp_all, n_idx_embd, 1, n_comp, n_stream,

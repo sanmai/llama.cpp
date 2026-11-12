@@ -178,7 +178,7 @@ static void usage(char ** argv) {
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
-    LOG("  --chunk <n>              Check that token chunks of n tokens (LLAMA_QSA_CHUNK) match the graph without chunks (CPU only)\n");
+    LOG("  --chunk <n>              Check that token chunks of n tokens (LLAMA_GRAPH_CHUNK) match the graph without chunks (CPU only)\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -1790,13 +1790,12 @@ static void set_env(const char * name, const char * value) {
 #endif
 }
 
-// the logits of all tokens, with the expert FFN and the QSA in chunks of n_chunk tokens ("0": no chunks)
-// a fresh context for each chunk size, as the context reads it when it is created
+// the logits of all tokens, with token chunks of n_chunk tokens ("0": no chunks)
 // batches of n_ubatch/2, n_ubatch and n_ubatch/2 tokens give ubatches with different chunk counts
 static std::vector<float> get_logits_chunk(llama_model * model, const llama_context_params & ctx_params, const std::vector<llama_token> & tokens, const char * n_chunk) {
-    set_env("LLAMA_QSA_CHUNK", n_chunk);
+    // each graph reads the chunk size when it is built
+    set_env("LLAMA_GRAPH_CHUNK", n_chunk);
     llama_context_ptr lctx(llama_init_from_model(model, ctx_params));
-    set_env("LLAMA_QSA_CHUNK", "0");
     if (!lctx) {
         throw std::runtime_error("failed to create llama context");
     }
@@ -1816,11 +1815,12 @@ static std::vector<float> get_logits_chunk(llama_model * model, const llama_cont
             ret.insert(ret.end(), logits_ith, logits_ith + n_vocab);
         }
     }
+    set_env("LLAMA_GRAPH_CHUNK", "0");
     return ret;
 }
 
 // the sparse attention of a token does not depend on the other tokens of the ubatch, so the token chunks
-// (LLAMA_QSA_CHUNK) match the graph without chunks
+// (LLAMA_GRAPH_CHUNK) match the graph without chunks
 // not bit-exact with flash attention: the CPU tiles it by batch size, so its rounding follows the chunk size
 static int test_chunk(const std::string & arch_filter, const size_t seed, const float stdev, const int verbosity, const char * n_chunk) {
     struct user_data_t {

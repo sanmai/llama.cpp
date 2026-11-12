@@ -1036,6 +1036,10 @@ struct llm_graph_chunk {
     int64_t n;
 };
 
+// the most tokens of a chunk, 0 = no chunks
+// a tensor with n_ctx elements per token, such as an attention mask, then has at most 2^28 elements
+uint32_t llm_graph_n_chunk(const llama_cparams & cparams);
+
 struct llm_graph_moe_cache_slots {
     ggml_tensor * slots;   // [n_expert_used, n_tokens] slots of the selected experts in the MoE cache, or nullptr
     ggml_tensor * cpu_ids; // [n_expert_used, n_tokens] misses computed from the host experts, -1 for the other experts, or nullptr
@@ -1105,6 +1109,9 @@ struct llm_graph_context {
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
+
+    // the token chunks of the ubatch for build_chunked, see llm_graph_n_chunk
+    const std::vector<llm_graph_chunk> chunks;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
@@ -1256,10 +1263,6 @@ struct llm_graph_context {
 
     // token chunks: a block whose rows do not depend on each other can be built once per chunk of tokens,
     // its tensors then have the size of a chunk and not of the ubatch
-
-    // n_tokens tokens in chunks of at most n_chunk tokens: the chunks have the same size, so that no chunk is too small for a device
-    // one chunk with all the tokens if n_chunk is 0
-    std::vector<llm_graph_chunk> get_chunks(int64_t n_tokens, int64_t n_chunk) const;
 
     // fn builds the rows [ne0, chunk.n] of the tokens of chunk ic, the result is [ne0, n_tokens]
     // with one chunk the result is the result of fn

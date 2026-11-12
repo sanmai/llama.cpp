@@ -1547,6 +1547,34 @@ void llm_graph_result::set_params(const llm_graph_params & params) {
 // llm_graph_context
 //
 
+uint32_t llm_graph_n_chunk(const llama_cparams & cparams) {
+    // the streams of a split cache are not split into chunks
+    if (!cparams.kv_unified && cparams.n_seq_max > 1) {
+        return 0;
+    }
+
+    // for tests: the models of the tests are too small for chunks
+    if (const char * value = getenv("LLAMA_GRAPH_CHUNK")) {
+        return std::max(0, atoi(value));
+    }
+
+    return std::max<uint32_t>(1, (UINT32_C(1) << 28)/std::max<uint32_t>(1, cparams.n_ctx));
+}
+
+// n_tokens tokens in chunks of at most n_chunk tokens: the chunks have the same size, so that no chunk is too small for a device
+// one chunk with all the tokens if n_chunk is 0
+static std::vector<llm_graph_chunk> get_chunks(int64_t n_tokens, int64_t n_chunk) {
+    const int64_t n_chunks = n_chunk > 0 ? std::max<int64_t>(1, (n_tokens + n_chunk - 1)/n_chunk) : 1;
+
+    std::vector<llm_graph_chunk> res;
+    for (int64_t ic = 0; ic < n_chunks; ++ic) {
+        const int64_t t0 = ic*n_tokens/n_chunks;
+        res.push_back({ t0, (ic + 1)*n_tokens/n_chunks - t0 });
+    }
+
+    return res;
+}
+
 llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     model            (*params.model),
     hparams          (params.hparams),
@@ -1595,7 +1623,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
-    gf               (res->get_gf()) {
+    gf               (res->get_gf()),
+    chunks           (get_chunks(ubatch.n_tokens, llm_graph_n_chunk(cparams))) {
         res->set_params(params);
     }
 
@@ -2662,18 +2691,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(moe_out, "ffn_moe_out", il);
 
     return moe_out;
-}
-
-std::vector<llm_graph_chunk> llm_graph_context::get_chunks(int64_t n_tokens, int64_t n_chunk) const {
-    const int64_t n_chunks = n_chunk > 0 ? std::max<int64_t>(1, (n_tokens + n_chunk - 1)/n_chunk) : 1;
-
-    std::vector<llm_graph_chunk> res;
-    for (int64_t ic = 0; ic < n_chunks; ++ic) {
-        const int64_t t0 = ic*n_tokens/n_chunks;
-        res.push_back({ t0, (ic + 1)*n_tokens/n_chunks - t0 });
-    }
-
-    return res;
 }
 
 ggml_tensor * llm_graph_context::build_chunked(const std::vector<llm_graph_chunk> & chunks, const llm_chunk_fn & fn) const {

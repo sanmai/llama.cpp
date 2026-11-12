@@ -59,10 +59,6 @@ struct llama_cparams {
     size_t moe_cache_size;
     float  moe_cache_cpu_share;
 
-    // a block of a layer whose rows do not depend on each other runs in chunks of at most this many tokens
-    // if the ubatch has more, 0 = no chunks (see llm_graph_context::build_chunked)
-    uint32_t n_qsa_chunk; // the selection and the attention of the QSA
-
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
     bool embeddings_layer_inp_dev; // write enabled layer inputs to a device buffer instead of host
     bool embeddings_nextn_dev;     // write the unmasked h_nextn rows to a device buffer instead of host, see llama_set_embeddings_nextn_dev()
