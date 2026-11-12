@@ -2941,7 +2941,7 @@ uint32_t llama_context::graph_max_nodes() const {
     }
 
     // each token chunk of a block of a layer has its own nodes, see llm_graph_context::build_chunked
-    if (const uint32_t n_chunk = llm_graph_n_chunk(cparams)) {
+    if (const uint32_t n_chunk = llm_graph_n_chunk(cparams); n_chunk > 0 && n_chunk < cparams.n_ubatch) {
         res += model.layers.size()*((cparams.n_ubatch + n_chunk - 1)/n_chunk)*96;
     }
 
