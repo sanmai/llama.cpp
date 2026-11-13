@@ -548,7 +548,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             iw = ggml_view_4d(ctx0, iw, iw->ne[0], nt/n_stream, 1, n_stream, iw->nb[1], iw->nb[1]*(nt/n_stream), iw->nb[1]*(nt/n_stream), 0);
 
             // chunk queries so the [n_ih, tokens, n_comp] scores stay near 2^26 elements (at most 64 chunks)
-            // the fused indexer has [tokens, n_comp] scores: one chunk, or the token chunks of the attention
+            // the fused indexer has [tokens, n_comp] scores: the token chunks of the attention (chunks of the same size and a remainder)
             const int64_t n_tok = nt/n_stream;
             GGML_ASSERT(ci.kq_mask->ne[1] == n_tok);
             const int64_t chunk = fused_idx ? chunks[0].n :
@@ -742,7 +742,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
 
             // the mask and the attention of a token read the cache and the picks, and not the other tokens of the ubatch,
             // and the mask has n_raw + n_comp values per token
-            out = build_chunked(chunks, [&](size_t, const llm_graph_chunk & chunk) {
+            out = build_chunked([&](size_t, const llm_graph_chunk & chunk) {
                 ggml_tensor * sel_mask = build_top_k_mask(build_chunk_view(ci.kq_mask, 1, chunk), build_chunk_view(top_k, 1, chunk), "comp_top_k_mask", il);
                 ggml_tensor * kq_mask  = ggml_concat(ctx0, build_chunk_view(raw_mask, 1, chunk), sel_mask, 0);
                 cb(kq_mask, "comp_kq_mask", il);

@@ -305,7 +305,7 @@ llama_model_kimi_k31::graph::graph(const llm_graph_params & params) :
     const bool     use_attn_res  = res_bs > 0;
     const int64_t  n_embd_latent = hparams.n_expert_latent > 0 ? hparams.n_expert_latent : n_embd;
 
-    ggml_tensor * prev_sel = nullptr;
+    std::vector<ggml_tensor *> prev_picks;
 
     for (int il = 0; il < n_layer; ++il) {
         const auto & layer = model.layers[il];
@@ -331,11 +331,11 @@ llama_model_kimi_k31::graph::graph(const llm_graph_params & params) :
             cur = build_kda_layer(cur, layer, inp_rs, d_conv, head_dim, n_head_kda,
                                   d_inner, n_seq_tokens, n_seqs, il);
         } else {
-            dsa_out dsa = build_dsa_layer(cur, layer, mctx_idx, inp_attn, prev_sel,
+            dsa_out dsa = build_dsa_layer(cur, layer, mctx_idx, inp_attn, prev_picks,
                                           n_embd_head_k_mla, kv_lora_rank,
                                           n_embd_head_qk_rope, n_embd_head_qk_nope, kq_scale_mla, il);
-            cur      = dsa.out;
-            prev_sel = dsa.sel;
+            cur        = dsa.out;
+            prev_picks = dsa.picks;
         }
 
         prefix_sum = banked ? cur : ggml_add(ctx0, prefix_sum, cur);
@@ -498,21 +498,11 @@ ggml_tensor * llama_model_kimi_k31::graph::build_kda_layer(
 // Gated DSA layer: nope MLA over the top-k cells picked by the lightning indexer
 //
 
-// true if a layer reads the selection of the layer before it
-static bool shares_sel(const llama_hparams & hparams) {
-    for (uint32_t il = 0; il < hparams.n_layer(); il++) {
-        if (!hparams.is_indexer_full(il)) {
-            return true;
-        }
-    }
-    return false;
-}
-
 llama_model_kimi_k31::graph::dsa_out
 llama_model_kimi_k31::graph::build_dsa_layer(
         ggml_tensor * cur, const llama_layer & layer,
         const llama_kv_cache_context * mctx_idx, llm_graph_input_attn_k * inp_attn,
-        ggml_tensor * prev_sel,
+        const std::vector<ggml_tensor *> & prev_picks,
         int64_t n_embd_head_k_mla, int64_t kv_lora_rank,
         int64_t n_embd_head_qk_rope, int64_t n_embd_head_qk_nope, float kq_scale, int il) {
 
@@ -596,7 +586,7 @@ llama_model_kimi_k31::graph::build_dsa_layer(
 
         ik = mctx_idx->get_k(ctx0, il);
     } else {
-        GGML_ASSERT(prev_sel != nullptr && "shared indexer layer must follow a full indexer layer");
+        GGML_ASSERT(!prev_picks.empty() && "shared indexer layer must follow a full indexer layer");
     }
 
     // the selection is applied as an additive mask, so attention only gets cheaper when the backend
@@ -607,10 +597,11 @@ llama_model_kimi_k31::graph::build_dsa_layer(
 
     // the selection and the attention of a token read the caches and not the other tokens of the ubatch,
     // and the score and the selection have n_kv values per token
-    // a layer that shares the selection of the layer before it needs the selection of all the tokens: one chunk
-    ggml_tensor * sel = prev_sel;
-    ggml_tensor * out = build_chunked(shares_sel(hparams) ? std::vector<llm_graph_chunk>{ { 0, n_tokens } } : chunks,
-            [&](size_t, const llm_graph_chunk & chunk) {
+    // a layer that shares the selection of this layer reads the picks of each chunk: they are small, the mask is not
+    std::vector<ggml_tensor *> picks;
+    ggml_tensor * out = build_chunked([&](size_t ic, const llm_graph_chunk & chunk) {
+        ggml_tensor * kq_mask = build_chunk_view(inp_attn->self_attn_mask.raw, 1, chunk);
+
         if (full) {
             ggml_tensor * iq_c = build_chunk_view(iq, 2, chunk);
             ggml_tensor * iw_c = build_chunk_view(iw, 1, chunk);
@@ -622,7 +613,6 @@ llama_model_kimi_k31::graph::build_dsa_layer(
             iw_c = ggml_view_4d(ctx0, iw_c, n_idx_head, chunk.n/n_stream, 1, n_stream,
                     iw_c->nb[1], iw_c->nb[2]/n_stream, iw_c->nb[2]/n_stream, 0);
 
-            ggml_tensor * kq_mask     = build_chunk_view(inp_attn->self_attn_mask.raw, 1, chunk);
             ggml_tensor * kq_mask_lid = kq_mask;
             if (cparams.fused_lid && kq_mask_lid->type != GGML_TYPE_F16) {
                 kq_mask_lid = ggml_cast(ctx0, kq_mask_lid, GGML_TYPE_F16);
@@ -652,9 +642,13 @@ llama_model_kimi_k31::graph::build_dsa_layer(
             ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, score, n_top_k));
             cb(top_k, "indexer_top_k", il);
 
-            sel = build_top_k_mask(kq_mask, top_k, il);
-            cb(sel, "kq_mask_dsa", il);
+            picks.push_back(top_k);
+        } else {
+            picks.push_back(prev_picks[ic]);
         }
+
+        ggml_tensor * sel = build_top_k_mask(kq_mask, picks[ic], il);
+        cb(sel, "kq_mask_dsa", il);
 
         return build_attn_mha(build_chunk_view(Q, 2, chunk), k, v, nullptr, sel, nullptr, nullptr, layer.wv_b,
                               n_sel, kq_scale, il);
@@ -671,7 +665,7 @@ llama_model_kimi_k31::graph::build_dsa_layer(
     out = ggml_mul_mat(ctx0, layer.wo, out);
     cb(out, "mla_out", il);
 
-    return { out, sel };
+    return { out, picks };
 }
 
 //

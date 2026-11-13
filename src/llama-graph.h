@@ -1037,8 +1037,11 @@ struct llm_graph_chunk {
     int64_t n;
 };
 
-// the most tokens of a chunk, 0 = no chunks
-// a tensor with n_ctx elements per token, such as an attention mask, then has at most 1 GiB of F32 elements
+using llm_graph_chunk_fn = std::function<ggml_tensor * (size_t ic, const llm_graph_chunk & chunk)>;
+
+// the default of llama_cparams::n_chunk
+// a tensor that a graph builds with n_ctx elements per token, such as a score or a selection, then has at most
+// 1 GiB of F32 elements; an input of the graph keeps the size of the ubatch
 uint32_t llm_graph_n_chunk(const llama_cparams & cparams);
 
 struct llm_graph_moe_cache_slots {
@@ -1102,7 +1105,7 @@ struct llm_graph_context {
     ggml_tensor * h_nextn_dev;
     ggml_tensor * h_nextn_src;
 
-    // the token chunks of the ubatch for build_chunked, see llm_graph_n_chunk
+    // the token chunks of the ubatch for build_chunked, see llama_cparams::n_chunk
     const std::vector<llm_graph_chunk> chunks;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
@@ -1267,8 +1270,7 @@ struct llm_graph_context {
 
     // fn builds the rows [ne0, chunk.n] of the tokens of chunk ic, the result is [ne0, n_tokens]
     // with one chunk the result is the result of fn
-    using llm_chunk_fn = std::function<ggml_tensor * (size_t ic, const llm_graph_chunk & chunk)>;
-    ggml_tensor * build_chunked(const std::vector<llm_graph_chunk> & chunks, const llm_chunk_fn & fn) const;
+    ggml_tensor * build_chunked(const llm_graph_chunk_fn & fn) const;
 
     // the tokens of chunk in dimension dim (1 or 2) of t: t if the chunk has all the tokens of the ubatch, nullptr if t is nullptr
     ggml_tensor * build_chunk_view(ggml_tensor * t, int dim, const llm_graph_chunk & chunk) const;

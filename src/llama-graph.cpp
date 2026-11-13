@@ -1562,24 +1562,23 @@ uint32_t llm_graph_n_chunk(const llama_cparams & cparams) {
         return 0;
     }
 
-    // for tests: the models of the tests are too small for chunks
-    if (const char * value = getenv("LLAMA_GRAPH_CHUNK")) {
-        return std::max(0, atoi(value));
-    }
-
     return std::max<uint64_t>(1, LLM_GRAPH_CHUNK_BYTES/sizeof(float)/std::max<uint32_t>(1, cparams.n_ctx));
 }
 
-// n_tokens tokens in chunks of at most n_chunk tokens: the chunks have the same size, so that no chunk is too small for a device
+// n_tokens tokens in chunks of n_chunk tokens, the last chunk has the remainder
+// no chunk is larger than a chunk of a full ubatch, so the graph of a full ubatch is the worst case for the memory
 // one chunk with all the tokens if n_chunk is 0
 static std::vector<llm_graph_chunk> get_chunks(int64_t n_tokens, int64_t n_chunk) {
-    const int64_t n_chunks = n_chunk > 0 ? std::max<int64_t>(1, (n_tokens + n_chunk - 1)/n_chunk) : 1;
+    if (n_chunk <= 0) {
+        n_chunk = n_tokens;
+    }
 
     std::vector<llm_graph_chunk> res;
-    for (int64_t ic = 0; ic < n_chunks; ++ic) {
-        const int64_t t0 = ic*n_tokens/n_chunks;
-        res.push_back({ t0, (ic + 1)*n_tokens/n_chunks - t0 });
-    }
+    int64_t t0 = 0;
+    do {
+        res.push_back({ t0, std::min(n_chunk, n_tokens - t0) });
+        t0 += n_chunk;
+    } while (t0 < n_tokens);
 
     return res;
 }
@@ -1628,7 +1627,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     layer_inp_src    (params.layer_inp_src),
     h_nextn_dev      (params.h_nextn_dev),
     h_nextn_src      (params.h_nextn_src),
-    chunks           (get_chunks(ubatch.n_tokens, llm_graph_n_chunk(cparams))),
+    chunks           (get_chunks(ubatch.n_tokens, cparams.n_chunk)),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2702,7 +2701,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     return moe_out;
 }
 
-ggml_tensor * llm_graph_context::build_chunked(const std::vector<llm_graph_chunk> & chunks, const llm_chunk_fn & fn) const {
+ggml_tensor * llm_graph_context::build_chunked(const llm_graph_chunk_fn & fn) const {
     // the rows of the first chunk, with room for the rows of the other chunks
     // not a new tensor of the full shape: it is a leaf, and ggml-alloc keeps every leaf for the whole graph
     ggml_tensor * res = fn(0, chunks[0]);
