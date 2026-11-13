@@ -1102,6 +1102,9 @@ struct llm_graph_context {
     ggml_tensor * h_nextn_dev;
     ggml_tensor * h_nextn_src;
 
+    // the token chunks of the ubatch for build_chunked, see llm_graph_n_chunk
+    const std::vector<llm_graph_chunk> chunks;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
@@ -1110,9 +1113,6 @@ struct llm_graph_context {
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
-
-    // the token chunks of the ubatch for build_chunked, see llm_graph_n_chunk
-    const std::vector<llm_graph_chunk> chunks;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;
