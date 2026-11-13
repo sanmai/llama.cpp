@@ -1270,6 +1270,7 @@ struct llm_graph_context {
 
     // fn builds the rows [ne0, chunk.n] of the tokens of chunk ic, the result is [ne0, n_tokens]
     // with one chunk the result is the result of fn
+    // fn runs once per chunk: a tensor that fn names (cb) exists once per chunk, with the rows of that chunk
     ggml_tensor * build_chunked(const llm_graph_chunk_fn & fn) const;
 
     // the tokens of chunk in dimension dim (1 or 2) of t: t if the chunk has all the tokens of the ubatch, nullptr if t is nullptr

@@ -1554,6 +1554,7 @@ void llm_graph_result::set_params(const llm_graph_params & params) {
 
 // the size limit of a tensor with n_ctx x n_chunk F32 elements (a score or a mask of one chunk);
 // a graph has several of these tensors, so this is not the limit of the compute buffer
+// the count is in F32 elements for each type: an F16 mask of a chunk then has half of this size
 static const uint64_t LLM_GRAPH_CHUNK_BYTES = UINT64_C(1) << 30;
 
 uint32_t llm_graph_n_chunk(const llama_cparams & cparams) {
@@ -2705,15 +2706,16 @@ ggml_tensor * llm_graph_context::build_chunked(const llm_graph_chunk_fn & fn) co
     // the rows of the first chunk, with room for the rows of the other chunks
     // not a new tensor of the full shape: it is a leaf, and ggml-alloc keeps every leaf for the whole graph
     ggml_tensor * res = fn(0, chunks[0]);
+    GGML_ASSERT(res->ne[1] == chunks[0].n && res->ne[2] == 1 && res->ne[3] == 1);
+
     if (chunks.size() > 1) {
-        GGML_ASSERT(res->ne[1] == chunks[0].n);
         res = ggml_pad(ctx0, res, 0, (int) (chunks.back().t0 + chunks.back().n - chunks[0].n), 0, 0);
         ggml_build_forward_expand(gf, res);
     }
 
     for (size_t ic = 1; ic < chunks.size(); ++ic) {
         ggml_tensor * rows = fn(ic, chunks[ic]);
-        GGML_ASSERT(rows->ne[0] == res->ne[0] && rows->ne[1] == chunks[ic].n);
+        GGML_ASSERT(rows->ne[0] == res->ne[0] && rows->ne[1] == chunks[ic].n && rows->ne[2] == 1 && rows->ne[3] == 1);
 
         // each store reads the previous one, so a chunk is computed after the tensors of the previous chunk are free
         res = ggml_set_2d_inplace(ctx0, res, rows, res->nb[1], chunks[ic].t0*res->nb[1]);
@@ -2728,7 +2730,10 @@ ggml_tensor * llm_graph_context::build_chunk_view(ggml_tensor * t, int dim, cons
         return t;
     }
 
+    // the tokens are the last dimension of t, and its first dimension is not permuted
     GGML_ASSERT(dim == 1 || dim == 2);
+    GGML_ASSERT(t->ne[dim] == n_tokens && t->ne[3] == 1 && (dim == 2 || t->ne[2] == 1));
+    GGML_ASSERT(t->nb[0] == ggml_type_size(t->type));
 
     return dim == 1 ?
         ggml_view_2d(ctx0, t, t->ne[0], chunk.n, t->nb[1], chunk.t0*t->nb[1]) :
