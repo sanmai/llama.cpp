@@ -456,6 +456,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
     const auto & ci         = ratio == 2 ? inp_dsv4->get_csa()             : inp_dsv4->get_hca();
     const auto * comp_ctx   = ratio == 2 ? inp_dsv4->mctx->get_csa()       : inp_dsv4->mctx->get_hca();
     const auto * comp_state = ratio == 2 ? inp_dsv4->mctx->get_csa_state() : inp_dsv4->mctx->get_hca_state();
+    const auto & chunks_kq_mask = ratio == 2 ? chunks_csa_mask : chunks_hca_mask; // the rows of ci.kq_mask of each token chunk
 
     const int32_t rd = inp_dsv4->mctx->get_comp_read_layer(il);
 
@@ -576,7 +577,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                 if (fused_idx) {
                     score = nc == n_tok ?
                         ggml_lightning_indexer(ctx0, iq,  ik, iw,       ci.kq_mask) :
-                        ggml_lightning_indexer(ctx0, iqc, ik, rows(iw), rows(ci.kq_mask));
+                        ggml_lightning_indexer(ctx0, iqc, ik, rows(iw), chunks_kq_mask[t0/chunk]);
                     res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
                 } else {
                     ggml_tensor * kq = ggml_mul_mat(ctx0, ik_p, ggml_permute(ctx0, iqc, 0, 2, 1, 3));
@@ -742,9 +743,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
 
             // the mask and the attention of a token read the cache and the picks, and not the other tokens of the ubatch,
             // and the mask has n_raw + n_comp values per token
-            out = build_chunked([&](size_t, const llm_graph_chunk & chunk) {
-                ggml_tensor * sel_mask = build_top_k_mask(build_chunk_view(ci.kq_mask, 1, chunk), build_chunk_view(top_k, 1, chunk), "comp_top_k_mask", il);
-                ggml_tensor * kq_mask  = ggml_concat(ctx0, build_chunk_view(raw_mask, 1, chunk), sel_mask, 0);
+            out = build_chunked([&](size_t ic, const llm_graph_chunk & chunk) {
+                ggml_tensor * sel_mask = build_top_k_mask(chunks_kq_mask[ic], build_chunk_view(top_k, 1, chunk), "comp_top_k_mask", il);
+                ggml_tensor * kq_mask  = ggml_concat(ctx0, chunks_raw_mask[ic], sel_mask, 0);
                 cb(kq_mask, "comp_kq_mask", il);
 
                 return build_attn_mha(build_chunk_view(q, 2, chunk), k_all, k_all, nullptr, kq_mask, nullptr, layer.attn_sinks, nullptr, n_kv_max, kq_scale, il);
@@ -790,6 +791,12 @@ llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
     ggml_tensor * inp_out_ids = build_inp_out_ids();
     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
     ggml_build_forward_expand(gf, inp_dsv4->get_raw()->self_attn_mask.raw);
+
+    for (const auto & chunk : chunks) {
+        chunks_raw_mask.push_back(build_chunk_view(inp_dsv4->get_raw()->self_attn_mask.raw, 1, chunk));
+        chunks_csa_mask.push_back(build_chunk_view(inp_dsv4->get_csa().kq_mask, 1, chunk));
+        chunks_hca_mask.push_back(build_chunk_view(inp_dsv4->get_hca().kq_mask, 1, chunk));
+    }
 
     auto inp41 = std::make_unique<llm_graph_input_dsv41>(model, inp_dsv4->mctx);
     // embedding input has no token ids: it skips Engram, like the reference's masked (image) positions

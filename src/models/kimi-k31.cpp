@@ -305,6 +305,13 @@ llama_model_kimi_k31::graph::graph(const llm_graph_params & params) :
     const bool     use_attn_res  = res_bs > 0;
     const int64_t  n_embd_latent = hparams.n_expert_latent > 0 ? hparams.n_expert_latent : n_embd;
 
+    // the rows of the attention mask of each token chunk (see build_dsa_layer)
+    // the views are made once per graph: each view of a host input is a separate upload
+    std::vector<ggml_tensor *> chunks_kq_mask;
+    for (const auto & chunk : chunks) {
+        chunks_kq_mask.push_back(build_chunk_view(inp_attn->self_attn_mask.raw, 1, chunk));
+    }
+
     std::vector<ggml_tensor *> prev_picks;
 
     for (int il = 0; il < n_layer; ++il) {
@@ -331,7 +338,7 @@ llama_model_kimi_k31::graph::graph(const llm_graph_params & params) :
             cur = build_kda_layer(cur, layer, inp_rs, d_conv, head_dim, n_head_kda,
                                   d_inner, n_seq_tokens, n_seqs, il);
         } else {
-            dsa_out dsa = build_dsa_layer(cur, layer, mctx_idx, inp_attn, prev_picks,
+            dsa_out dsa = build_dsa_layer(cur, layer, mctx_idx, inp_attn, chunks_kq_mask, prev_picks,
                                           n_embd_head_k_mla, kv_lora_rank,
                                           n_embd_head_qk_rope, n_embd_head_qk_nope, kq_scale_mla, il);
             cur        = dsa.out;
@@ -502,6 +509,7 @@ llama_model_kimi_k31::graph::dsa_out
 llama_model_kimi_k31::graph::build_dsa_layer(
         ggml_tensor * cur, const llama_layer & layer,
         const llama_kv_cache_context * mctx_idx, llm_graph_input_attn_k * inp_attn,
+        const std::vector<ggml_tensor *> & chunks_kq_mask,
         const std::vector<ggml_tensor *> & prev_picks,
         int64_t n_embd_head_k_mla, int64_t kv_lora_rank,
         int64_t n_embd_head_qk_rope, int64_t n_embd_head_qk_nope, float kq_scale, int il) {
@@ -600,7 +608,7 @@ llama_model_kimi_k31::graph::build_dsa_layer(
     // a layer that shares the selection of this layer reads the picks of each chunk: they are small, the mask is not
     std::vector<ggml_tensor *> picks;
     ggml_tensor * out = build_chunked([&](size_t ic, const llm_graph_chunk & chunk) {
-        ggml_tensor * kq_mask = build_chunk_view(inp_attn->self_attn_mask.raw, 1, chunk);
+        ggml_tensor * kq_mask = chunks_kq_mask[ic];
 
         if (full) {
             ggml_tensor * iq_c = build_chunk_view(iq, 2, chunk);

@@ -1469,6 +1469,12 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
         std::map<std::pair<int32_t, int32_t>, ggml_tensor *> gather_k_of;
         std::map<int32_t, ggml_tensor *> gather_sel_of;
         std::map<int32_t, ggml_tensor *> gather_mask_of;
+
+        // the rows of the attention masks of each token chunk (see build_attention41)
+        // the views are made once per graph: each view of a host input is a separate upload
+        std::vector<ggml_tensor *> chunks_raw_mask;
+        std::vector<ggml_tensor *> chunks_csa_mask;
+        std::vector<ggml_tensor *> chunks_hca_mask;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
@@ -2978,6 +2984,7 @@ struct llama_model_kimi_k31 : public llama_model_base {
         dsa_out build_dsa_layer(ggml_tensor * cur, const llama_layer & layer,
                                 const llama_kv_cache_context * mctx_idx,
                                 llm_graph_input_attn_k * inp_attn,
+                                const std::vector<ggml_tensor *> & chunks_kq_mask,
                                 const std::vector<ggml_tensor *> & prev_picks,
                                 int64_t n_embd_head_k_mla, int64_t kv_lora_rank,
                                 int64_t n_embd_head_qk_rope,
