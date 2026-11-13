@@ -2717,9 +2717,11 @@ ggml_tensor * llm_graph_context::build_chunked(const llm_graph_chunk_fn & fn) co
         ggml_tensor * rows = fn(ic, chunks[ic]);
         GGML_ASSERT(rows->ne[0] == res->ne[0] && rows->ne[1] == chunks[ic].n && rows->ne[2] == 1 && rows->ne[3] == 1);
 
-        // each store reads the previous one, so a chunk is computed after the tensors of the previous chunk are free
-        res = ggml_set_2d_inplace(ctx0, res, rows, res->nb[1], chunks[ic].t0*res->nb[1]);
-        ggml_build_forward_expand(gf, res);
+        // a copy to a view of res and not ggml_set, which has a byte offset below 1 GiB
+        // the copy is in the graph before the nodes that read res, so it runs before them,
+        // and the tensors of a chunk are free before the next chunk
+        ggml_tensor * dst = ggml_view_2d(ctx0, res, res->ne[0], chunks[ic].n, res->nb[1], chunks[ic].t0*res->nb[1]);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, rows, dst));
     }
 
     return res;
