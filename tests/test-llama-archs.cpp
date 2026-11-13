@@ -17,6 +17,7 @@
 #include <cstring>
 #include <cstdint>
 #include <filesystem>
+#include <iterator>
 #include <memory>
 #include <random>
 #include <regex>
@@ -1790,6 +1791,110 @@ static void set_env(const char * name, const char * value) {
 #endif
 }
 
+// the discrete selections of a decode (the top-k cells of an indexer, the experts of a router) and their scores:
+// per tensor name, one row per token in decode order
+struct sel_capture {
+    std::vector<std::pair<std::string, std::vector<std::vector<float>>>> rows;
+
+    const std::vector<std::vector<float>> * find(const std::string & name) const {
+        for (const auto & e : rows) {
+            if (e.first == name) {
+                return &e.second;
+            }
+        }
+        return nullptr;
+    }
+};
+
+static bool sel_capture_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    sel_capture * cap = (sel_capture *) user_data;
+    const char * name = ggml_get_name(t);
+    // not the reshaped views of these tensors, which have a suffix after the layer
+    bool want = (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_I32) && ggml_is_contiguous(t) && strchr(name, ' ') == nullptr;
+    if (want) {
+        want = false;
+        for (const char * prefix : { "indexer_top_k-", "indexer_score-", "ffn_moe_topk-", "ffn_moe_probs-" }) {
+            want = want || strncmp(name, prefix, strlen(prefix)) == 0;
+        }
+    }
+    if (ask || !want) {
+        return want;
+    }
+    std::vector<uint8_t> buf(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, buf.data(), 0, buf.size());
+
+    auto it = std::find_if(cap->rows.begin(), cap->rows.end(), [&](const auto & e) { return e.first == name; });
+    if (it == cap->rows.end()) {
+        cap->rows.emplace_back(name, std::vector<std::vector<float>>());
+        it = cap->rows.end() - 1;
+    }
+    const int64_t n_row = t->ne[0];
+    for (int64_t i = 0; i < ggml_nelements(t)/n_row; i++) {
+        std::vector<float> row(n_row);
+        for (int64_t j = 0; j < n_row; j++) {
+            row[j] = t->type == GGML_TYPE_F32 ? ((const float *) buf.data())[i*n_row + j] : (float) ((const int32_t *) buf.data())[i*n_row + j];
+        }
+        it->second.push_back(std::move(row));
+    }
+    return true;
+}
+
+// prints the tokens that have a different selection (tensors sel-<il>, scores score-<il>) in the two decodes,
+// with the scores of the items that differ
+// a selection of a device changes with the batch shape when the scores of two items are almost equal
+static void print_sel_diff(const sel_capture & ref, const sel_capture & cur, const std::string & sel, const std::string & score) {
+    size_t n_rows = 0;
+    size_t n_diff = 0;
+    for (const auto & e : ref.rows) {
+        if (e.first.compare(0, sel.size(), sel) != 0) {
+            continue;
+        }
+        const std::string il = e.first.substr(sel.size());
+        const auto * top_k_cur = cur.find(e.first);
+        const auto * score_ref = ref.find(score + il);
+        const auto * score_cur = cur.find(score + il);
+        if (!top_k_cur || !score_ref || !score_cur || top_k_cur->size() != e.second.size() ||
+                score_ref->size() != e.second.size() || score_cur->size() != e.second.size()) {
+            LOG("  %s%s: the tensors of the two decodes do not match\n", sel.c_str(), il.c_str());
+            continue;
+        }
+        for (size_t t = 0; t < e.second.size(); t++) {
+            std::vector<float> a = e.second[t];
+            std::vector<float> b = (*top_k_cur)[t];
+            std::sort(a.begin(), a.end());
+            std::sort(b.begin(), b.end());
+            n_rows++;
+            if (a == b) {
+                continue;
+            }
+            n_diff++;
+
+            const std::vector<float> & s_ref = (*score_ref)[t];
+            const std::vector<float> & s_cur = (*score_cur)[t];
+            double diff_max = 0.0;
+            for (size_t j = 0; j < s_ref.size() && j < s_cur.size(); j++) {
+                if (std::isfinite(s_ref[j]) && std::isfinite(s_cur[j])) {
+                    diff_max = std::max(diff_max, (double) std::fabs(s_ref[j] - s_cur[j]));
+                }
+            }
+            std::vector<float> only_a;
+            std::vector<float> only_b;
+            std::set_difference(a.begin(), a.end(), b.begin(), b.end(), std::back_inserter(only_a));
+            std::set_difference(b.begin(), b.end(), a.begin(), a.end(), std::back_inserter(only_b));
+
+            LOG("  %s%s token %3zu: score max abs diff %.2e;", sel.c_str(), il.c_str(), t, diff_max);
+            for (const float idx : only_a) {
+                LOG(" -%d (%.7e, %.7e)", (int) idx, s_ref[(size_t) idx], s_cur[(size_t) idx]);
+            }
+            for (const float idx : only_b) {
+                LOG(" +%d (%.7e, %.7e)", (int) idx, s_ref[(size_t) idx], s_cur[(size_t) idx]);
+            }
+            LOG("\n");
+        }
+    }
+    LOG("  %s: %zu of %zu selections differ\n", sel.c_str(), n_diff, n_rows);
+}
+
 // the logits of all tokens, with token chunks of n_chunk tokens ("0": no chunks)
 // batches of n_ubatch/2, n_ubatch and n_ubatch/2 tokens give ubatches with different chunk counts
 // n_ubatch_ctx: the ubatch size of the context, for a reference with small ubatches and no chunks
@@ -1897,8 +2002,23 @@ static int test_chunk(const std::string & arch_filter, const size_t seed, const 
             for (const llama_flash_attn_type fa : { LLAMA_FLASH_ATTN_TYPE_DISABLED, LLAMA_FLASH_ATTN_TYPE_ENABLED }) {
                 ctx_params.flash_attn_type = fa;
 
+                sel_capture sel_ref;
+                sel_capture sel_chunk;
+                if (verbosity >= LOG_LEVEL_WARN) {
+                    ctx_params.cb_eval = sel_capture_cb;
+                }
+
+                ctx_params.cb_eval_user_data = &sel_ref;
                 const std::vector<float> logits_ref   = get_logits_chunk(model.get(), ctx_params, tokens, "0");
+                ctx_params.cb_eval_user_data = &sel_chunk;
                 const std::vector<float> logits_chunk = get_logits_chunk(model.get(), ctx_params, tokens, n_chunk);
+
+                if (verbosity >= LOG_LEVEL_WARN) {
+                    LOG("%s, flash attention %d: selections with chunks against no chunks\n", llama_arch_name(arch), fa == LLAMA_FLASH_ATTN_TYPE_ENABLED);
+                    print_sel_diff(sel_ref, sel_chunk, "indexer_top_k-", "indexer_score-");
+                    print_sel_diff(sel_ref, sel_chunk, "ffn_moe_topk-",  "ffn_moe_probs-");
+                    ctx_params.cb_eval = nullptr;
+                }
 
                 nmse_val = std::max(nmse_val, nmse(logits_ref, logits_chunk));
 
