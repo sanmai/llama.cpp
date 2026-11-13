@@ -1038,7 +1038,7 @@ struct llm_graph_chunk {
 };
 
 // the most tokens of a chunk, 0 = no chunks
-// a tensor with n_ctx elements per token, such as an attention mask, then has at most 2^28 elements
+// a tensor with n_ctx elements per token, such as an attention mask, then has at most 1 GiB of F32 elements
 uint32_t llm_graph_n_chunk(const llama_cparams & cparams);
 
 struct llm_graph_moe_cache_slots {

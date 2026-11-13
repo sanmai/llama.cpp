@@ -1552,6 +1552,10 @@ void llm_graph_result::set_params(const llm_graph_params & params) {
 // llm_graph_context
 //
 
+// the size limit of a tensor with n_ctx x n_chunk F32 elements (a score or a mask of one chunk);
+// a graph has several of these tensors, so this is not the limit of the compute buffer
+static const uint64_t LLM_GRAPH_CHUNK_BYTES = UINT64_C(1) << 30;
+
 uint32_t llm_graph_n_chunk(const llama_cparams & cparams) {
     // the streams of a split cache are not split into chunks
     if (!cparams.kv_unified && cparams.n_seq_max > 1) {
@@ -1563,7 +1567,7 @@ uint32_t llm_graph_n_chunk(const llama_cparams & cparams) {
         return std::max(0, atoi(value));
     }
 
-    return std::max<uint32_t>(1, (UINT32_C(1) << 28)/std::max<uint32_t>(1, cparams.n_ctx));
+    return std::max<uint64_t>(1, LLM_GRAPH_CHUNK_BYTES/sizeof(float)/std::max<uint32_t>(1, cparams.n_ctx));
 }
 
 // n_tokens tokens in chunks of at most n_chunk tokens: the chunks have the same size, so that no chunk is too small for a device
