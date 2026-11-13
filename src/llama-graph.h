@@ -1269,7 +1269,7 @@ struct llm_graph_context {
     using llm_chunk_fn = std::function<ggml_tensor * (size_t ic, const llm_graph_chunk & chunk)>;
     ggml_tensor * build_chunked(const std::vector<llm_graph_chunk> & chunks, const llm_chunk_fn & fn) const;
 
-    // the tokens of chunk in dimension dim (1 or 2) of t: t if the chunk has all of them, nullptr if t is nullptr
+    // the tokens of chunk in dimension dim (1 or 2) of t: t if the chunk has all the tokens of the ubatch, nullptr if t is nullptr
     ggml_tensor * build_chunk_view(ggml_tensor * t, int dim, const llm_graph_chunk & chunk) const;
 
     // the slots of the selected experts in the MoE cache, nullptr if the experts of the layer are not read from the cache

@@ -1864,7 +1864,7 @@ static int test_chunk(const std::string & arch_filter, const size_t seed, const 
     size_t n_failed = 0;
     for (const llm_arch & arch : llama_arch_all()) {
         // the archs that build their sparse attention with llm_graph_context::build_chunked
-        if (arch != LLM_ARCH_QWEN4EXP && arch != LLM_ARCH_GLM5_NEXT && arch != LLM_ARCH_DEEPSEEK41) {
+        if (arch != LLM_ARCH_QWEN4EXP && arch != LLM_ARCH_GLM5_NEXT && arch != LLM_ARCH_DEEPSEEK41 && arch != LLM_ARCH_KIMI_K31) {
             continue;
         }
         if (!arch_matches(arch_filter, arch) || !arch_supported(arch)) {
@@ -1875,11 +1875,11 @@ static int test_chunk(const std::string & arch_filter, const size_t seed, const 
         n_tests++;
         try {
             gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, true);
-            if (arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_GLM5_NEXT || arch == LLM_ARCH_DEEPSEEK41) {
+            if (arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_GLM5_NEXT || arch == LLM_ARCH_DEEPSEEK41 || arch == LLM_ARCH_KIMI_K31) {
                 // a realistic top-k, so that the selection depends on the indexer query
                 gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_ATTENTION_INDEXER_TOP_K).c_str(), 8);
             }
-            if (arch == LLM_ARCH_GLM5_NEXT) {
+            if (arch == LLM_ARCH_GLM5_NEXT || arch == LLM_ARCH_KIMI_K31) {
                 // every layer has its own indexer: a layer that shares a selection disables the chunks
                 gguf_remove_key(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_ATTENTION_INDEXER_TYPES).c_str());
             }

@@ -2716,7 +2716,7 @@ ggml_tensor * llm_graph_context::build_chunked(const std::vector<llm_graph_chunk
 }
 
 ggml_tensor * llm_graph_context::build_chunk_view(ggml_tensor * t, int dim, const llm_graph_chunk & chunk) const {
-    if (t == nullptr || chunk.n == t->ne[dim]) {
+    if (t == nullptr || chunk.n == n_tokens) {
         return t;
     }
 

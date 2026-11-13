@@ -498,6 +498,16 @@ ggml_tensor * llama_model_kimi_k31::graph::build_kda_layer(
 // Gated DSA layer: nope MLA over the top-k cells picked by the lightning indexer
 //
 
+// true if a layer reads the selection of the layer before it
+static bool shares_sel(const llama_hparams & hparams) {
+    for (uint32_t il = 0; il < hparams.n_layer(); il++) {
+        if (!hparams.is_indexer_full(il)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 llama_model_kimi_k31::graph::dsa_out
 llama_model_kimi_k31::graph::build_dsa_layer(
         ggml_tensor * cur, const llama_layer & layer,
@@ -551,70 +561,6 @@ llama_model_kimi_k31::graph::build_dsa_layer(
     ggml_tensor * kv_cmpr_3d = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, n_tokens);
     ggml_tensor * K = ggml_concat(ctx0, kv_cmpr_3d, k_pe, 0);
 
-    // --- DSA: keep only the top-k cells of this layer ---
-    ggml_tensor * sel = prev_sel;
-    if (hparams.is_indexer_full(il) && layer.indexer_attn_q_b) {
-        GGML_ASSERT(mctx_idx != nullptr);
-
-        ggml_tensor * iq = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);
-        iq = ggml_reshape_3d(ctx0, iq, n_idx_dim, n_idx_head, n_tokens);
-
-        ggml_tensor * ik = ggml_mul_mat(ctx0, layer.indexer_attn_k, cur);
-        ik = build_norm(ik, layer.indexer_k_norm, layer.indexer_k_norm_b, LLM_NORM, il);
-        ik = ggml_reshape_3d(ctx0, ik, n_idx_dim, 1, n_tokens);
-        cb(ik, "indexer_k", il);
-
-        // the indexer keys go to the cells of the matching attention layer
-        ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, ik, inp_attn->get_k_idxs(), il));
-
-        ggml_tensor * iw = ggml_mul_mat(ctx0, layer.indexer_proj, cur);
-        // pre-scale so the huge score tensor is not scaled afterwards
-        iw = ggml_scale(ctx0, iw, 1.0f / sqrtf(float(n_idx_dim * n_idx_head)));
-
-        ik = mctx_idx->get_k(ctx0, il);
-
-        // split the ubatch into its streams, k carries one row per stream
-        const int64_t n_stream = ik->ne[3];
-        iq = ggml_view_4d(ctx0, iq, n_idx_dim, n_idx_head, n_tokens/n_stream, n_stream,
-                iq->nb[1], iq->nb[2], iq->nb[3]/n_stream, 0);
-        iw = ggml_view_4d(ctx0, iw, n_idx_head, n_tokens/n_stream, 1, n_stream,
-                iw->nb[1], iw->nb[2]/n_stream, iw->nb[2]/n_stream, 0);
-
-        ggml_tensor * kq_mask_lid = inp_attn->self_attn_mask.raw;
-        if (cparams.fused_lid && kq_mask_lid->type != GGML_TYPE_F16) {
-            kq_mask_lid = ggml_cast(ctx0, kq_mask_lid, GGML_TYPE_F16);
-        }
-
-        ggml_tensor * score;
-        if (cparams.fused_lid) {
-            score = ggml_lightning_indexer(ctx0, iq, ik, iw, kq_mask_lid);
-            res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
-        } else {
-            ggml_tensor * q_p = ggml_permute(ctx0, iq, 0, 2, 1, 3); // [n_idx_dim, n_tokens, n_idx_head]
-            ggml_tensor * k_p = ggml_permute(ctx0, ik, 0, 2, 1, 3); // [n_idx_dim, n_kv, 1]
-
-            ggml_tensor * kq = ggml_mul_mat(ctx0, k_p, q_p);        // [n_kv, n_tokens, n_idx_head]
-            kq = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3)); // [n_idx_head, n_tokens, n_kv]
-
-            score = ggml_relu(ctx0, kq);
-            score = ggml_mul(ctx0, score, iw);
-            score = ggml_sum_rows(ctx0, score);                      // [1, n_tokens, n_kv]
-            score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3)); // [n_kv, n_tokens, 1]
-
-            score = ggml_add(ctx0, score, kq_mask_lid);
-        }
-        cb(score, "indexer_score", il);
-
-        const int64_t n_top_k = std::min<int64_t>(score->ne[0], hparams.indexer_top_k);
-        ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, score, n_top_k));
-        cb(top_k, "indexer_top_k", il);
-
-        sel = build_top_k_mask(inp_attn->self_attn_mask.raw, top_k, il);
-        cb(sel, "kq_mask_dsa", il);
-    } else {
-        GGML_ASSERT(sel != nullptr && "shared indexer layer must follow a full indexer layer");
-    }
-
     ggml_build_forward_expand(gf, Q);
     ggml_build_forward_expand(gf, K);
     ggml_build_forward_expand(gf, mctx_mla->cpy_k(ctx0, K, inp_attn->get_k_idxs(), il));
@@ -623,13 +569,96 @@ llama_model_kimi_k31::graph::build_dsa_layer(
     ggml_tensor * v = ggml_view_4d(ctx0, k, kv_lora_rank, k->ne[1], k->ne[2], k->ne[3],
         k->nb[1], k->nb[2], k->nb[3], 0);
 
+    // --- DSA: keep only the top-k cells of this layer ---
+    const bool full = hparams.is_indexer_full(il) && layer.indexer_attn_q_b;
+
+    ggml_tensor * iq = nullptr;
+    ggml_tensor * ik = nullptr;
+    ggml_tensor * iw = nullptr;
+    if (full) {
+        GGML_ASSERT(mctx_idx != nullptr);
+
+        iq = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);
+        iq = ggml_reshape_3d(ctx0, iq, n_idx_dim, n_idx_head, n_tokens);
+
+        ik = ggml_mul_mat(ctx0, layer.indexer_attn_k, cur);
+        ik = build_norm(ik, layer.indexer_k_norm, layer.indexer_k_norm_b, LLM_NORM, il);
+        ik = ggml_reshape_3d(ctx0, ik, n_idx_dim, 1, n_tokens);
+        cb(ik, "indexer_k", il);
+
+        // the indexer keys go to the cells of the matching attention layer
+        // the keys of all the tokens are stored before the token chunks read them
+        ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, ik, inp_attn->get_k_idxs(), il));
+
+        iw = ggml_mul_mat(ctx0, layer.indexer_proj, cur);
+        // pre-scale so the huge score tensor is not scaled afterwards
+        iw = ggml_scale(ctx0, iw, 1.0f / sqrtf(float(n_idx_dim * n_idx_head)));
+
+        ik = mctx_idx->get_k(ctx0, il);
+    } else {
+        GGML_ASSERT(prev_sel != nullptr && "shared indexer layer must follow a full indexer layer");
+    }
+
     // the selection is applied as an additive mask, so attention only gets cheaper when the backend
     // can skip masked columns: cuda flash attention gathers the visible cells when n_kv_max > 0 and
     // the cache holds at least 4096 cells. on the dense fallbacks the mask keeps the result correct
     // but the kq and kqv products still run over the whole cache, and the indexer is pure overhead
     const int64_t n_sel = std::min<int64_t>(mctx_mla->get_n_kv(), hparams.indexer_top_k);
-    ggml_tensor * out = build_attn_mha(Q, k, v, nullptr, sel, nullptr, nullptr, layer.wv_b,
-                                       n_sel, kq_scale, il);
+
+    // the selection and the attention of a token read the caches and not the other tokens of the ubatch,
+    // and the score and the selection have n_kv values per token
+    // a layer that shares the selection of the layer before it needs the selection of all the tokens: one chunk
+    ggml_tensor * sel = prev_sel;
+    ggml_tensor * out = build_chunked(shares_sel(hparams) ? std::vector<llm_graph_chunk>{ { 0, n_tokens } } : chunks,
+            [&](size_t, const llm_graph_chunk & chunk) {
+        if (full) {
+            ggml_tensor * iq_c = build_chunk_view(iq, 2, chunk);
+            ggml_tensor * iw_c = build_chunk_view(iw, 1, chunk);
+
+            // split the tokens into their streams, k carries one row per stream
+            const int64_t n_stream = ik->ne[3];
+            iq_c = ggml_view_4d(ctx0, iq_c, n_idx_dim, n_idx_head, chunk.n/n_stream, n_stream,
+                    iq_c->nb[1], iq_c->nb[2], iq_c->nb[3]/n_stream, 0);
+            iw_c = ggml_view_4d(ctx0, iw_c, n_idx_head, chunk.n/n_stream, 1, n_stream,
+                    iw_c->nb[1], iw_c->nb[2]/n_stream, iw_c->nb[2]/n_stream, 0);
+
+            ggml_tensor * kq_mask     = build_chunk_view(inp_attn->self_attn_mask.raw, 1, chunk);
+            ggml_tensor * kq_mask_lid = kq_mask;
+            if (cparams.fused_lid && kq_mask_lid->type != GGML_TYPE_F16) {
+                kq_mask_lid = ggml_cast(ctx0, kq_mask_lid, GGML_TYPE_F16);
+            }
+
+            ggml_tensor * score;
+            if (cparams.fused_lid) {
+                score = ggml_lightning_indexer(ctx0, iq_c, ik, iw_c, kq_mask_lid);
+                res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
+            } else {
+                ggml_tensor * q_p = ggml_permute(ctx0, iq_c, 0, 2, 1, 3); // [n_idx_dim, n_tokens, n_idx_head]
+                ggml_tensor * k_p = ggml_permute(ctx0, ik, 0, 2, 1, 3);   // [n_idx_dim, n_kv, 1]
+
+                ggml_tensor * kq = ggml_mul_mat(ctx0, k_p, q_p);        // [n_kv, n_tokens, n_idx_head]
+                kq = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3)); // [n_idx_head, n_tokens, n_kv]
+
+                score = ggml_relu(ctx0, kq);
+                score = ggml_mul(ctx0, score, iw_c);
+                score = ggml_sum_rows(ctx0, score);                      // [1, n_tokens, n_kv]
+                score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3)); // [n_kv, n_tokens, 1]
+
+                score = ggml_add(ctx0, score, kq_mask_lid);
+            }
+            cb(score, "indexer_score", il);
+
+            const int64_t n_top_k = std::min<int64_t>(score->ne[0], hparams.indexer_top_k);
+            ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, score, n_top_k));
+            cb(top_k, "indexer_top_k", il);
+
+            sel = build_top_k_mask(kq_mask, top_k, il);
+            cb(sel, "kq_mask_dsa", il);
+        }
+
+        return build_attn_mha(build_chunk_view(Q, 2, chunk), k, v, nullptr, sel, nullptr, nullptr, layer.wv_b,
+                              n_sel, kq_scale, il);
+    });
     cb(out, "kqv_out", il);
 
     // K3.1: attn_output *= sigmoid(g_proj(x)), then o_proj
