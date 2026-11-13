@@ -2703,25 +2703,38 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 }
 
 ggml_tensor * llm_graph_context::build_chunked(const llm_graph_chunk_fn & fn) const {
-    // the rows of the first chunk, with room for the rows of the other chunks
-    // not a new tensor of the full shape: it is a leaf, and ggml-alloc keeps every leaf for the whole graph
-    ggml_tensor * res = fn(0, chunks[0]);
-    GGML_ASSERT(res->ne[1] == chunks[0].n && res->ne[2] == 1 && res->ne[3] == 1);
+    // ggml_set has a byte offset below 1 GiB, so a larger result is built in parts: chunks ic to ie - 1 are one part,
+    // and each store has an offset from the start of its part
+    const size_t offset_max = (size_t) 1 << 30;
 
-    if (chunks.size() > 1) {
-        res = ggml_pad(ctx0, res, 0, (int) (chunks.back().t0 + chunks.back().n - chunks[0].n), 0, 0);
-        ggml_build_forward_expand(gf, res);
-    }
+    ggml_tensor * res = nullptr;
+    for (size_t ic = 0, ie = 0; ic < chunks.size(); ic = ie) {
+        // the rows of the first chunk, with room for the rows of the other chunks
+        // not a new tensor of the full shape: it is a leaf, and ggml-alloc keeps every leaf for the whole graph
+        ggml_tensor * part = fn(ic, chunks[ic]);
+        GGML_ASSERT(part->ne[1] == chunks[ic].n && part->ne[2] == 1 && part->ne[3] == 1);
 
-    for (size_t ic = 1; ic < chunks.size(); ++ic) {
-        ggml_tensor * rows = fn(ic, chunks[ic]);
-        GGML_ASSERT(rows->ne[0] == res->ne[0] && rows->ne[1] == chunks[ic].n && rows->ne[2] == 1 && rows->ne[3] == 1);
+        const auto offset = [&](size_t i) {
+            return (size_t) (chunks[i].t0 - chunks[ic].t0)*part->nb[1];
+        };
 
-        // a copy to a view of res and not ggml_set, which has a byte offset below 1 GiB
-        // the copy is in the graph before the nodes that read res, so it runs before them,
-        // and the tensors of a chunk are free before the next chunk
-        ggml_tensor * dst = ggml_view_2d(ctx0, res, res->ne[0], chunks[ic].n, res->nb[1], chunks[ic].t0*res->nb[1]);
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, rows, dst));
+        for (ie = ic + 1; ie < chunks.size() && offset(ie) < offset_max; ++ie) {
+        }
+        if (ie > ic + 1) {
+            part = ggml_pad(ctx0, part, 0, (int) (chunks[ie - 1].t0 + chunks[ie - 1].n - chunks[ic].t0 - chunks[ic].n), 0, 0);
+            ggml_build_forward_expand(gf, part);
+        }
+
+        for (size_t i = ic + 1; i < ie; ++i) {
+            ggml_tensor * rows = fn(i, chunks[i]);
+            GGML_ASSERT(rows->ne[0] == part->ne[0] && rows->ne[1] == chunks[i].n && rows->ne[2] == 1 && rows->ne[3] == 1);
+
+            // each store reads the previous one, so a chunk is computed after the tensors of the previous chunk are free
+            part = ggml_set_2d_inplace(ctx0, part, rows, part->nb[1], offset(i));
+            ggml_build_forward_expand(gf, part);
+        }
+
+        res = res ? ggml_concat(ctx0, res, part, 1) : part;
     }
 
     return res;
