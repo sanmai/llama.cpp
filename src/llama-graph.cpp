@@ -1557,9 +1557,20 @@ void llm_graph_result::set_params(const llm_graph_params & params) {
 // the count is in F32 elements for each type: an F16 mask of a chunk then has half of this size
 static const uint64_t LLM_GRAPH_CHUNK_BYTES = UINT64_C(1) << 30;
 
+// the largest ubatch that has chunks
+// build_chunked stores a chunk with ggml_set, which has a byte offset below 1 GiB (an int32 in op_params):
+// 16384 tokens of a result with 16384 F32 elements per token
+// TODO: a 64-bit offset in ggml_set removes this limit
+static const uint32_t LLM_GRAPH_CHUNK_UBATCH_MAX = 16384;
+
 uint32_t llm_graph_n_chunk(const llama_cparams & cparams) {
     // the streams of a split cache are not split into chunks
     if (!cparams.kv_unified && cparams.n_seq_max > 1) {
+        return 0;
+    }
+
+    if (cparams.n_ubatch > LLM_GRAPH_CHUNK_UBATCH_MAX) {
+        LLAMA_LOG_WARN("%s: n_ubatch = %u is above %u, no token chunks\n", __func__, cparams.n_ubatch, LLM_GRAPH_CHUNK_UBATCH_MAX);
         return 0;
     }
 
@@ -2698,50 +2709,29 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 }
 
 ggml_tensor * llm_graph_context::build_chunked(const llm_graph_chunk_fn & fn) const {
-    // a result of 1 GiB or less is one part
-    ggml_tensor * res = nullptr;
-    for (size_t ic = 0; ic < chunks.size(); ) {
-        ggml_tensor * part = build_chunked_part(fn, ic);
-        res = res ? ggml_concat(ctx0, res, part, 1) : part;
+    ggml_tensor * res = fn(0, chunks[0]);
+    GGML_ASSERT(res->ne[1] == chunks[0].n && res->ne[2] == 1 && res->ne[3] == 1);
+
+    if (chunks.size() == 1) {
+        return res;
     }
-
-    return res;
-}
-
-ggml_tensor * llm_graph_context::build_chunked_part(const llm_graph_chunk_fn & fn, size_t & ic) const {
-    // ggml_set has a byte offset below 1 GiB: the part ends before the first chunk with a larger offset
-    const size_t offset_max = (size_t) 1 << 30;
-
-    const llm_graph_chunk & first = chunks[ic];
-
-    ggml_tensor * res = fn(ic, first);
-    GGML_ASSERT(res->ne[1] == first.n && res->ne[2] == 1 && res->ne[3] == 1);
 
     const size_t nb1 = res->nb[1];
 
-    size_t ie = ic + 1;
-    while (ie < chunks.size() && (chunks[ie].t0 - first.t0)*nb1 < offset_max) {
-        ie++;
-    }
+    // the rows of the first chunk, with room for the rows of the other chunks
+    // not a new tensor of the full shape: it is a leaf, and ggml-alloc keeps every leaf for the whole graph
+    res = ggml_pad(ctx0, res, 0, (int) (n_tokens - chunks[0].n), 0, 0);
+    ggml_build_forward_expand(gf, res);
 
-    if (ie > ic + 1) {
-        // the rows of the first chunk, with room for the rows of the other chunks
-        // not a new tensor of the full shape: it is a leaf, and ggml-alloc keeps every leaf for the whole graph
-        const llm_graph_chunk & last = chunks[ie - 1];
-        res = ggml_pad(ctx0, res, 0, (int) (last.t0 + last.n - first.t0 - first.n), 0, 0);
-        ggml_build_forward_expand(gf, res);
-    }
-
-    for (size_t i = ic + 1; i < ie; ++i) {
-        ggml_tensor * rows = fn(i, chunks[i]);
-        GGML_ASSERT(rows->ne[0] == res->ne[0] && rows->ne[1] == chunks[i].n && rows->ne[2] == 1 && rows->ne[3] == 1);
+    for (size_t ic = 1; ic < chunks.size(); ++ic) {
+        ggml_tensor * rows = fn(ic, chunks[ic]);
+        GGML_ASSERT(rows->ne[0] == res->ne[0] && rows->ne[1] == chunks[ic].n && rows->ne[2] == 1 && rows->ne[3] == 1);
 
         // each store reads the previous one, so a chunk is computed after the tensors of the previous chunk are free
-        res = ggml_set_2d_inplace(ctx0, res, rows, nb1, (chunks[i].t0 - first.t0)*nb1);
+        // the byte offset is below 1 GiB, see LLM_GRAPH_CHUNK_UBATCH_MAX
+        res = ggml_set_2d_inplace(ctx0, res, rows, nb1, chunks[ic].t0*nb1);
         ggml_build_forward_expand(gf, res);
     }
-
-    ic = ie;
 
     return res;
 }

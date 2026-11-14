@@ -1042,6 +1042,7 @@ using llm_graph_chunk_fn = std::function<ggml_tensor * (size_t ic, const llm_gra
 // the default of llama_cparams::n_chunk
 // a tensor that a graph builds with n_ctx elements per token, such as a score or a selection, then has at most
 // 1 GiB of F32 elements; an input of the graph keeps the size of the ubatch
+// 0 for a split cache with several sequences and for a ubatch above 16384 tokens
 uint32_t llm_graph_n_chunk(const llama_cparams & cparams);
 
 struct llm_graph_context {
@@ -1267,10 +1268,6 @@ struct llm_graph_context {
     // with one chunk the result is the result of fn
     // fn runs once per chunk: a tensor that fn names (cb) exists once per chunk, with the rows of that chunk
     ggml_tensor * build_chunked(const llm_graph_chunk_fn & fn) const;
-
-    // one part of the result of build_chunked: the rows of chunk ic and of the next chunks, as many as one tensor
-    // with ggml_set can have; sets ic to the first chunk after the part
-    ggml_tensor * build_chunked_part(const llm_graph_chunk_fn & fn, size_t & ic) const;
 
     // the tokens of chunk in dimension dim (1 or 2) of t: t if the chunk has all the tokens of the ubatch, nullptr if t is nullptr
     ggml_tensor * build_chunk_view(ggml_tensor * t, int dim, const llm_graph_chunk & chunk) const;
