@@ -1822,7 +1822,7 @@ static std::vector<float> get_logits_chunk(llama_model * model, const llama_cont
     // the context reads the chunk size when it is created
     common_set_env("LLAMA_GRAPH_CHUNK", n_chunk);
     llama_context_ptr lctx(llama_init_from_model(model, ctx_params));
-    common_set_env("LLAMA_GRAPH_CHUNK", "0");
+    common_set_env("LLAMA_GRAPH_CHUNK", "");
     if (!lctx) {
         throw std::runtime_error("failed to create llama context");
     }
