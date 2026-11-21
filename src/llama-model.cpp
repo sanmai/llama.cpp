@@ -1852,6 +1852,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // generic pass: load optional per-tensor/per-expert ".scale" tensors (e.g. NVFP4 scale2)
         // this avoids having to add scale loading to every architecture
         for (int i = 0; i < n_layer_all; ++i) {
+            if (layer_phys(i) != i) {
+                continue;
+            }
             auto & layer = layers[i];
 
             if (hparams.has_kv(i)) {
@@ -2004,6 +2007,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             if (!layer.nextn.shared_head_head_in_s && layer.nextn.shared_head_head) {
                 layer.nextn.shared_head_head_in_s = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "input_scale", i), {1}, TENSOR_NOT_REQUIRED);
+            }
+        }
+        // repeated layers share the weights and the scales of their physical layer
+        for (int il = 0; il < n_layer_all; ++il) {
+            if (layer_phys(il) != il) {
+                layers[il] = layers[layer_phys(il)];
             }
         }
         // output scales
