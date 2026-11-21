@@ -1129,6 +1129,9 @@ struct llama_model_base : public llama_model {
     // helper: read the SWA pattern as one flag per layer, or as a period expanded by set_swa_pattern
     void load_swa_pattern(llama_model_loader & ml, uint32_t n_pattern, bool dense_first = false);
 
+    // the physical layer whose weights layer il uses; looped models repeat physical layers in later slots
+    virtual int layer_phys(int il) const { return il; }
+
     void load_stats  (llama_model_loader & ml) override;
     void load_hparams(llama_model_loader & ml) override;
     void load_vocab  (llama_model_loader & ml) override;

@@ -1846,6 +1846,9 @@ struct llama_model_metis16 : public llama_model_base {
     void load_arch_tensors(llama_model_loader & ml) override;
     uint32_t graph_nodes_per_tensor() const override { return 32; }
 
+    // the virtual layers of later passes repeat the physical layers
+    int layer_phys(int il) const override { return il % n_layer_phys; }
+
     uint32_t n_pass       = 1;
     uint32_t n_stream     = 1;
     uint32_t n_mem        = 0;
@@ -2549,7 +2552,8 @@ struct llama_model_inkling2_loop : public llama_model_inkling2 {
     void load_arch_tensors(llama_model_loader & ml) override;
 
     int n_layer_phys() const override { return n_phys; }
-    int layer_phys(int il) const;
+    // each cache slot keeps its own KV and conv state
+    int layer_phys(int il) const override;
 
     int      n_phys     = 0;
     uint32_t core_start = 0;

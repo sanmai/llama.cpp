@@ -16,6 +16,7 @@
 #include <cstring>
 #include <cstdint>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <random>
 #include <regex>
@@ -1037,6 +1038,33 @@ static bool check_causal_attn_toggle(
     return ok;
 }
 
+// a weight scale must apply each time its weight does, also in the layers that repeat a physical layer
+static bool check_weight_scale_uses(llama_context * lctx) {
+    ggml_cgraph * gf = llama_graph_reserve(lctx, 1, 1, 1);
+
+    std::map<std::string, int> n_uses;
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+        const ggml_tensor * node = ggml_graph_node(gf, i);
+        for (int j = 0; j < GGML_MAX_SRC && node->src[j] != nullptr; j++) {
+            n_uses[ggml_get_name(node->src[j])]++;
+        }
+    }
+
+    const std::regex re_scale("(.*)\\.scale");
+    for (const auto & [name, n] : n_uses) {
+        std::smatch m;
+        if (!std::regex_match(name, m, re_scale)) {
+            continue;
+        }
+        const auto weight = n_uses.find(m[1].str() + ".weight");
+        if (weight == n_uses.end() || weight->second != n) {
+            LOG_ERR("%s: %s is used %d times, its weight %d times\n", __func__, name.c_str(), n, weight == n_uses.end() ? 0 : weight->second);
+            return false;
+        }
+    }
+    return true;
+}
+
 // speculative decoding: each step decodes a token and 0 to n_draft_max drafts, then rejects the drafts
 // the logits of the token must match a decode without drafts
 static double check_draft_rollback(llama_model * model, const std::vector<llama_token> & tokens, const std::vector<float> & logits_ref) {
@@ -1518,6 +1546,14 @@ static int test_backends(const std::string & arch_filter, const size_t seed, con
                         if (!encode && !check_causal_attn_toggle(model_and_ctx_dev.first.get(), model_and_ctx_dev.second.get(), tokens)) {
                             if (test_ok) {
                                 status_nmse = "\033[1;31mFAIL\033[0m (toggle)";
+                            }
+                            test_ok = false;
+                        }
+
+                        // runs after the logits checks, as it reserves a new graph in the context
+                        if (dc.split_mode != LLAMA_SPLIT_MODE_TENSOR && !check_weight_scale_uses(model_and_ctx_dev.second.get())) {
+                            if (test_ok) {
+                                status_nmse = "\033[1;31mFAIL\033[0m (scale)";
                             }
                             test_ok = false;
                         }
