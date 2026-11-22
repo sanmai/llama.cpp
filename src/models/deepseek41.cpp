@@ -203,6 +203,8 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
         }
 
         layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert}, 0);
+        // the reference computes the router in F32: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/1bae0e1088993b9b82de08f59de5be5a34e42170/inference/model.py#L813
+        prec_policy.set_acc(layer.ffn_gate_inp, GGML_PREC_F32);
         layer.ffn_exp_probs_b = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B, "bias",   i), {n_expert}, 0);
         layer.ffn_exp_probs_b_vl = create_tensor(tn(LLM_TENSOR_FFN_EXP_PROBS_B_VL, "bias", i), {n_expert}, TENSOR_NOT_REQUIRED);
         layer.ffn_norm        = create_tensor(tn(LLM_TENSOR_FFN_NORM,        "weight", i), {n_embd}, 0);
@@ -534,7 +536,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
             ggml_tensor * ik = ggml_view_4d(ctx0, comp_all, n_idx_embd, 1, n_comp, n_stream,
                     comp_all->nb[1], comp_all->nb[2], comp_all->nb[3], ggml_row_size(comp_all->type, n_embd_head));
             // the fused indexer reads the strided view in place, the unfused path needs it contiguous; CUDA has no same-type copy of quantized views, so dequantize them
-            const bool fused_idx = sparse && cparams.fused_lid && ci.kq_mask->type == GGML_TYPE_F16;
+            const bool fused_idx = sparse && ci.kq_mask->type == GGML_TYPE_F16;
             if (ggml_is_quantized(ik->type)) {
                 ik = ggml_cast(ctx0, ik, GGML_TYPE_F32);
             } else if (!fused_idx) {
@@ -578,7 +580,6 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention41(
                     score = nc == n_tok ?
                         ggml_lightning_indexer(ctx0, iq,  ik, iw,       ci.kq_mask) :
                         ggml_lightning_indexer(ctx0, iqc, ik, rows(iw), chunks_kq_mask[t0/chunk]);
-                    res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
                 } else {
                     ggml_tensor * kq = ggml_mul_mat(ctx0, ik_p, ggml_permute(ctx0, iqc, 0, 2, 1, 3));
                     kq = ggml_cont(ctx0, ggml_permute(ctx0, kq, 2, 1, 0, 3));
@@ -890,9 +891,7 @@ llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
         cur = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
-        // the reference computes the router in F32: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/1bae0e1088993b9b82de08f59de5be5a34e42170/inference/model.py#L813
         ggml_tensor * logits = build_lora_mm(layer.ffn_gate_inp, cur);
-        ggml_prec_set_acc(logits, GGML_PREC_F32);
         cb(logits, "ffn_moe_logits", il);
 
         // image (embedding) tokens use the vision router bias, as DeepSeek-V4

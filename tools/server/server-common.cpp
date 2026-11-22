@@ -306,10 +306,9 @@ bool lora_should_clear_cache(
         const std::vector<common_adapter_lora_info> & current,
         const std::vector<common_adapter_lora_info> & next) {
 
-    // This should always be called after determining that the two sets are
-    // _not_ equal. This assert is therefore some slightly wasted work and
-    // should be safe to remove as long as this method is called correctly.
-    GGML_ASSERT(!are_lora_equal(current, next));
+    if (are_lora_equal(current, next)) {
+        return false;
+    }
 
     return (
         !(lora_get_enabled_ids(current).empty() || lora_all_alora(current)) ||
@@ -1642,10 +1641,20 @@ json oaicompat_chat_params_parse(
     // Parse the OAI "reasoning_effort" field; "none" disables reasoning.
     if (body.contains("reasoning_effort")) {
         auto reasoning_effort = json_value(body, "reasoning_effort", std::string(""));
+        const auto levels = caps.at("reasoning_effort_levels").get<std::vector<std::string>>();
         if (reasoning_effort == "none") {
             inputs.enable_thinking = false;
-            inputs.chat_template_kwargs.erase("reasoning_effort");
+            // Some models use reasoning_effort = none and some throw an exception, so check the model's list of effort levels first
+            if (std::find(levels.begin(), levels.end(), reasoning_effort) != levels.end()) {
+                inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
+            } else {
+                inputs.chat_template_kwargs.erase("reasoning_effort");
+            }
         } else if (!reasoning_effort.empty()) {
+            const auto rejected = caps.at("reasoning_effort_rejected").get<std::vector<std::string>>();
+            if (std::find(rejected.begin(), rejected.end(), reasoning_effort) != rejected.end()) {
+                throw std::invalid_argument("reasoning_effort \"" + reasoning_effort + "\" is not supported by the chat template, supported levels: " + string_join(levels, ", "));
+            }
             inputs.chat_template_kwargs["reasoning_effort"] = json(reasoning_effort).dump();
         }
     }
