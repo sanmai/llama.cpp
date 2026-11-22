@@ -2283,6 +2283,14 @@ extern "C" {
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
 
+    // Attend to the listed K/V cells only, the dense selection mask is not needed.
+    // kv_idxs: [n_idx, n_batch, 1, ne3] I32, the cells of each query, shared by the heads
+    // a cell outside [0, n_kv) is an unused slot, the cells of one query must be distinct
+    // the mask is optional and stays in cell space: query j adds mask[kv_idxs[i, j], j]
+    GGML_API void ggml_flash_attn_ext_set_kv_idxs(
+            struct ggml_tensor * a,
+            struct ggml_tensor * kv_idxs);
+
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(
             struct ggml_context * ctx,

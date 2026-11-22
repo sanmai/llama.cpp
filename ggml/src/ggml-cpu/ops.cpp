@@ -8869,6 +8869,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
     const ggml_tensor * kv_rows = dst->src[5];
+    const ggml_tensor * kv_idxs = dst->src[6];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8972,18 +8973,25 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         q_to_vec_dot(pq, Q_q, DK);
 
         const int32_t * rows = kv_rows ? (const int32_t *) ((const char *) kv_rows->data + iq3*kv_rows->nb[1]) : nullptr;
+        const int32_t * idxs = kv_idxs ? (const int32_t *) ((const char *) kv_idxs->data + iq1*kv_idxs->nb[1] + iq3*kv_idxs->nb[3]) : nullptr;
 
         // online softmax / attention
         // loop over n_kv and n_head_kv
         // ref: https://arxiv.org/pdf/2112.05682.pdf
 
         for (int64_t ic = ic_start; ic < ic_end; ++ic) {
-            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[ic]) : 0.0f;
+            // with kv_idxs the loop runs over the slots of the query, the mask stays in cell space
+            const int64_t im = idxs ? idxs[ic] : ic;
+            if (im < 0 || (idxs && im >= nek1)) {
+                continue;
+            }
+
+            const float mv = mp ? slope*GGML_CPU_FP16_TO_FP32(mp[im]) : 0.0f;
             if (mv == -INFINITY) {
                 continue;
             }
 
-            const int64_t ik1 = rows ? rows[ic] : ic;
+            const int64_t ik1 = rows ? rows[ic] : im;
             if (ik1 < 0) {
                 continue;
             }
@@ -9496,7 +9504,11 @@ static void ggml_compute_forward_flash_attn_ext_f16(
     const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : nek1;
 
     const bool kv_is_f32_or_f16 = (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
-    const bool use_split_kv_path = !use_ref && !kv_rows && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
+    // with kv_idxs each query has its own cell list, only the vec loop reads it
+    const ggml_tensor * kv_idxs = dst->src[6];
+    const int64_t n_kv_loop = kv_idxs ? kv_idxs->ne[0] : n_kv_cols;
+
+    const bool use_split_kv_path = !use_ref && !kv_rows && !kv_idxs && (neq1 == 1 && neq3 == 1) && kv_is_f32_or_f16 && (k->type == v->type) && q->type == GGML_TYPE_F32 && nek1 >= 512;
 
     if (use_split_kv_path) {
         const int64_t chunk_size = (nek1 + nth - 1) / nth;
@@ -9553,7 +9565,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const int64_t dr = (nr + nchunk - 1) / nchunk;
 
         static constexpr int64_t Q_TILE_SZ  = ggml_fa_tile_config::Q;
-        bool use_tiled = !use_ref &&
+        bool use_tiled = !use_ref && !kv_idxs &&
                                (q->type == GGML_TYPE_F32 &&
                                 kv_is_f32_or_f16 &&
                                 k->type == v->type &&
@@ -9575,7 +9587,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
             if (use_tiled) {
                 ggml_compute_forward_flash_attn_ext_tiled(params, dst, ir0, ir1);
             } else {
-                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, n_kv_cols, nullptr, 0);
+                ggml_compute_forward_flash_attn_ext_f16_one_chunk(params, dst, ir0, ir1, 0, n_kv_loop, nullptr, 0);
             }
 
             current_chunk = ggml_threadpool_chunk_add(params->threadpool, 1);

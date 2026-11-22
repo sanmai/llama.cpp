@@ -16772,8 +16772,8 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_FLASH_ATTN_EXT:
             {
-                // K/V row lists (ggml_flash_attn_ext_rows) are not supported
-                if (op->src[5] != nullptr) {
+                // K/V row lists (ggml_flash_attn_ext_rows) and cell lists (kv_idxs) are not supported
+                if (op->src[5] != nullptr || op->src[6] != nullptr) {
                     return false;
                 }
                 bool coopmat2 = device->coopmat2;
