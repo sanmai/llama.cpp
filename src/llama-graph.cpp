@@ -3110,6 +3110,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
          ggml_tensor * kq_b,
          ggml_tensor * kq_mask,
          ggml_tensor * kv_rows,
+         ggml_tensor * kv_idxs,
          ggml_tensor * sinks,
          ggml_tensor * v_mla,
              int64_t   n_kv_max,
@@ -3133,6 +3134,7 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
     GGML_ASSERT(use_flash_attn || kv_rows == nullptr);
+    GGML_ASSERT(use_flash_attn || kv_idxs == nullptr);
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
 
@@ -3156,7 +3158,10 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
                                       hparams.attn_soft_cap ? hparams.f_attn_logit_softcapping : 0.0f);
         }
-        res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : LLM_FUSED_OP_FLASH_ATTN, cur, il});
+        if (kv_idxs) {
+            ggml_flash_attn_ext_set_kv_idxs(cur, kv_idxs);
+        }
+        res->add_fused_node({kv_rows ? LLM_FUSED_OP_FLASH_ATTN_KV_ROWS : kv_idxs ? LLM_FUSED_OP_FLASH_ATTN_KV_IDXS : LLM_FUSED_OP_FLASH_ATTN, cur, il});
 
         ggml_flash_attn_ext_add_sinks(cur, sinks);
         GGML_ASSERT(n_kv_max >= 0 && n_kv_max <= INT32_MAX);
@@ -3317,7 +3322,7 @@ ggml_tensor * llm_graph_context::build_attn(
         kq_b = ggml_pad(ctx0, kq_b, n_kv_pad, 0, 0, 0);
     }
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, nullptr, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -3464,7 +3469,7 @@ ggml_tensor * llm_graph_context::build_attn(
     const auto & kq_mask = inp->self_attn_mask.raw;
     const auto & kv_rows = inp->self_attn_mask.rows;
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, nullptr, sinks, v_mla, 0, kq_scale, il);
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
     cb(cur, "kqv_out", il);
 
@@ -3547,7 +3552,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, nullptr, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -3608,6 +3613,27 @@ ggml_tensor * llm_graph_context::build_top_k_mask(
     return ggml_add(ctx0, kq_mask_top_k, kq_mask);
 }
 
+ggml_tensor * llm_graph_context::build_top_k_cells(
+        ggml_tensor * top_k,
+        ggml_tensor * score,
+        ggml_tensor * blocks) const {
+    const int64_t n_top  = top_k->ne[0];
+    const int64_t n_blk  = blocks->ne[0];
+    const int64_t n_pick = score->ne[0];
+
+    ggml_tensor * cells = ggml_get_rows(ctx0, blocks, ggml_reshape_1d(ctx0, top_k, n_top*n_tokens)); // [n_blk, n_top*n_tokens]
+
+    // top_k fills a short selection with -inf picks: live is 0 for a -inf score, else 1 (the scaled score rounds off)
+    ggml_tensor * top_score = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, score, 1, n_pick, n_tokens), top_k); // [1, n_top, n_tokens]
+    ggml_tensor * live      = ggml_scale_bias(ctx0, ggml_clamp(ctx0, top_score, -1.0e30f, 0.0f), 1.0e-30f, 1.0f);
+
+    // cell = live*(cell + 1) - 1
+    ggml_tensor * cells_f = ggml_cast(ctx0, ggml_reshape_3d(ctx0, cells, n_blk, n_top, n_tokens), GGML_TYPE_F32);
+    cells_f = ggml_scale_bias(ctx0, ggml_mul(ctx0, ggml_scale_bias(ctx0, cells_f, 1.0f, 1.0f), live), 1.0f, -1.0f);
+
+    return ggml_reshape_2d(ctx0, ggml_cast(ctx0, cells_f, GGML_TYPE_I32), n_blk*n_top, n_tokens);
+}
+
 ggml_tensor * llm_graph_context::build_attn(
         llm_graph_input_attn_k_dsa * inp,
         ggml_tensor * wo,
@@ -3661,7 +3687,7 @@ ggml_tensor * llm_graph_context::build_attn(
     const int64_t n_embd_v = v_cur ? v_cur->ne[0] : v_mla->ne[0];
     ggml_tensor * v = ggml_view_4d(ctx0, k, n_embd_v, k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, nullptr, sinks, v_mla, top_k->ne[0], kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask_top_k, nullptr, nullptr, sinks, v_mla, top_k->ne[0], kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {
@@ -3757,7 +3783,7 @@ static ggml_tensor * build_attn_iswa_impl(
     ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, nullptr, sinks, v_mla, 0, kq_scale, il);
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
     gctx.cb(cur, "kqv_out", il);
 
@@ -3851,7 +3877,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = ggml_view_4d(ctx0, k, v_cur->ne[0], k->ne[1], k->ne[2], k->ne[3], k->nb[1], k->nb[2], k->nb[3], 0);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, nullptr, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (k_rot) {
@@ -3909,7 +3935,7 @@ ggml_tensor * llm_graph_context::build_attn(
     ggml_tensor * k = k_cur;
     ggml_tensor * v = v_cur;
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, nullptr, sinks, v_mla, 0, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     if (wo) {

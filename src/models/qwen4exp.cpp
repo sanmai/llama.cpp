@@ -878,6 +878,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n_tokens], unordered
     cb(top_k, "indexer_top_k", il);
 
+    // flash attention reads the cells of the live picked pools and the tail, no selection mask
+    // padded pools and missing tail cells hold n_kv, which is out of range
+    if (cparams.fused_kv_idxs) {
+        ggml_tensor * sel_idx = build_top_k_cells(top_k, score, inp_kpool->pool_idxs);
+        sel_idx = ggml_concat(ctx0, sel_idx, inp_kpool->tail_idxs, 0); // [n_sel, n_tokens]
+        GGML_ASSERT(sel_idx->ne[0] == inp_kpool->n_sel);
+        cb(sel_idx, "indexer_sel", il);
+
+        return sel_idx;
+    }
+
     // flash attention requires an f16 mask
     const ggml_type type_mask = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
@@ -991,12 +1002,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
     // the selection replaces the kq_mask: split it into the streams of the K view
+    // it is a mask over the cells, or a list of cells with fused_kv_idxs
     const int64_t n_stream = k->ne[3];
-    GGML_ASSERT(sel->ne[0] == k->ne[2] && sel->ne[1] % n_stream == 0);
+    GGML_ASSERT((cparams.fused_kv_idxs || sel->ne[0] == k->ne[2]) && sel->ne[1] % n_stream == 0);
     sel = ggml_reshape_4d(ctx0, sel, sel->ne[0], sel->ne[1]/n_stream, 1, n_stream);
     cb(sel, "kq_mask_qsa", il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, sel, nullptr, nullptr, nullptr, n_sel, kq_scale, il);
+    ggml_tensor * sel_mask = cparams.fused_kv_idxs ? nullptr : sel;
+    ggml_tensor * sel_idxs = cparams.fused_kv_idxs ? sel : nullptr;
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, sel_mask, nullptr, sel_idxs, nullptr, nullptr, n_sel, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output

@@ -49,6 +49,7 @@ enum llm_graph_type {
 enum llm_fused_op {
     LLM_FUSED_OP_FLASH_ATTN,
     LLM_FUSED_OP_FLASH_ATTN_KV_ROWS,
+    LLM_FUSED_OP_FLASH_ATTN_KV_IDXS,
     LLM_FUSED_OP_DSV4_HC_PRE,
     LLM_FUSED_OP_DSV4_HC_COMB,
     LLM_FUSED_OP_DSV4_HC_POST,
@@ -1332,6 +1333,7 @@ struct llm_graph_context {
             ggml_tensor * kq_b,
             ggml_tensor * kq_mask,
             ggml_tensor * kv_rows, // [n_kv, n_stream], k and v are shared by the streams
+            ggml_tensor * kv_idxs, // [n_idx, n_tokens/n_stream, 1, n_stream], the cells each token attends to
             ggml_tensor * sinks,   // [n_head_q]
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
@@ -1418,6 +1420,13 @@ struct llm_graph_context {
             ggml_tensor * kq_mask, // [n_kv, n_tokens/n_stream, 1, n_stream]
             ggml_tensor * top_k,   // [n_top, n_tokens]
                     int   il) const;
+
+    // the member cells of the picked blocks for ggml_flash_attn_ext_set_kv_idxs: [n_blk*n_top, n_tokens]
+    // the cells of a pick with a -inf score are set to -1
+    ggml_tensor * build_top_k_cells(
+            ggml_tensor * top_k,   // [n_top, n_tokens]
+            ggml_tensor * score,   // [n_pick, n_tokens]
+            ggml_tensor * blocks) const; // [n_blk, n_pick]
 
     llm_graph_input_attn_kv_iswa * build_attn_inp_kv_iswa() const;
 
