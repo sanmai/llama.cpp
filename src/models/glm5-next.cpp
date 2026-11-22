@@ -937,6 +937,19 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
         const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
         ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n_tokens], UNORDERED
 
+        // flash attention reads the cells of the live picked pools and the tail, no selection mask
+        // padded pools and missing tail cells hold n_kv, which is out of range
+        if (cparams.fused_kv_idxs) {
+            sel_idx = build_top_k_cells(top_k, score, inp_kpool->pool_idxs);
+            if (hparams.indexer_kpool_select_tail) {
+                sel_idx = ggml_concat(ctx0, sel_idx, inp_kpool->tail_idxs, 0);
+            }
+            GGML_ASSERT(sel_idx->ne[0] == (int64_t) inp_kpool->n_sel);
+            cb(sel_idx, "indexer_sel", il);
+
+            return sel_idx;
+        }
+
         // keep the cells of the live picked pools and the tail, -inf elsewhere
         // all retained cells are in the token's sequence, so the kq_mask is not needed
         if (cparams.fused_top_k_mask) {
@@ -1046,8 +1059,9 @@ llama_model_glm5_next::graph::build_dsa_layer(
         sel = build_kpool_select(cur, qr, layer, mctx_hyb, inp_kpool, il);
 
         // the selection replaces the kq_mask: split it into the streams of the K view
+        // it is a mask over the cells, or a list of cells with fused_kv_idxs
         const int64_t n_stream = k->ne[3];
-        GGML_ASSERT(sel->ne[0] == k->ne[2] && sel->ne[1] % n_stream == 0);
+        GGML_ASSERT((cparams.fused_kv_idxs || sel->ne[0] == k->ne[2]) && sel->ne[1] % n_stream == 0);
         sel = ggml_reshape_4d(ctx0, sel, sel->ne[0], sel->ne[1]/n_stream, 1, n_stream);
     } else {
         GGML_ASSERT(sel != nullptr && "shared indexer layer must follow a full indexer layer");
@@ -1059,7 +1073,10 @@ llama_model_glm5_next::graph::build_dsa_layer(
 
     cb(sel, "kq_mask_dsa", il);
 
-    ggml_tensor * out = build_attn_mha(q_absorbed, k, v, nullptr, sel, nullptr, nullptr, nullptr, layer.wv_b, inp_kpool->n_sel, kq_scale, il);
+    ggml_tensor * sel_mask = cparams.fused_kv_idxs ? nullptr : sel;
+    ggml_tensor * sel_idxs = cparams.fused_kv_idxs ? sel : nullptr;
+
+    ggml_tensor * out = build_attn_mha(q_absorbed, k, v, nullptr, sel_mask, nullptr, sel_idxs, nullptr, layer.wv_b, inp_kpool->n_sel, kq_scale, il);
     cb(out, "kqv_out", il);
 
     out = ggml_mul_mat(ctx0, layer.wo, out);
