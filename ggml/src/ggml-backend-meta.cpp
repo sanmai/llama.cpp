@@ -1099,7 +1099,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_GATED_DELTA_NET: {
                 split_state = handle_gated_delta_net(src_ss);
             } break;
-            case GGML_OP_LIGHTNING_INDEXER: {
+            case GGML_OP_LIGHTNING_INDEXER:
+            case GGML_OP_LIGHTNING_INDEXER_TOP_K: {
                 split_state = handle_lightning_indexer(src_ss);
             } break;
             case GGML_OP_DSV4_HC_COMB:

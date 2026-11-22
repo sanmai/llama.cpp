@@ -12460,6 +12460,29 @@ void ggml_compute_forward_fwht(const ggml_compute_params * params, ggml_tensor *
 
 // ggml_compute_forward_lightning_indexer
 
+// score of one key for token t of stream s, before the mask
+static float ggml_lightning_indexer_score(
+        const ggml_tensor * q,
+        const float * k_row,
+        const float * w_row,
+        int t,
+        int s) {
+    const int n_embd = q->ne[0];
+    const int n_head = q->ne[1];
+
+    float score = 0.0f;
+    for (int h = 0; h < n_head; ++h) {
+        // dot product of q and k for head h
+        float qk = 0.0f;
+        const float * q_row = (float *) ((char *) q->data + h*q->nb[1] + t*q->nb[2] + s*q->nb[3]);
+        ggml_vec_dot_f32(n_embd, &qk, 0, q_row, 0, k_row, 0, 1);
+        // ReLU and weights (prescaled)
+        score += MAX(qk, 0.0f) * w_row[h];
+    }
+
+    return score;
+}
+
 void ggml_compute_forward_lightning_indexer(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
@@ -12492,7 +12515,6 @@ void ggml_compute_forward_lightning_indexer(
     GGML_ASSERT(nbm0 == ggml_type_size(  m->type));
 
     const int n_embd    = q->ne[0];
-    const int n_head    = q->ne[1];
     const int n_tokens  = q->ne[2];
     const int n_stream  = q->ne[3];
     const int n_kv      = k->ne[2];
@@ -12526,17 +12548,72 @@ void ggml_compute_forward_lightning_indexer(
                 } else {
                     k_row_f32 = (float *) k_row;
                 }
-                float score = 0.0f;
-                for (int h = 0; h < n_head; ++h) {
-                    // dot product of q and k for head h
-                    float qk = 0.0f;
-                    const float * q_row = (float *) ((char *) q->data + h*nbq1 + t*nbq2 + s*nbq3);
-                    ggml_vec_dot_f32(n_embd, &qk, 0, q_row, 0, k_row_f32, 0, 1);
-                    // ReLU and weights (prescaled)
-                    score += MAX(qk, 0.0f) * w_row[h];
-                }
                 // apply mask
-                dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
+                dst_row[ik] = ggml_lightning_indexer_score(q, k_row_f32, w_row, t, s) + GGML_CPU_FP16_TO_FP32(m_row[ik]);
+            }
+        }
+    }
+}
+
+// ggml_compute_forward_lightning_indexer_top_k
+
+void ggml_compute_forward_lightning_indexer_top_k(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * w = dst->src[2]; // weights
+    const ggml_tensor * m = dst->src[3]; // mask
+
+    GGML_ASSERT(dst->type  == GGML_TYPE_I32);
+    GGML_ASSERT(   q->type == GGML_TYPE_F32);
+    GGML_ASSERT(   w->type == GGML_TYPE_F32);
+    GGML_ASSERT(   m->type == GGML_TYPE_F16);
+
+    GGML_ASSERT(dst->nb[0] == ggml_type_size(dst->type));
+    GGML_ASSERT(  q->nb[0] == ggml_type_size(  q->type));
+    GGML_ASSERT(  k->nb[0] == ggml_type_size(  k->type));
+    GGML_ASSERT(  w->nb[0] == ggml_type_size(  w->type));
+    GGML_ASSERT(  m->nb[0] == ggml_type_size(  m->type));
+
+    const int n_embd   = q->ne[0];
+    const int n_tokens = q->ne[2];
+    const int n_stream = q->ne[3];
+    const int n_kv     = k->ne[2];
+    const int top_k    = dst->ne[0];
+
+    ggml_to_float_t const k_to_float = ggml_get_type_traits(k->type)->to_float;
+    GGML_ASSERT((k->type == GGML_TYPE_F32 || k_to_float) && "lightning indexer: unsupported K-type");
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // per thread: K converted to float, the scores and the sorted keys of one token
+    float   * k_row_f32 = (float *) params->wdata + ith*(n_embd + 2*n_kv + CACHE_LINE_SIZE_F32);
+    float   * score     = k_row_f32 + n_embd;
+    int32_t * picks     = (int32_t *) (score + n_kv);
+
+    for (int s = 0; s < n_stream; ++s) {
+        for (int t = ith; t < n_tokens; t += nth) {
+            const float       *   w_row =       (float *) ((char *)   w->data + t*  w->nb[1] +            s*  w->nb[3]);
+            const ggml_fp16_t *   m_row = (ggml_fp16_t *) ((char *)   m->data + t*  m->nb[1] + (s%m->ne[3])*  m->nb[3]);
+            int32_t           * dst_row =     (int32_t *) ((char *) dst->data + t*dst->nb[1] +            s*dst->nb[3]);
+            for (int ik = 0; ik < n_kv; ++ik) {
+                const char  * k_row = (char *) k->data + ik*k->nb[2] + s*k->nb[3];
+                const float * k_f32 = (const float *) k_row;
+                if (k_to_float) {
+                    k_to_float(k_row, k_row_f32, n_embd);
+                    k_f32 = k_row_f32;
+                }
+                score[ik] = ggml_lightning_indexer_score(q, k_f32, w_row, t, s) + GGML_CPU_FP16_TO_FP32(m_row[ik]);
+                picks[ik] = ik;
+            }
+
+            std::partial_sort(picks, picks + top_k, picks + n_kv, cmp_top_k{score});
+
+            for (int j = 0; j < top_k; ++j) {
+                dst_row[j] = score[picks[j]] > -INFINITY ? picks[j] : n_kv;
             }
         }
     }

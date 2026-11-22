@@ -411,6 +411,7 @@ extern "C" {
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_LIGHTNING_INDEXER,
+        GGML_OP_LIGHTNING_INDEXER_TOP_K,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
@@ -2456,6 +2457,21 @@ extern "C" {
             struct ggml_tensor  * k,
             struct ggml_tensor  * weights,
             struct ggml_tensor  * mask);
+
+    // DSA lightning indexer and top k in one op, the scores [n_kv, n_batch] are not stored
+    //
+    // res: [top_k, n_batch, 1, ne3] i32
+    //
+    // the picks of ggml_top_k(ggml_lightning_indexer(q, k, weights, mask), top_k), in no particular order
+    // a pick with a -inf score is set to n_kv
+    //
+    GGML_API struct ggml_tensor * ggml_lightning_indexer_top_k(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * mask,
+            int                   top_k);
 
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)

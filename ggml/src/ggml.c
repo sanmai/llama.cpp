@@ -1095,6 +1095,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SOLVE_TRI",
     "GATED_DELTA_NET",
     "LIGHTNING_INDEXER",
+    "LIGHTNING_INDEXER_TOP_K",
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
@@ -1118,7 +1119,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SLEEP",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1210,6 +1211,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
     "lightning_indexer(q, k, weights, mask)",
+    "lightning_indexer_top_k(q, k, weights, mask)",
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
@@ -1233,7 +1235,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sleep(x)",
 };
 
-static_assert(GGML_OP_COUNT == 100, "GGML_OP_COUNT != 100");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6395,12 +6397,13 @@ struct ggml_tensor * ggml_gated_delta_net(
 
 // ggml_lightning_indexer
 
-struct ggml_tensor * ggml_lightning_indexer(
+static struct ggml_tensor * ggml_lightning_indexer_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
         struct ggml_tensor  * weights,
-        struct ggml_tensor  * mask) {
+        struct ggml_tensor  * mask,
+        int                   top_k) {
 
     GGML_ASSERT(       q->type == GGML_TYPE_F32);
     GGML_ASSERT( weights->type == GGML_TYPE_F32);
@@ -6416,17 +6419,42 @@ struct ggml_tensor * ggml_lightning_indexer(
     GGML_ASSERT(      q->ne[3] == k->ne[3]);
     GGML_ASSERT(      k->ne[3] == weights->ne[3]);
     GGML_ASSERT(weights->ne[3] % mask->ne[3] == 0);
+    GGML_ASSERT(         top_k <= k->ne[2]);
 
-    int64_t ne[4] = { k->ne[2], q->ne[2], 1, q->ne[3] };
-    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    // top_k == 0: the scores, else the picks
+    int64_t ne[4] = { top_k > 0 ? top_k : k->ne[2], q->ne[2], 1, q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, top_k > 0 ? GGML_TYPE_I32 : GGML_TYPE_F32, 4, ne);
 
-    result->op   = GGML_OP_LIGHTNING_INDEXER;
+    result->op   = top_k > 0 ? GGML_OP_LIGHTNING_INDEXER_TOP_K : GGML_OP_LIGHTNING_INDEXER;
     result->src[0] = q;
     result->src[1] = k;
     result->src[2] = weights;
     result->src[3] = mask;
 
     return result;
+}
+
+struct ggml_tensor * ggml_lightning_indexer(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * mask) {
+    return ggml_lightning_indexer_impl(ctx, q, k, weights, mask, 0);
+}
+
+// ggml_lightning_indexer_top_k
+
+struct ggml_tensor * ggml_lightning_indexer_top_k(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * mask,
+        int                   top_k) {
+    GGML_ASSERT(top_k > 0);
+
+    return ggml_lightning_indexer_impl(ctx, q, k, weights, mask, top_k);
 }
 
 // ggml_dsv4_hc_comb

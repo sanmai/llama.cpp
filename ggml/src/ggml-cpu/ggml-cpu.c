@@ -2131,6 +2131,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
             } break;
+        case GGML_OP_LIGHTNING_INDEXER_TOP_K:
+            {
+                ggml_compute_forward_lightning_indexer_top_k(params, tensor);
+            } break;
         case GGML_OP_DSV4_HC_COMB:
             {
                 ggml_compute_forward_dsv4_hc_comb(params, tensor);
@@ -2469,6 +2473,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SSM_CONV:
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:
+        case GGML_OP_LIGHTNING_INDEXER_TOP_K:
             {
                 n_tasks = n_threads;
             } break;
@@ -3077,6 +3082,13 @@ struct ggml_cplan ggml_graph_plan(
                         // temp buffer for dequantizing lightning indexer keys
                         const int64_t ne10 = node->src[1]->ne[0];
                         cur += sizeof(float)*ne10*n_tasks;
+                    } break;
+                case GGML_OP_LIGHTNING_INDEXER_TOP_K:
+                    {
+                        // per task: one dequantized key, the scores and the sorted keys of one token
+                        const int64_t ne10 = node->src[1]->ne[0];
+                        const int64_t ne12 = node->src[1]->ne[2];
+                        cur += sizeof(float)*(ne10 + 2*ne12)*n_tasks;
                     } break;
                 default:
                     break;
