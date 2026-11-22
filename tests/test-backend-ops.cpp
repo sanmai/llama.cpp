@@ -10055,6 +10055,135 @@ struct test_lightning_indexer : public test_case {
     }
 };
 
+// GGML_OP_LIGHTNING_INDEXER_TOP_K
+struct test_lightning_indexer_top_k : public test_case {
+    const int64_t hsk; // indexer K head size
+    const int64_t nh; // num indexer heads
+    const int64_t kv; // kv size
+    const int64_t nb; // batch size
+    const int64_t ns; // num streams
+    const int64_t nm; // ne[3] of mask
+    const int top_k;
+
+    const ggml_type type_K;
+
+    std::string vars() override {
+        return VARS_TO_STR8(hsk, nh, kv, nb, ns, nm, top_k, type_K);
+    }
+
+    double max_err() override {
+        return 0.0;
+    }
+
+    // the order in a row is not specified, so compare the sorted rows
+    double err(const float * a, const float * b, size_t n) override {
+        std::vector<float> sa(a, a + n);
+        std::vector<float> sb(b, b + n);
+        for (size_t r = 0; r + top_k <= n; r += top_k) {
+            std::sort(sa.begin() + r, sa.begin() + r + top_k);
+            std::sort(sb.begin() + r, sb.begin() + r + top_k);
+        }
+
+        double diff = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            diff += sa[i] != sb[i];
+        }
+        return diff;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ((2 * hsk + 2) * nh + 1) * kv * nb * ns;
+    }
+
+    test_lightning_indexer_top_k(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1, int top_k = 32, ggml_type type_K = GGML_TYPE_F16)
+        : hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), top_k(top_k), type_K(type_K) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, ns);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, hsk, 1, kv, ns);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, nh, nb, 1, ns);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, nm);
+        ggml_set_name(m, "m");
+
+        ggml_tensor * out = ggml_lightning_indexer_top_k(ctx, q, k, w, m, top_k);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    // the scores of a token have no ties and a gap that is larger than the rounding of the backends:
+    // key i is gain[i]*dir with a different gain for each key, and each head has q*dir > 0 (even heads) or < 0 (odd heads)
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(std::random_device{}());
+        std::uniform_real_distribution<float> dis(0.25f, 1.0f);
+
+        std::vector<float> dir(hsk*ns);
+        for (float & d : dir) {
+            d = (gen() & 1) ? dis(gen) : -dis(gen);
+        }
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "q") == 0) {
+                std::vector<float> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    const int64_t e = i % hsk;
+                    const int64_t h = (i / hsk) % nh;
+                    const int64_t s = i / (hsk*nh*nb);
+                    const float sign = (h % 2 == 0) == (dir[s*hsk + e] > 0.0f) ? 1.0f : -1.0f;
+                    data[i] = sign*dis(gen);
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "k") == 0) {
+                std::vector<float> data(ggml_nelements(t));
+                std::vector<int32_t> rank(kv);
+                for (int64_t i = 0; i < kv; i++) {
+                    rank[i] = i;
+                }
+                for (int64_t s = 0; s < ns; s++) {
+                    std::shuffle(rank.begin(), rank.end(), gen);
+                    for (int64_t i = 0; i < kv; i++) {
+                        const float gain = powf(100.0f, (float) rank[i]/kv);
+                        for (int64_t e = 0; e < hsk; e++) {
+                            data[(s*kv + i)*hsk + e] = gain*dir[s*hsk + e];
+                        }
+                    }
+                }
+                if (t->type == GGML_TYPE_F32) {
+                    ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+                } else {
+                    std::vector<uint8_t> dataq(ggml_nbytes(t));
+                    ggml_quantize_chunk(t->type, data.data(), dataq.data(), 0, kv*ns, hsk, nullptr);
+                    ggml_backend_tensor_set(t, dataq.data(), 0, dataq.size());
+                }
+            } else if (strcmp(t->name, "w") == 0) {
+                init_tensor_uniform(t, 0.5f, 1.5f);
+            } else if (strcmp(t->name, "m") == 0) {
+                // every third row has less than top_k visible keys, the first row has none
+                std::vector<float> data_f32(ggml_nelements(t));
+                for (int64_t r = 0; r < nb*nm; r++) {
+                    const int64_t n_visible = r % 3 == 0 ? (r/3) % top_k : kv;
+                    for (int64_t i = 0; i < kv; i++) {
+                        const bool visible = r % 3 == 0 ? (i*7 + r) % kv < n_visible : gen() % 4 != 0;
+                        data_f32[r*kv + i] = visible ? 0.0f : -INFINITY;
+                    }
+                }
+                std::vector<ggml_fp16_t> data_f16(data_f32.size());
+                ggml_fp32_to_fp16_row(data_f32.data(), data_f16.data(), data_f16.size());
+                ggml_backend_tensor_set(t, data_f16.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_TOP_K_MASK
 struct test_top_k_mask : public test_case {
     const ggml_type type;
@@ -13963,6 +14092,30 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
         }
     }
+
+    // lightning_indexer_top_k
+    for (int bs : { 1, 2, 67 }) {
+        for (int nh : { 4, 32, 64 }) {
+            for (auto [ns, nm] : { std::pair{1, 1}, std::pair{4, 4}, std::pair{4, 1} }) {
+                for (int top_k : { 32, 256 }) {
+                    for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+                        test_cases.emplace_back(new test_lightning_indexer_top_k(128, nh, 256, bs, ns, nm, top_k, type_K));
+                    }
+                }
+            }
+        }
+    }
+
+    for (int kv : { 1, 7, 65 }) {
+        test_cases.emplace_back(new test_lightning_indexer_top_k(128, 64, kv, 32, 4, 1, std::min(kv, 4), GGML_TYPE_F16));
+    }
+
+    // Qwen3.8-Flash-Next pooled indexer prefill
+    test_cases.emplace_back(new test_lightning_indexer_top_k(128, 4, 1088, 1024, 1, 1, 128, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer_top_k(128, 4, 1088, 1024, 1, 1, 128, GGML_TYPE_Q4_0));
+
+    // the scores of the batch do not fit in one chunk of the CUDA backend
+    test_cases.emplace_back(new test_lightning_indexer_top_k(128, 4, 16384, 1100, 1, 1, 512, GGML_TYPE_F32));
 
     return test_cases;
 }
