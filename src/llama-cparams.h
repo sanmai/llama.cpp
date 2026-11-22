@@ -49,6 +49,8 @@ struct llama_cparams {
     bool auto_fkvr;
     bool fused_kv_idxs;      // sparse attention: flash attention reads the selected cells, no selection mask (ggml_flash_attn_ext_set_kv_idxs)
     bool auto_fkvi;
+    bool fused_indexer_top_k; // sparse attention: the indexer returns the top-k picks, no score tensor (ggml_lightning_indexer_top_k)
+    bool auto_fitk;
     bool no_perf;
     bool op_offload;
     bool kv_unified;

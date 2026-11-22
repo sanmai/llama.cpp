@@ -725,6 +725,10 @@ public:
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
         mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, tail_idxs, nullptr, new_pool_idxs, new_pool_rep,
                               ubatch, new_pool_pos);
+
+        // the block that a dead pick of the fused indexer top-k reads
+        const int64_t n_pool = pool_cells->ne[0];
+        std::fill_n((int32_t *) pool_idxs_dead->data + kpool*n_pool, kpool, (int32_t) n_kv);
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -751,6 +755,7 @@ public:
     ggml_tensor * k_idxs        = nullptr; // I64 [n_tokens]
     ggml_tensor * pool_cells    = nullptr; // I32 [n_pool]         cell caching each block's pooled key
     ggml_tensor * pool_idxs     = nullptr; // I32 [kpool, n_pool]  member cells per block, n_kv sentinel for the padded blocks
+    ggml_tensor * pool_idxs_dead = nullptr; // I32 [kpool, n_pool + 1]  pool_idxs is a view of it, block n_pool holds the n_kv sentinel
     ggml_tensor * pool_mask     = nullptr; // F16 [n_pool, n_tokens]
     ggml_tensor * tail_idxs     = nullptr; // I32 [kpool - 1, n_tokens]
     ggml_tensor * new_pool_idxs = nullptr; // I32 [kpool, n_new]   members of the blocks to re-pool this ubatch
@@ -776,11 +781,12 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
 
     inp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
     inp->pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
-    inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
+    inp->pool_idxs_dead = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool + 1);
+    inp->pool_idxs  = ggml_view_2d(ctx0, inp->pool_idxs_dead, kpool, n_pool, inp->pool_idxs_dead->nb[1], 0);
     inp->pool_mask  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_pool, n_tokens);
     inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
     ggml_set_input(inp->pool_cells);
-    ggml_set_input(inp->pool_idxs);
+    ggml_set_input(inp->pool_idxs_dead);
     ggml_set_input(inp->pool_mask);
     ggml_set_input(inp->tail_idxs);
 
@@ -871,10 +877,29 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // the reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim),
     // which is the lightning indexer with every head weight set to that scale
     ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, n_tokens), 1.0f/sqrtf((float) idx_dim));
+
+    const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
+
+    // score and select in one op, the scores [n_pool, n_tokens] are not stored
+    // a dead pick is n_pool, its block in pool_idxs_dead holds n_kv, which is out of range
+    if (cparams.fused_indexer_top_k) {
+        GGML_ASSERT(cparams.fused_kv_idxs);
+
+        ggml_tensor * top_k = ggml_lightning_indexer_top_k(ctx0, q, pooled, weights, inp_kpool->pool_mask, n_top_pool); // [n_top_pool, n_tokens], unordered
+        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER_TOP_K, top_k, il});
+        cb(top_k, "indexer_top_k", il);
+
+        ggml_tensor * sel_idx = build_top_k_cells(top_k, nullptr, inp_kpool->pool_idxs_dead);
+        sel_idx = ggml_concat(ctx0, sel_idx, inp_kpool->tail_idxs, 0); // [n_sel, n_tokens]
+        GGML_ASSERT(sel_idx->ne[0] == inp_kpool->n_sel);
+        cb(sel_idx, "indexer_sel", il);
+
+        return sel_idx;
+    }
+
     ggml_tensor * score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask); // [n_pool, n_tokens]
     cb(score, "indexer_score", il);
 
-    const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
     ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n_tokens], unordered
     cb(top_k, "indexer_top_k", il);
 

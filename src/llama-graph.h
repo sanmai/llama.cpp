@@ -54,6 +54,7 @@ enum llm_fused_op {
     LLM_FUSED_OP_DSV4_HC_COMB,
     LLM_FUSED_OP_DSV4_HC_POST,
     LLM_FUSED_OP_TOP_K_MASK,
+    LLM_FUSED_OP_LIGHTNING_INDEXER_TOP_K,
 };
 
 enum llm_ffn_op_type : int {
@@ -1423,6 +1424,7 @@ struct llm_graph_context {
 
     // the member cells of the picked blocks for ggml_flash_attn_ext_set_kv_idxs: [n_blk*n_top, n_tokens]
     // the cells of a pick with a -inf score are set to -1
+    // score == nullptr: a dead pick is n_pick (ggml_lightning_indexer_top_k) and blocks has the block n_pick for it
     ggml_tensor * build_top_k_cells(
             ggml_tensor * top_k,   // [n_top, n_tokens]
             ggml_tensor * score,   // [n_pick, n_tokens]

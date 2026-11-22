@@ -3619,9 +3619,15 @@ ggml_tensor * llm_graph_context::build_top_k_cells(
         ggml_tensor * blocks) const {
     const int64_t n_top  = top_k->ne[0];
     const int64_t n_blk  = blocks->ne[0];
-    const int64_t n_pick = score->ne[0];
 
     ggml_tensor * cells = ggml_get_rows(ctx0, blocks, ggml_reshape_1d(ctx0, top_k, n_top*n_tokens)); // [n_blk, n_top*n_tokens]
+
+    // ggml_lightning_indexer_top_k picks: a dead pick reads the last block
+    if (score == nullptr) {
+        return ggml_reshape_2d(ctx0, cells, n_blk*n_top, n_tokens);
+    }
+
+    const int64_t n_pick = score->ne[0];
 
     // top_k fills a short selection with -inf picks: live is 0 for a -inf score, else 1 (the scaled score rounds off)
     ggml_tensor * top_score = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, score, 1, n_pick, n_tokens), top_k); // [1, n_top, n_tokens]

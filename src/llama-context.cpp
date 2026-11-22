@@ -166,6 +166,12 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_lightning_indexer_top_k_probe = {
+    /*.op               =*/ LLM_FUSED_OP_LIGHTNING_INDEXER_TOP_K,
+    /*.name             =*/ "fused lightning indexer top-k",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -399,6 +405,19 @@ llama_context::llama_context(
         } else {
             LLAMA_LOG_INFO("%s: LLAMA_KV_IDXS_DISABLE set, disabling kv_idxs\n", __func__);
             cparams.auto_fkvi = false;
+        }
+    }
+
+    // resolved after kv_idxs, see resolve_fused_ops()
+    {
+        cparams.fused_indexer_top_k = false;
+
+        const char * LLAMA_INDEXER_TOP_K_DISABLE = getenv("LLAMA_INDEXER_TOP_K_DISABLE");
+        if (!LLAMA_INDEXER_TOP_K_DISABLE) {
+            cparams.auto_fitk = hparams.indexer_top_k > 0;
+        } else {
+            LLAMA_LOG_INFO("%s: LLAMA_INDEXER_TOP_K_DISABLE set, disabling the fused lightning indexer top-k\n", __func__);
+            cparams.auto_fitk = false;
         }
     }
 
@@ -740,6 +759,13 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         cparams.fused_kv_idxs = cparams.flash_attn;
         resolve(llm_fused_op_flash_attn_kv_idxs_probe, cparams.fused_kv_idxs);
         cparams.auto_fkvi = false;
+    }
+
+    // the picks feed the K/V cell lists, the fallback stores the scores
+    if (cparams.auto_fitk) {
+        cparams.fused_indexer_top_k = cparams.fused_kv_idxs;
+        resolve(llm_fused_op_lightning_indexer_top_k_probe, cparams.fused_indexer_top_k);
+        cparams.auto_fitk = false;
     }
 
     if (cparams.auto_fhc) {
