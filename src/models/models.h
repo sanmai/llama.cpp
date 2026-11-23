@@ -2997,6 +2997,7 @@ struct llama_model_qwen4exp : public llama_model_base {
         llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb);
 
         // QSA: the additive mask [n_kv, n_tokens] of the top blocks and the tail
+        // with fused_kv_idxs: the list of these cells [n_sel, n_tokens], a cell out of range is a dead slot
         ggml_tensor * build_qsa_sel(
   const llama_memory_hybrid_idx_context * mctx_hyb,
           llm_graph_input_kpool * inp_kpool,

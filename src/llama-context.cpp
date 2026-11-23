@@ -136,6 +136,12 @@ static const llm_fused_op_probe llm_fused_op_flash_attn_kv_rows_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_flash_attn_kv_idxs_probe = {
+    /*.op               =*/ LLM_FUSED_OP_FLASH_ATTN_KV_IDXS,
+    /*.name             =*/ "Flash Attention over K/V cell lists",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 static const llm_fused_op_probe llm_fused_op_dsv4_hc_pre_probe = {
     /*.op               =*/ LLM_FUSED_OP_DSV4_HC_PRE,
     /*.name             =*/ "fused DeepSeek V4 HC pre",
@@ -380,6 +386,19 @@ llama_context::llama_context(
         } else {
             LLAMA_LOG_INFO("%s: LLAMA_KV_ROWS_DISABLE set, disabling kv_rows\n", __func__);
             cparams.auto_fkvr = false;
+        }
+    }
+
+    // resolved after flash attention, see resolve_fused_ops()
+    {
+        cparams.fused_kv_idxs = false;
+
+        const char * LLAMA_KV_IDXS_DISABLE = getenv("LLAMA_KV_IDXS_DISABLE");
+        if (!LLAMA_KV_IDXS_DISABLE) {
+            cparams.auto_fkvi = hparams.indexer_top_k > 0;
+        } else {
+            LLAMA_LOG_INFO("%s: LLAMA_KV_IDXS_DISABLE set, disabling kv_idxs\n", __func__);
+            cparams.auto_fkvi = false;
         }
     }
 
@@ -714,6 +733,13 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         cparams.fused_kv_rows = cparams.flash_attn;
         resolve(llm_fused_op_flash_attn_kv_rows_probe, cparams.fused_kv_rows);
         cparams.auto_fkvr = false;
+    }
+
+    // the fallback builds a dense selection mask
+    if (cparams.auto_fkvi) {
+        cparams.fused_kv_idxs = cparams.flash_attn;
+        resolve(llm_fused_op_flash_attn_kv_idxs_probe, cparams.fused_kv_idxs);
+        cparams.auto_fkvi = false;
     }
 
     if (cparams.auto_fhc) {

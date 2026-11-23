@@ -9382,6 +9382,120 @@ struct test_flash_attn_ext_mask_bcast : public test_flash_attn_ext {
     }
 };
 
+// GGML_OP_FLASH_ATTN_EXT over a list of K/V cells per query (ggml_flash_attn_ext_set_kv_idxs)
+struct test_flash_attn_ext_kv_idxs : public test_case {
+    const int64_t hs;
+    const int64_t nh;      // K/V heads
+    const int64_t gqa;
+    const int64_t kv;      // cells per sequence
+    const int64_t n_idx;   // slots per query, can be > kv
+    const int64_t nb;      // queries per sequence
+    const int64_t n_seq;
+    const bool    mask;
+    const ggml_type type_KV;
+
+    std::string vars() override {
+        return VARS_TO_STR9(hs, nh, gqa, kv, n_idx, nb, n_seq, mask, type_KV);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    test_flash_attn_ext_kv_idxs(int64_t hs = 256, int64_t nh = 2, int64_t gqa = 8, int64_t kv = 4096, int64_t n_idx = 512,
+                                int64_t nb = 8, int64_t n_seq = 1, bool mask = false, ggml_type type_KV = GGML_TYPE_F16)
+        : hs(hs), nh(nh), gqa(gqa), kv(kv), n_idx(n_idx), nb(nb), n_seq(n_seq), mask(mask), type_KV(type_KV) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, nb, nh*gqa, n_seq);
+        ggml_set_name(q, "q");
+
+        // cache layout [hs, nh, kv, n_seq]
+        ggml_tensor * k0 = ggml_new_tensor_4d(ctx, type_KV, hs, nh, kv, n_seq);
+        ggml_tensor * v0 = ggml_new_tensor_4d(ctx, type_KV, hs, nh, kv, n_seq);
+        ggml_set_name(k0, "k0");
+        ggml_set_name(v0, "v0");
+
+        ggml_tensor * k = ggml_permute(ctx, k0, 0, 2, 1, 3);
+        ggml_tensor * v = ggml_permute(ctx, v0, 0, 2, 1, 3);
+
+        ggml_tensor * m = nullptr;
+        if (mask) {
+            m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, n_seq);
+            ggml_set_name(m, "m");
+        }
+
+        ggml_tensor * idxs = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, n_idx, nb, 1, n_seq);
+        ggml_set_name(idxs, "idxs");
+
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_set_kv_idxs(out, idxs);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x1D75);
+
+        // per query: distinct random cells in random slots, the other slots hold a value out of range
+        // the first query of each sequence starts with dead slots only, like a short context
+        std::vector<int32_t> idxs(n_idx*nb*n_seq);
+        std::vector<int32_t> order(kv);
+        std::vector<int32_t> slots(n_idx);
+        for (int64_t r = 0; r < nb*n_seq; ++r) {
+            for (int64_t i = 0; i < n_idx; ++i) {
+                const int32_t dead[3] = { -1, (int32_t) kv, (int32_t) kv + 7 };
+                idxs[r*n_idx + i] = dead[(i + r) % 3];
+                slots[i] = i;
+            }
+            for (int64_t i = 0; i < kv; ++i) {
+                order[i] = i;
+            }
+            std::shuffle(order.begin(), order.end(), gen);
+
+            const int64_t n_dead_head = r % nb == 0 ? n_idx/2 : 0;
+            std::shuffle(slots.begin() + n_dead_head, slots.end(), gen);
+
+            const int64_t n_live = std::max<int64_t>(1, std::min(kv, n_idx - n_dead_head) - (r*37) % std::max<int64_t>(1, n_idx/4));
+            for (int64_t i = 0; i < n_live; ++i) {
+                idxs[r*n_idx + slots[n_dead_head + i]] = order[i];
+            }
+        }
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src) {
+                continue;
+            }
+            if (strcmp(t->name, "idxs") == 0) {
+                ggml_backend_tensor_set(t, idxs.data(), 0, idxs.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "m") == 0) {
+                // drop some of the listed cells, keep the first live one of each query
+                std::vector<float> f(ggml_nelements(t));
+                std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+                for (int64_t r = 0; r < nb*n_seq; ++r) {
+                    for (int64_t c = 0; c < kv; ++c) {
+                        f[r*kv + c] = (c + 3*r) % 5 == 0 ? -INFINITY : dis(gen);
+                    }
+                    for (int64_t i = 0; i < n_idx; ++i) {
+                        const int32_t c = idxs[r*n_idx + i];
+                        if (c >= 0 && c < kv) {
+                            f[r*kv + c] = 0.25f;
+                            break;
+                        }
+                    }
+                }
+                std::vector<ggml_fp16_t> h(f.size());
+                ggml_fp32_to_fp16_row(f.data(), h.data(), f.size());
+                ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_FLASH_ATTN_EXT with kv_rows: each q slice attends to its own list of K/V cache rows
 struct test_flash_attn_ext_kv_rows : public test_case {
     const int64_t hs;
@@ -13451,6 +13565,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_kv_rows( 64, 4, 2, 3000, 768,  nb, n_slices, GGML_TYPE_Q8_0));
             test_cases.emplace_back(new test_flash_attn_ext_kv_rows(512, 2, 8, 4096, 1024, nb, n_slices));
             test_cases.emplace_back(new test_flash_attn_ext_kv_rows(256, 8, 2, 4096, 1280, nb, n_slices));
+        }
+    }
+
+    // flash attention over a list of K/V cells per query
+    for (int64_t nb : {1, 3, 8, 64}) {
+        for (int64_t n_seq : {1, 3}) {
+            for (bool mask : {false, true}) {
+                test_cases.emplace_back(new test_flash_attn_ext_kv_idxs(256, 2,  8, 4096,  512, nb, n_seq, mask));
+                test_cases.emplace_back(new test_flash_attn_ext_kv_idxs(256, 2, 12, 4099,  700, nb, n_seq, mask));
+                test_cases.emplace_back(new test_flash_attn_ext_kv_idxs(512, 1,  8, 2048,  515, nb, n_seq, mask));
+                test_cases.emplace_back(new test_flash_attn_ext_kv_idxs(256, 1, 16,  300,  512, nb, n_seq, mask)); // more slots than cells
+                test_cases.emplace_back(new test_flash_attn_ext_kv_idxs(256, 2,  8, 1024,  256, nb, n_seq, mask, GGML_TYPE_Q8_0));
+                test_cases.emplace_back(new test_flash_attn_ext_kv_idxs(128, 4,  4, 1000,  200, nb, n_seq, mask)); // no CUDA kernel
+            }
         }
     }
 
