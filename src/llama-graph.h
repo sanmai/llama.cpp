@@ -1102,7 +1102,7 @@ using llm_graph_chunk_fn = std::function<ggml_tensor * (size_t ic, const llm_gra
 // 1 GiB of F32 elements; an input of the graph keeps the size of the ubatch
 // 0 for a split cache with several sequences and for a ubatch above 16384 tokens
 // n_head_mask: the heads of an attention mask with a value per cell, token and head
-uint32_t llm_graph_n_chunk(const llama_cparams & cparams, uint32_t n_head_mask = 1);
+uint32_t llm_graph_n_chunk(const llama_cparams & cparams, uint32_t n_head_mask);
 
 struct llm_graph_context {
     const llama_model & model;

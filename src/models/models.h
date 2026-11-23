@@ -1502,6 +1502,10 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
     void load_arch_tensors(llama_model_loader & ml) override;
     bool lid_k_hdmd() const override { return false; }
 
+    // the nodes of one token chunk: 88 measured for all the layers of a 3-layer test model
+    static constexpr uint32_t GRAPH_NODES_PER_CHUNK = 96;
+    uint32_t graph_nodes_per_chunk() const override { return GRAPH_NODES_PER_CHUNK; }
+
     // Engram: the hash constants are hparams.ple_* (one module per Engram layer), hashed on the host (ggml has no int64 mul/xor/mod)
     int engram_index(int il) const;
 
@@ -2510,6 +2514,11 @@ struct llama_model_inkling2 : public llama_model_base {
     void load_arch_tensors(llama_model_loader & ml) override;
     uint32_t graph_nodes_per_tensor() const override { return 32; }
 
+    // the nodes of one token chunk: 20 measured for one full-attention layer
+    static constexpr uint32_t GRAPH_NODES_PER_CHUNK = 24;
+    uint32_t graph_nodes_per_chunk() const override { return GRAPH_NODES_PER_CHUNK; }
+    uint32_t graph_chunk_n_head_mask() const override;
+
     // the layers stored in the file
     virtual int n_layer_phys() const { return hparams.n_layer(); }
 
@@ -2950,6 +2959,10 @@ struct llama_model_qwen4exp : public llama_model_base {
     void load_arch_tensors(llama_model_loader & ml) override;
     uint32_t graph_nodes_per_tensor() const override { return 32; }
 
+    // the nodes of one token chunk: 21 measured for all the layers of a 3-layer test model
+    static constexpr uint32_t GRAPH_NODES_PER_CHUNK = 24;
+    uint32_t graph_nodes_per_chunk() const override { return GRAPH_NODES_PER_CHUNK; }
+
     struct graph : public llm_build_delta_net_base {
         graph(const llm_graph_params & params);
     protected:
@@ -3211,6 +3224,10 @@ struct llama_model_kimi_k31 : public llama_model_base {
     void load_arch_tensors(llama_model_loader & ml) override;
     uint32_t graph_nodes_per_tensor() const override { return 64; }
 
+    // the nodes of one token chunk: 42 measured for all the layers of a 3-layer test model
+    static constexpr uint32_t GRAPH_NODES_PER_CHUNK = 48;
+    uint32_t graph_nodes_per_chunk() const override { return GRAPH_NODES_PER_CHUNK; }
+
     struct graph : public llm_build_delta_net_base {
         graph(const llm_graph_params & params);
 
@@ -3258,6 +3275,10 @@ struct llama_model_glm5_next : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
     uint32_t graph_nodes_per_tensor() const override { return 64; }
+
+    // the nodes of one token chunk: 53 measured for all the layers of a 3-layer test model
+    static constexpr uint32_t GRAPH_NODES_PER_CHUNK = 56;
+    uint32_t graph_nodes_per_chunk() const override { return GRAPH_NODES_PER_CHUNK; }
 
     // k-pool indexer inputs on top of the generic hybrid input
     class llm_graph_input_kpool;

@@ -1969,12 +1969,7 @@ static int test_chunk(const std::string & arch_filter, const size_t seed, const 
     size_t n_tests  = 0;
     size_t n_failed = 0;
     for (const llm_arch & arch : llama_arch_all()) {
-        // the archs that build their sparse attention with llm_graph_context::build_chunked
-        if (arch != LLM_ARCH_QWEN4EXP && arch != LLM_ARCH_GLM5_NEXT && arch != LLM_ARCH_DEEPSEEK41 && arch != LLM_ARCH_KIMI_K31 &&
-                arch != LLM_ARCH_INKLING2 && arch != LLM_ARCH_INKLING2_LOOP) {
-            continue;
-        }
-        if (!arch_matches(arch_filter, arch) || !arch_supported(arch)) {
+        if (!arch_matches(arch_filter, arch) || !arch_supported(arch) || !llama_arch_supports_chunks(arch)) {
             continue;
         }
 
@@ -1984,11 +1979,9 @@ static int test_chunk(const std::string & arch_filter, const size_t seed, const 
             gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, true, 3);
             // a realistic top-k, so that the selection depends on the indexer query
             gguf_set_val_u32(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_ATTENTION_INDEXER_TOP_K).c_str(), 8);
-            if (arch == LLM_ARCH_GLM5_NEXT || arch == LLM_ARCH_KIMI_K31) {
-                // layer 1 is recurrent, layer 2 shares the selection of layer 0
-                const uint32_t indexer_types[] = { 1, 0, 0 };
-                gguf_set_arr_data(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_ATTENTION_INDEXER_TYPES).c_str(), GGUF_TYPE_UINT32, indexer_types, std::size(indexer_types));
-            }
+            // for the archs that read the types: layer 1 is recurrent, layer 2 shares the selection of layer 0
+            const uint32_t indexer_types[] = { 1, 0, 0 };
+            gguf_set_arr_data(gguf_ctx.get(), llama_arch_kv_name(arch, LLM_KV_ATTENTION_INDEXER_TYPES).c_str(), GGUF_TYPE_UINT32, indexer_types, std::size(indexer_types));
             llama_model_ptr model = get_model(gguf_ctx.get(), nullptr, seed, stdev, {});
 
             llama_context_params ctx_params = llama_context_default_params();

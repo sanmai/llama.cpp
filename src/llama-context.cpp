@@ -425,17 +425,7 @@ llama_context::llama_context(
     }
 
     {
-        // Inkling has a KQ mask per head in its full-attention layers
-        uint32_t n_head_mask = 1;
-        if (model.arch == LLM_ARCH_INKLING2 || model.arch == LLM_ARCH_INKLING2_LOOP) {
-            for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
-                if (!model.hparams.is_swa(il)) {
-                    n_head_mask = std::max(n_head_mask, model.hparams.n_head(il));
-                }
-            }
-        }
-
-        cparams.n_chunk = llm_graph_n_chunk(cparams, n_head_mask);
+        cparams.n_chunk = model.graph_nodes_per_chunk() > 0 ? llm_graph_n_chunk(cparams, model.graph_chunk_n_head_mask()) : 0;
 
         // for tests: the models of the tests are too small for chunks
         const char * LLAMA_GRAPH_CHUNK = getenv("LLAMA_GRAPH_CHUNK");
@@ -2928,18 +2918,10 @@ uint32_t llama_context::graph_max_nodes() const {
         res += 32u*model.hparams.n_layer_all;
     }
 
-    // the archs that use llm_graph_context::build_chunked: each token chunk of a layer has its own nodes
-    // 96 is above the most nodes that a chunk adds to a layer: test-llama-archs --chunk counts at most 93,
-    // for all the layers of deepseek41 with flash attention
-    if ((model.arch == LLM_ARCH_QWEN4EXP ||
-         model.arch == LLM_ARCH_DEEPSEEK41 ||
-         model.arch == LLM_ARCH_GLM5_NEXT ||
-         model.arch == LLM_ARCH_KIMI_K31 ||
-         model.arch == LLM_ARCH_INKLING2 ||
-         model.arch == LLM_ARCH_INKLING2_LOOP) &&
-            cparams.n_chunk > 0 && cparams.n_chunk < cparams.n_ubatch) {
+    // llm_graph_context::build_chunked: each token chunk of a layer has its own nodes
+    if (cparams.n_chunk > 0 && cparams.n_chunk < cparams.n_ubatch) {
         const uint32_t n_chunks = (cparams.n_ubatch + cparams.n_chunk - 1)/cparams.n_chunk;
-        res += model.layers.size()*n_chunks*96;
+        res += model.layers.size()*n_chunks*model.graph_nodes_per_chunk();
     }
 
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling

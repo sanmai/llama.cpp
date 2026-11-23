@@ -157,6 +157,18 @@ void llama_model_inkling2::load_arch_tensors(llama_model_loader &) {
     }
 }
 
+// the full-attention layers have a KQ mask per head
+uint32_t llama_model_inkling2::graph_chunk_n_head_mask() const {
+    uint32_t n_head_mask = 1;
+    for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+        if (!hparams.is_swa(il)) {
+            n_head_mask = std::max(n_head_mask, hparams.n_head(il));
+        }
+    }
+
+    return n_head_mask;
+}
+
 std::unique_ptr<llm_graph_context> llama_model_inkling2::build_arch_graph(const llm_graph_params & params) const {
     return std::make_unique<graph>(params);
 }
