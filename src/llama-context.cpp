@@ -425,7 +425,17 @@ llama_context::llama_context(
     }
 
     {
-        cparams.n_chunk = llm_graph_n_chunk(cparams);
+        // Inkling has a KQ mask per head in its full-attention layers
+        uint32_t n_head_mask = 1;
+        if (model.arch == LLM_ARCH_INKLING2 || model.arch == LLM_ARCH_INKLING2_LOOP) {
+            for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+                if (!model.hparams.is_swa(il)) {
+                    n_head_mask = std::max(n_head_mask, model.hparams.n_head(il));
+                }
+            }
+        }
+
+        cparams.n_chunk = llm_graph_n_chunk(cparams, n_head_mask);
 
         // for tests: the models of the tests are too small for chunks
         const char * LLAMA_GRAPH_CHUNK = getenv("LLAMA_GRAPH_CHUNK");
@@ -2924,7 +2934,9 @@ uint32_t llama_context::graph_max_nodes() const {
     if ((model.arch == LLM_ARCH_QWEN4EXP ||
          model.arch == LLM_ARCH_DEEPSEEK41 ||
          model.arch == LLM_ARCH_GLM5_NEXT ||
-         model.arch == LLM_ARCH_KIMI_K31) &&
+         model.arch == LLM_ARCH_KIMI_K31 ||
+         model.arch == LLM_ARCH_INKLING2 ||
+         model.arch == LLM_ARCH_INKLING2_LOOP) &&
             cparams.n_chunk > 0 && cparams.n_chunk < cparams.n_ubatch) {
         const uint32_t n_chunks = (cparams.n_ubatch + cparams.n_chunk - 1)/cparams.n_chunk;
         res += model.layers.size()*n_chunks*96;

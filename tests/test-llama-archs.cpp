@@ -1970,7 +1970,8 @@ static int test_chunk(const std::string & arch_filter, const size_t seed, const 
     size_t n_failed = 0;
     for (const llm_arch & arch : llama_arch_all()) {
         // the archs that build their sparse attention with llm_graph_context::build_chunked
-        if (arch != LLM_ARCH_QWEN4EXP && arch != LLM_ARCH_GLM5_NEXT && arch != LLM_ARCH_DEEPSEEK41 && arch != LLM_ARCH_KIMI_K31) {
+        if (arch != LLM_ARCH_QWEN4EXP && arch != LLM_ARCH_GLM5_NEXT && arch != LLM_ARCH_DEEPSEEK41 && arch != LLM_ARCH_KIMI_K31 &&
+                arch != LLM_ARCH_INKLING2 && arch != LLM_ARCH_INKLING2_LOOP) {
             continue;
         }
         if (!arch_matches(arch_filter, arch) || !arch_supported(arch)) {
