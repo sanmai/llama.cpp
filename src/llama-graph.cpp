@@ -3618,20 +3618,21 @@ ggml_tensor * llm_graph_context::build_top_k_cells(
         ggml_tensor * score,
         ggml_tensor * blocks) const {
     const int64_t n_top  = top_k->ne[0];
+    const int64_t n_tok  = top_k->ne[1];
     const int64_t n_blk  = blocks->ne[0];
     const int64_t n_pick = score->ne[0];
 
-    ggml_tensor * cells = ggml_get_rows(ctx0, blocks, ggml_reshape_1d(ctx0, top_k, n_top*n_tokens)); // [n_blk, n_top*n_tokens]
+    ggml_tensor * cells = ggml_get_rows(ctx0, blocks, ggml_reshape_1d(ctx0, top_k, n_top*n_tok)); // [n_blk, n_top*n_tok]
 
     // top_k fills a short selection with -inf picks: live is 0 for a -inf score, else 1 (the scaled score rounds off)
-    ggml_tensor * top_score = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, score, 1, n_pick, n_tokens), top_k); // [1, n_top, n_tokens]
+    ggml_tensor * top_score = ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, score, 1, n_pick, n_tok), top_k); // [1, n_top, n_tok]
     ggml_tensor * live      = ggml_scale_bias(ctx0, ggml_clamp(ctx0, top_score, -1.0e30f, 0.0f), 1.0e-30f, 1.0f);
 
     // cell = live*(cell + 1) - 1
-    ggml_tensor * cells_f = ggml_cast(ctx0, ggml_reshape_3d(ctx0, cells, n_blk, n_top, n_tokens), GGML_TYPE_F32);
+    ggml_tensor * cells_f = ggml_cast(ctx0, ggml_reshape_3d(ctx0, cells, n_blk, n_top, n_tok), GGML_TYPE_F32);
     cells_f = ggml_scale_bias(ctx0, ggml_mul(ctx0, ggml_scale_bias(ctx0, cells_f, 1.0f, 1.0f), live), 1.0f, -1.0f);
 
-    return ggml_reshape_2d(ctx0, ggml_cast(ctx0, cells_f, GGML_TYPE_I32), n_blk*n_top, n_tokens);
+    return ggml_reshape_2d(ctx0, ggml_cast(ctx0, cells_f, GGML_TYPE_I32), n_blk*n_top, n_tok);
 }
 
 ggml_tensor * llm_graph_context::build_attn(

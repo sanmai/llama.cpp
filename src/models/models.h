@@ -2996,6 +2996,15 @@ struct llama_model_qwen4exp : public llama_model_base {
         // the QSA layers share one set of k-pool inputs, see llama_memory_hybrid_idx
         llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb);
 
+        // QSA, fused_kv_idxs: score and select per token chunk, the cell lists [n_sel, n_tokens] of the chunks joined
+        ggml_tensor * build_qsa_sel_idxs(
+                llm_graph_input_kpool * inp_kpool,
+                          ggml_tensor * q,
+                          ggml_tensor * pooled,
+                          ggml_tensor * weights,
+                              int64_t   n_top_pool,
+                                  int   il);
+
         // QSA: the additive mask [n_kv, n_tokens] of the top blocks and the tail
         // with fused_kv_idxs: the list of these cells [n_sel, n_tokens], a cell out of range is a dead slot
         ggml_tensor * build_qsa_sel(

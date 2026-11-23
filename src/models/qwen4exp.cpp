@@ -810,6 +810,61 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
 
 // QSA attends to the top blocks of compress_ratio cells plus the incomplete tail, like the glm5-next k-pool indexer
 // a block is scored by one pooled key: the mean of its raw indexer keys, normed and rotated to its first member
+// the selection budget of one token chunk: 2^26 F32 scores = 256 MiB
+static const int64_t QSA_SEL_CHUNK_ELEMENTS = INT64_C(1) << 26;
+
+static int64_t qsa_sel_n_chunk(int64_t n_pool) {
+    // for tests: the models of the tests are too small for chunks
+    const char * LLAMA_QSA_SEL_CHUNK = getenv("LLAMA_QSA_SEL_CHUNK");
+    if (LLAMA_QSA_SEL_CHUNK) {
+        return std::max(1, atoi(LLAMA_QSA_SEL_CHUNK));
+    }
+
+    return std::max<int64_t>(1, QSA_SEL_CHUNK_ELEMENTS/n_pool);
+}
+
+ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel_idxs(
+        llm_graph_input_kpool * inp_kpool,
+        ggml_tensor *           q,
+        ggml_tensor *           pooled,
+        ggml_tensor *           weights,
+        int64_t                 n_top_pool,
+        int                     il) {
+    const int64_t n_pool  = inp_kpool->pool_mask->ne[0];
+    const int64_t n_chunk = qsa_sel_n_chunk(n_pool);
+
+    ggml_tensor * pool_mask = inp_kpool->pool_mask;
+    ggml_tensor * tail_idxs = inp_kpool->tail_idxs;
+
+    // score and select one token chunk at a time: the [n_pool, n_chunk] score is the only one alive,
+    // the cell lists of the chunks are small
+    ggml_tensor * sel_idx = nullptr;
+    for (int64_t t0 = 0; t0 < n_tokens; t0 += n_chunk) {
+        const int64_t n_chunk_tokens = std::min(n_chunk, n_tokens - t0);
+
+        ggml_tensor * q_chunk         = ggml_view_3d(ctx0, q, q->ne[0], q->ne[1], n_chunk_tokens, q->nb[1], q->nb[2], t0*q->nb[2]);
+        ggml_tensor * weights_chunk   = ggml_view_2d(ctx0, weights,   weights->ne[0],   n_chunk_tokens, weights->nb[1],   t0*weights->nb[1]);
+        ggml_tensor * pool_mask_chunk = ggml_view_2d(ctx0, pool_mask, pool_mask->ne[0], n_chunk_tokens, pool_mask->nb[1], t0*pool_mask->nb[1]);
+        ggml_tensor * tail_idxs_chunk = ggml_view_2d(ctx0, tail_idxs, tail_idxs->ne[0], n_chunk_tokens, tail_idxs->nb[1], t0*tail_idxs->nb[1]);
+
+        ggml_tensor * score = ggml_lightning_indexer(ctx0, q_chunk, pooled, weights_chunk, pool_mask_chunk); // [n_pool, n_chunk_tokens]
+        cb(score, "indexer_score", il);
+
+        ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n_chunk_tokens], unordered
+        cb(top_k, "indexer_top_k", il);
+
+        ggml_tensor * cells = build_top_k_cells(top_k, score, inp_kpool->pool_idxs);
+        cells = ggml_concat(ctx0, cells, tail_idxs_chunk, 0); // [n_sel, n_chunk_tokens]
+
+        // finish this chunk before the next one starts, so the allocator reuses the score
+        ggml_build_forward_expand(gf, cells);
+
+        sel_idx = sel_idx ? ggml_concat(ctx0, sel_idx, cells, 1) : cells;
+    }
+
+    return sel_idx;
+}
+
 ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
         const llama_memory_hybrid_idx_context * mctx_hyb,
         llm_graph_input_kpool *                 inp_kpool,
@@ -871,23 +926,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // the reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim),
     // which is the lightning indexer with every head weight set to that scale
     ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, n_tokens), 1.0f/sqrtf((float) idx_dim));
-    ggml_tensor * score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask); // [n_pool, n_tokens]
-    cb(score, "indexer_score", il);
 
     const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);
-    ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n_tokens], unordered
-    cb(top_k, "indexer_top_k", il);
 
     // flash attention reads the cells of the live picked pools and the tail, no selection mask
     // padded pools and missing tail cells hold n_kv, which is out of range
     if (cparams.fused_kv_idxs) {
-        ggml_tensor * sel_idx = build_top_k_cells(top_k, score, inp_kpool->pool_idxs);
-        sel_idx = ggml_concat(ctx0, sel_idx, inp_kpool->tail_idxs, 0); // [n_sel, n_tokens]
+        ggml_tensor * sel_idx = build_qsa_sel_idxs(inp_kpool, q, pooled, weights, n_top_pool, il); // [n_sel, n_tokens]
         GGML_ASSERT(sel_idx->ne[0] == inp_kpool->n_sel);
         cb(sel_idx, "indexer_sel", il);
 
         return sel_idx;
     }
+
+    ggml_tensor * score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask); // [n_pool, n_tokens]
+    cb(score, "indexer_score", il);
+
+    ggml_tensor * top_k = ggml_top_k(ctx0, score, n_top_pool); // [n_top_pool, n_tokens], unordered
+    cb(top_k, "indexer_top_k", il);
 
     // flash attention requires an f16 mask
     const ggml_type type_mask = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
