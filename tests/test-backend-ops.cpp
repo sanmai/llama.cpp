@@ -11094,6 +11094,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 256, 8, 2, 1, 1, false, true, 3));
+    // short rows: a block copies several rows, the last block is partial
+    for (int n : {1, 3, 33}) {
+        for (bool v : {false, true}) {
+            test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, n, 700, 300, 3, 2, v));
+            test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, n, 700, 300, 3, 2, v));
+        }
+    }
 
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 8, 2, 1, false));
     test_cases.emplace_back(new test_get_rows_back(GGML_TYPE_F32, 1, 70000, 4, 1, false)); // row count > CUDA grid-y limit (65535)
@@ -13991,6 +13998,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int r : {1, 2048}) {
         test_cases.emplace_back(new test_get_rows(GGML_TYPE_F16, 2560, 65536, r, 1, 1, false));
     }
+    // QSA cell lists: the score of each of 512 picks of 65536 pools, 1024 tokens
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 65536, 512, 1024, 1, false));
 
     // LoRA at prefill: B is [rank, n_out], so K = rank
     for (int64_t k : {16, 32, 48, 64}) {
