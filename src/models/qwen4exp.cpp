@@ -810,8 +810,9 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
 
 // QSA attends to the top blocks of compress_ratio cells plus the incomplete tail, like the glm5-next k-pool indexer
 // a block is scored by one pooled key: the mean of its raw indexer keys, normed and rotated to its first member
-// the selection budget of one token chunk: 2^26 F32 scores = 256 MiB
-static const int64_t QSA_SEL_CHUNK_ELEMENTS = INT64_C(1) << 26;
+// the selection budget of one token chunk: 2^24 F32 scores = 64 MiB
+// the top_k passes read the score again; at 64 MiB the score stays in the L2 of large GPUs (RTX 5090 at 256 MiB: 2x top_k time)
+static const int64_t QSA_SEL_CHUNK_ELEMENTS = INT64_C(1) << 24;
 
 static int64_t qsa_sel_n_chunk(int64_t n_pool) {
     // for tests: the models of the tests are too small for chunks
@@ -856,10 +857,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel_idxs(
         ggml_tensor * cells = build_top_k_cells(top_k, score, inp_kpool->pool_idxs);
         cells = ggml_concat(ctx0, cells, tail_idxs_chunk, 0); // [n_sel, n_chunk_tokens]
 
-        // finish this chunk before the next one starts, so the allocator reuses the score
-        ggml_build_forward_expand(gf, cells);
+        if (n_chunk_tokens == n_tokens) {
+            return cells;
+        }
 
-        sel_idx = sel_idx ? ggml_concat(ctx0, sel_idx, cells, 1) : cells;
+        // write the chunk into its rows of the joined list (a concat chain copies the list once per chunk);
+        // finish this chunk before the next one starts, so the allocator reuses the score
+        if (!sel_idx) {
+            sel_idx = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, cells->ne[0], n_tokens);
+        }
+        sel_idx = ggml_set_2d_inplace(ctx0, sel_idx, cells, sel_idx->nb[1], t0*sel_idx->nb[1]);
+        ggml_build_forward_expand(gf, sel_idx);
     }
 
     return sel_idx;
