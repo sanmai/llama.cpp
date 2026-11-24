@@ -4454,7 +4454,7 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * q_cur,
         ggml_tensor * k_cur,
         ggml_tensor * v_cur,
-        ggml_tensor * kq_b,
+        ggml_tensor * table,
         ggml_tensor * sinks,
             float     kq_scale,
             int       il) const {
@@ -4464,9 +4464,37 @@ ggml_tensor * llm_graph_context::build_attn(
 
     const auto & attn_mask = is_swa ? inp_attn->self_attn_mask_swa : inp_attn->self_attn_mask;
 
-    // TODO: support kv_rows - fill the distances over the kv_rows cell lists and pass the rows to build_attn_mha,
-    //       needs a kv_rows flash attention with a per-head mask (CUDA has none)
+    // TODO: support kv_rows - fill the distances over the kv_rows cell lists and pass the rows to build_attn_mha
     GGML_ASSERT(attn_mask.rows == nullptr);
+
+    ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
+
+    // flash attention gathers the bias itself, there is no mask per head
+    if (cparams.fused_rel_bias) {
+        const size_t n_fused = res->get_fused_nodes().size();
+
+        ggml_tensor * cur = build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, attn_mask.raw, nullptr, sinks, nullptr, kq_scale, il);
+
+        // the flash attention node of this layer, the one node that build_attn_mha registers
+        GGML_ASSERT(res->get_fused_nodes().size() == n_fused + 1);
+        const llm_graph_fused_node fa = res->get_fused_nodes().back();
+        GGML_ASSERT(fa.op == LLM_FUSED_OP_FLASH_ATTN && fa.il == il);
+
+        ggml_flash_attn_ext_add_indexed_bias(fa.tensor, table, rel_pos);
+        res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN_INDEXED_BIAS, fa.tensor, il});
+
+        return cur;
+    }
+
+    const int64_t n_head   = table->ne[1];
+    const int64_t n_kv     = rel_pos->ne[0];
+    const int64_t n_stream = attn_mask.raw->ne[3];
+
+    // gather the table by distance: [n_head, n_kv, n_tokens] -> [n_kv, n_tokens/n_stream, n_head, n_stream]
+    ggml_tensor * kq_b = ggml_get_rows(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3)), rel_pos);
+    kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
+    kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
+    cb(kq_b, "kq_b", il);
 
     // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
     ggml_tensor * kq_mask = attn_mask.raw;

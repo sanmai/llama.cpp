@@ -48,6 +48,8 @@ struct llama_cparams {
     bool auto_ftkm;
     bool fused_kv_rows;      // unified cache: attend to the cells of each sequence only (ggml_flash_attn_ext_rows)
     bool auto_fkvr;
+    bool fused_rel_bias;     // flash attention adds the relative-position bias (ggml_flash_attn_ext_add_indexed_bias)
+    bool auto_frb;
     bool no_perf;
     bool op_offload;
     bool kv_unified;
