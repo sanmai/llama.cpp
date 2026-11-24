@@ -26,6 +26,7 @@ static __global__ void flash_attn_ext_vec(
         const char * sinks_ptr,
         const int  * KV_max_ptr,
         const int  * KV_rows_ptr,
+        const fattn_indexed_bias indexed_bias,
         float      * dst_ptr,
         float2     * dst_meta_ptr,
         const float scale,
@@ -115,6 +116,10 @@ static __global__ void flash_attn_ext_vec(
     const half * maskh  = mask ? (const half  *) (mask + nb33*(sequence % ne33) + nb32*(head % ne32) + nb31*ic0) : nullptr;
 
     const float slope = get_alibi_slope(max_bias, head, n_head_log2, m0, m1);
+
+    // the bias table of query ic0 and head, and its entry for each mask column
+    const float   * bias_h     = indexed_bias.table ? indexed_bias.table   + sequence*indexed_bias.s3 + head*indexed_bias.s1 + ic0*indexed_bias.s2 : nullptr;
+    const int32_t * bias_idx_q = indexed_bias.table ? indexed_bias.indices + sequence*indexed_bias.p3                         + ic0*indexed_bias.p1 : nullptr;
 
     static_assert(D % (2*WARP_SIZE) == 0, "D not divisible by 2*WARP_SIZE == 64.");
     constexpr int nwarps = nthreads / WARP_SIZE;
@@ -302,6 +307,10 @@ static __global__ void flash_attn_ext_vec(
 
                 if (mask && (ncols == 1 || ic0 + j < int(ne01.z))) {
                     sum += slope*__half2float(maskh[j*ne11 + i_KQ]);
+                }
+
+                if (bias_h && (ncols == 1 || ic0 + j < int(ne01.z))) {
+                    sum += slope*bias_h[j*indexed_bias.s2 + bias_idx_q[j*indexed_bias.p1 + k_VKQ_0 + i_KQ]];
                 }
 
                 KQ_max_new[j] = fmaxf(KQ_max_new[j], sum + FATTN_KQ_MAX_OFFSET);
@@ -537,7 +546,7 @@ static __global__ void flash_attn_ext_vec(
         dst_meta[((sequence*int(ne01.z) + ic0 + tid)*ne02 + head)*gridDim.y + blockIdx.y] = make_float2(KQ_max[tid], KQ_sum[tid]);
     }
 #else
-    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, dst_ptr, dst_meta_ptr, scale,
+    GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, KV_rows_ptr, indexed_bias, dst_ptr, dst_meta_ptr, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,
