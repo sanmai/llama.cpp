@@ -13844,6 +13844,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 768, 1, 1, 17, kv_rows, true, type));
             test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 768, 7, 2, 17, kv_rows, true, type));
         }
+        // the CUDA kernel choices: vector kernel with 2 queries, MMA tiles of several query blocks, K/V not padded to 256 (no GQA tiles)
+        test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 768,   2, 2,   17, kv_rows));
+        test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 3, 113,  65, 2,   17, kv_rows));
+        test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 2, 4, 512, 130, 1,   17, kv_rows));
+        test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3, 1024,  1, 1, 1025, kv_rows, true, GGML_TYPE_Q5_1));
+        test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3, 1024, 512, 1, 1025, kv_rows, true, GGML_TYPE_Q8_0));
     }
 
     // sparse mask with large batch size
@@ -14745,6 +14751,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 65536, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 4, {6, 1}, 131072, 512, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+
+    // Inkling 2 attention with the indexed bias, decode and prefill
+    for (int64_t kv : {4096, 32768}) {
+        for (int64_t nb : {1, 512}) {
+            test_cases.emplace_back(new test_flash_attn_ext_indexed_bias(128, 8, 3, kv, nb, 1, 1025, false, true, GGML_TYPE_Q8_0));
+        }
+    }
 
     for (int kv : { 4096, 8192, 16384,32768, 65536, }) {
         for (int hs : { 64, 128, 256, 512, 576, }) {

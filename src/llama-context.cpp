@@ -136,6 +136,12 @@ static const llm_fused_op_probe llm_fused_op_flash_attn_kv_rows_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_flash_attn_indexed_bias_probe = {
+    /*.op               =*/ LLM_FUSED_OP_FLASH_ATTN_INDEXED_BIAS,
+    /*.name             =*/ "Flash Attention with an indexed bias",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 static const llm_fused_op_probe llm_fused_op_dsv4_hc_pre_probe = {
     /*.op               =*/ LLM_FUSED_OP_DSV4_HC_PRE,
     /*.name             =*/ "fused DeepSeek V4 HC pre",
@@ -388,6 +394,19 @@ llama_context::llama_context(
         } else {
             LLAMA_LOG_INFO("%s: LLAMA_KV_ROWS_DISABLE set, disabling kv_rows\n", __func__);
             cparams.auto_fkvr = false;
+        }
+    }
+
+    // resolved after flash attention, see resolve_fused_ops()
+    {
+        cparams.fused_rel_bias = false;
+
+        const char * LLAMA_FA_REL_BIAS_DISABLE = getenv("LLAMA_FA_REL_BIAS_DISABLE");
+        if (!LLAMA_FA_REL_BIAS_DISABLE) {
+            cparams.auto_frb = true;
+        } else {
+            LLAMA_LOG_INFO("%s: LLAMA_FA_REL_BIAS_DISABLE set, the relative-position bias uses a dense mask\n", __func__);
+            cparams.auto_frb = false;
         }
     }
 
@@ -723,6 +742,13 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         cparams.fused_kv_rows = cparams.flash_attn;
         resolve(llm_fused_op_flash_attn_kv_rows_probe, cparams.fused_kv_rows);
         cparams.auto_fkvr = false;
+    }
+
+    // the fallback adds the relative-position bias to a dense mask per head
+    if (cparams.auto_frb) {
+        cparams.fused_rel_bias = cparams.flash_attn;
+        resolve(llm_fused_op_flash_attn_indexed_bias_probe, cparams.fused_rel_bias);
+        cparams.auto_frb = false;
     }
 
     if (cparams.auto_fhc) {

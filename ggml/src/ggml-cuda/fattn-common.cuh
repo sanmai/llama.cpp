@@ -18,6 +18,19 @@
 // The macro on the following line shifts it by a factor of 2**3=8, as was needed to fix https://github.com/ggml-org/llama.cpp/issues/18606 .
 #define FATTN_KQ_MAX_OFFSET (3.0f*0.6931f)
 
+// the optional bias of ggml_flash_attn_ext_add_indexed_bias, strides in elements
+// mask of column i, query j, head h, stream s += table[s*s3 + j*s2 + h*s1 + indices[s*p3 + j*p1 + i]]
+struct fattn_indexed_bias {
+    const float   * table;   // nullptr if not set
+    const int32_t * indices;
+    int32_t         s1;
+    int32_t         s2;
+    int64_t         s3;
+    int32_t         p1;
+    int64_t         p3;
+    int32_t         n_head; // the MMA kernel narrows this to the heads of a tile that exist
+};
+
 typedef void (* fattn_kernel_t)(
         const char * __restrict__ Q,
         const char * __restrict__ K,
@@ -26,6 +39,7 @@ typedef void (* fattn_kernel_t)(
         const char * __restrict__ sinks,
         const int  * __restrict__ KV_max,
         const int  * __restrict__ KV_rows,
+        const fattn_indexed_bias indexed_bias,
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
         const float scale,
@@ -1050,6 +1064,23 @@ void launch_fattn(
     const int64_t n_kv_cols = kv_rows ? kv_rows->ne[0] : K->ne[1];
     GGML_ASSERT(!kv_rows || !use_sparse);
 
+    // the queries of all streams are flattened in the table and the indices
+    fattn_indexed_bias indexed_bias_args = {};
+    if (ggml_flash_attn_ext_has_indexed_bias(dst)) {
+        const ggml_tensor * bias_table   = dst->src[6];
+        const ggml_tensor * bias_indices = dst->src[7];
+        GGML_ASSERT(!use_sparse);
+
+        indexed_bias_args.table   = (const float   *) bias_table->data;
+        indexed_bias_args.indices = (const int32_t *) bias_indices->data;
+        indexed_bias_args.s1      = bias_table->nb[1]   / sizeof(float);
+        indexed_bias_args.s2      = bias_table->nb[2]   / sizeof(float);
+        indexed_bias_args.s3      = Q->ne[1]*indexed_bias_args.s2;
+        indexed_bias_args.p1      = bias_indices->nb[1] / sizeof(int32_t);
+        indexed_bias_args.p3      = Q->ne[1]*indexed_bias_args.p1;
+        indexed_bias_args.n_head  = Q->ne[2];
+    }
+
     ggml_tensor * KQV = dst;
 
     GGML_ASSERT(Q->type == GGML_TYPE_F32);
@@ -1318,6 +1349,7 @@ void launch_fattn(
         sinks ? ((const char *) sinks->data) : nullptr,
         KV_max.ptr,
         kv_rows ? (const int *) kv_rows->data : nullptr,
+        indexed_bias_args,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,
         Q->ne[0], ne01,     Q->ne[2], Q->ne[3], Q->nb[1], Q->nb[2], Q->nb[3],
