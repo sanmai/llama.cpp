@@ -4471,6 +4471,10 @@ ggml_tensor * llm_graph_context::build_attn(
 
     // flash attention gathers the bias itself, there is no mask per head
     if (cparams.fused_rel_bias) {
+        // build_attn_mha adds the attention to the graph before the bias is set: add the bias inputs first
+        ggml_build_forward_expand(gf, table);
+        ggml_build_forward_expand(gf, rel_pos);
+
         const size_t n_fused = res->get_fused_nodes().size();
 
         ggml_tensor * cur = build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, attn_mask.raw, nullptr, sinks, nullptr, kq_scale, il);
