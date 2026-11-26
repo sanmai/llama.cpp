@@ -2048,7 +2048,7 @@ static int test_chunk(const std::string & arch_filter, const size_t seed, const 
     size_t n_tests  = 0;
     size_t n_failed = 0;
     for (const llm_arch & arch : llama_arch_all()) {
-        if (!arch_matches(arch_filter, arch) || !arch_supported(arch)) {
+        if (!arch_matches(arch_filter, arch) || !arch_supported(arch) || !llama_arch_supports_chunks(arch)) {
             continue;
         }
 
