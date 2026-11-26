@@ -425,13 +425,18 @@ llama_context::llama_context(
     }
 
     {
-        cparams.n_chunk = model.graph_nodes_per_chunk() > 0 ? llm_graph_n_chunk(cparams, model.graph_chunk_n_head_mask()) : 0;
+        // LLAMA_GRAPH_CHUNK: the tokens of a chunk of a full ubatch, 0 = no chunks
+        // LLAMA_GRAPH_CHUNK_CONST=1: the same chunk count for every ubatch, see llama_cparams::chunks_const
+        const char * LLAMA_GRAPH_CHUNK       = getenv("LLAMA_GRAPH_CHUNK");
+        const char * LLAMA_GRAPH_CHUNK_CONST = getenv("LLAMA_GRAPH_CHUNK_CONST");
 
-        // for tests: the models of the tests are too small for chunks
-        const char * LLAMA_GRAPH_CHUNK = getenv("LLAMA_GRAPH_CHUNK");
-        if (LLAMA_GRAPH_CHUNK && cparams.n_chunk > 0) {
-            cparams.n_chunk = std::max(0, atoi(LLAMA_GRAPH_CHUNK));
-            LLAMA_LOG_INFO("%s: LLAMA_GRAPH_CHUNK set, token chunks of %u\n", __func__, cparams.n_chunk);
+        const uint32_t n_chunk_tokens = LLAMA_GRAPH_CHUNK && *LLAMA_GRAPH_CHUNK ? std::max(0, atoi(LLAMA_GRAPH_CHUNK)) : LLM_GRAPH_CHUNK_TOKENS;
+
+        cparams.n_chunks     = model.graph_nodes_per_chunk() > 0 ? llm_graph_n_chunks(cparams, n_chunk_tokens) : 1;
+        cparams.chunks_const = LLAMA_GRAPH_CHUNK_CONST && atoi(LLAMA_GRAPH_CHUNK_CONST) != 0;
+
+        if (cparams.n_chunks > 1) {
+            LLAMA_LOG_INFO("%s: token chunks of a ubatch: %u%s\n", __func__, cparams.n_chunks, cparams.chunks_const ? ", for every ubatch" : "");
         }
     }
 
@@ -2919,9 +2924,8 @@ uint32_t llama_context::graph_max_nodes() const {
     }
 
     // llm_graph_context::build_chunked: each token chunk of a layer has its own nodes
-    if (cparams.n_chunk > 0 && cparams.n_chunk < cparams.n_ubatch) {
-        const uint32_t n_chunks = (cparams.n_ubatch + cparams.n_chunk - 1)/cparams.n_chunk;
-        res += model.layers.size()*n_chunks*model.graph_nodes_per_chunk();
+    if (cparams.n_chunks > 1) {
+        res += model.layers.size()*cparams.n_chunks*model.graph_nodes_per_chunk();
     }
 
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling

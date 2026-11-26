@@ -807,10 +807,6 @@ public:
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
 
-    // the rows of the full-attention mask and distances of each token chunk
-    std::vector<ggml_tensor *> chunks_attn_mask;
-    std::vector<ggml_tensor *> chunks_rel_pos;
-
     const uint32_t extent;
     const uint32_t extent_swa;
 
@@ -1097,12 +1093,14 @@ struct llm_graph_chunk {
 
 using llm_graph_chunk_fn = std::function<ggml_tensor * (size_t ic, const llm_graph_chunk & chunk)>;
 
-// the default of llama_cparams::n_chunk
-// a tensor that a graph builds with n_ctx elements per token, such as a score or a selection, then has at most
-// 1 GiB of F32 elements; an input of the graph keeps the size of the ubatch
-// 0 for a split cache with several sequences and for a ubatch above 16384 tokens
-// n_head_mask: the heads of an attention mask with a value per cell, token and head
-uint32_t llm_graph_n_chunk(const llama_cparams & cparams, uint32_t n_head_mask);
+// the tokens of a chunk of a full ubatch, the default of LLAMA_GRAPH_CHUNK
+static const uint32_t LLM_GRAPH_CHUNK_TOKENS = 1024;
+
+// llama_cparams::n_chunks: the chunks of n_chunk_tokens tokens in a full ubatch, fixed for the context
+// a tensor that a graph builds per token, such as a score or a selection, then has the size of a chunk;
+// an input of the graph keeps the size of the ubatch
+// 1 (no chunks) if n_chunk_tokens is 0, for a split cache with several sequences and for a ubatch above 16384 tokens
+uint32_t llm_graph_n_chunks(const llama_cparams & cparams, uint32_t n_chunk_tokens);
 
 struct llm_graph_context {
     const llama_model & model;
@@ -1160,7 +1158,7 @@ struct llm_graph_context {
     ggml_tensor * h_nextn_dev;
     ggml_tensor * h_nextn_src;
 
-    // the token chunks of the ubatch for build_chunked, see llama_cparams::n_chunk
+    // the token chunks of the ubatch for build_chunked, see llama_cparams::n_chunks
     const std::vector<llm_graph_chunk> chunks;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
@@ -1567,24 +1565,17 @@ struct llm_graph_context {
             uint32_t extent,
             uint32_t extent_swa) const;
 
-    // the KQ mask of the tokens of rel_pos: the bias by distance, gathered for each cell and added to mask
-    ggml_tensor * build_kq_mask_rel(
-            ggml_tensor * mask,     // [n_kv, n_tokens/n_stream, 1, n_stream]
-            ggml_tensor * rel_pos,  // [n_kv, n_tokens]
-            ggml_tensor * rel_bias, // [n_head_q, extent + 1, n_tokens]
-                    int   il) const;
-
-    // rel_bias is gathered by the distance to each cell and added to the KQ mask, after the KQ scale
+    // kq_b is added to the KQ mask, after the KQ scale
     ggml_tensor * build_attn(
             llm_graph_input_mem_hybrid_iswa_rel * inp,
             ggml_tensor * wo,
             ggml_tensor * wo_b,
             ggml_tensor * wo_s,
-            ggml_tensor * q_cur,    // [n_embd_head_q, n_head_q, n_tokens]
-            ggml_tensor * k_cur,    // [n_embd_head_k, n_head_k, n_tokens]
-            ggml_tensor * v_cur,    // [n_embd_head_v, n_head_v, n_tokens]
-            ggml_tensor * rel_bias, // [n_head_q, extent + 1, n_tokens]
-            ggml_tensor * sinks,    // [n_head_q]
+            ggml_tensor * q_cur, // [n_embd_head_q, n_head_q, n_tokens]
+            ggml_tensor * k_cur, // [n_embd_head_k, n_head_k, n_tokens]
+            ggml_tensor * v_cur, // [n_embd_head_v, n_head_v, n_tokens]
+            ggml_tensor * kq_b,  // [n_kv, n_tokens/n_stream, n_head_q, n_stream]
+            ggml_tensor * sinks, // [n_head_q]
                   float   kq_scale,
                     int   il) const;
 

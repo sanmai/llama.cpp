@@ -1678,58 +1678,44 @@ void llm_graph_result::set_params(const llm_graph_params & params) {
 // llm_graph_context
 //
 
-// the size limit of a tensor with n_ctx x n_chunk F32 elements (a score or a mask of one chunk);
-// a graph has several of these tensors, so this is not the limit of the compute buffer
-// the count is in F32 elements for each type: an F16 mask of a chunk then has half of this size
-static const uint64_t LLM_GRAPH_CHUNK_BYTES = UINT64_C(1) << 30;
-
 // the largest ubatch that has chunks
 // build_chunked stores a chunk with ggml_set, which has a byte offset below 1 GiB (an int32 in op_params):
 // 16384 tokens of a result with 16384 F32 elements per token
 // TODO: a 64-bit offset in ggml_set removes this limit
 static const uint32_t LLM_GRAPH_CHUNK_UBATCH_MAX = 16384;
 
-uint32_t llm_graph_n_chunk(const llama_cparams & cparams, uint32_t n_head_mask) {
+uint32_t llm_graph_n_chunks(const llama_cparams & cparams, uint32_t n_chunk_tokens) {
     // the streams of a split cache are not split into chunks
-    if (!cparams.kv_unified && cparams.n_seq_max > 1) {
-        return 0;
+    if (n_chunk_tokens == 0 || (!cparams.kv_unified && cparams.n_seq_max > 1)) {
+        return 1;
     }
 
     if (cparams.n_ubatch > LLM_GRAPH_CHUNK_UBATCH_MAX) {
         LLAMA_LOG_WARN("%s: n_ubatch = %u is above %u, no token chunks\n", __func__, cparams.n_ubatch, LLM_GRAPH_CHUNK_UBATCH_MAX);
-        return 0;
+        return 1;
     }
 
-    const uint64_t n_chunk = LLM_GRAPH_CHUNK_BYTES/sizeof(float)/std::max<uint32_t>(1, cparams.n_ctx)/n_head_mask;
-
-    // no chunks if the mask of a full ubatch is in the budget
-    if (n_head_mask == 1 || n_chunk >= cparams.n_ubatch) {
-        return std::max<uint64_t>(1, n_chunk);
-    }
-
-    // a mask per head: 16 chunks per layer keep the buffer small at short context
-    const uint64_t n_chunk_target = std::max<uint64_t>(32, (cparams.n_ubatch + 15)/16);
-
-    // at most 64 chunks per layer limit the graph nodes
-    const uint64_t n_chunk_min = (cparams.n_ubatch + 63)/64;
-
-    return std::max<uint64_t>({ 1, std::min(n_chunk, n_chunk_target), n_chunk_min });
+    return (cparams.n_ubatch + n_chunk_tokens - 1)/n_chunk_tokens;
 }
 
-// n_tokens tokens in chunks of n_chunk tokens, the last chunk has the remainder
+// the tokens of a ubatch in cparams.n_chunks chunks of the same size, so the count of chunks does not depend on the batch
+// the last chunk starts earlier if the tokens do not divide evenly: it computes some rows of the previous chunk again
 // no chunk is larger than a chunk of a full ubatch, so the graph of a full ubatch is the worst case for the memory
-// one chunk with all the tokens if n_chunk is 0
-static std::vector<llm_graph_chunk> get_chunks(int64_t n_tokens, int64_t n_chunk) {
-    if (n_chunk <= 0) {
-        n_chunk = n_tokens;
+// one chunk with all the tokens if the tokens fit in one chunk, unless cparams.chunks_const
+static std::vector<llm_graph_chunk> get_chunks(const llama_cparams & cparams, int64_t n_tokens) {
+    const int64_t n_chunks    = cparams.n_chunks;
+    const int64_t n_chunk_max = (cparams.n_ubatch + n_chunks - 1)/n_chunks;
+
+    if (n_chunks <= 1 || (!cparams.chunks_const && n_tokens <= n_chunk_max)) {
+        return { { 0, n_tokens } };
     }
 
+    const int64_t n_chunk = (n_tokens + n_chunks - 1)/n_chunks;
+
     std::vector<llm_graph_chunk> res;
-    int64_t t0 = 0;
-    do {
-        res.push_back({ t0, std::min(n_chunk, n_tokens - t0) });
-        t0 += n_chunk;
-    } while (t0 < n_tokens);
+    for (int64_t ic = 0; ic < n_chunks; ++ic) {
+        res.push_back({ std::min(ic*n_chunk, n_tokens - n_chunk), n_chunk });
+    }
 
     return res;
 }
@@ -1778,7 +1764,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     layer_inp_src    (params.layer_inp_src),
     h_nextn_dev      (params.h_nextn_dev),
     h_nextn_src      (params.h_nextn_src),
-    chunks           (get_chunks(ubatch.n_tokens, cparams.n_chunk)),
+    chunks           (get_chunks(cparams, ubatch.n_tokens)),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -3776,8 +3762,6 @@ ggml_tensor * llm_graph_context::build_attn(
 }
 
 // the iswa build_attn with the KQ mask and kv_rows given by the caller, which has to keep them in sync
-using llm_graph_attn_fn = std::function<ggml_tensor * (ggml_tensor * q, ggml_tensor * k, ggml_tensor * v)>;
-
 static ggml_tensor * build_attn_iswa_impl(
         const llm_graph_context & gctx,
         llm_graph_input_attn_kv_iswa * inp,
@@ -3793,8 +3777,7 @@ static ggml_tensor * build_attn_iswa_impl(
         ggml_tensor * sinks,
         ggml_tensor * v_mla,
             float     kq_scale,
-            int       il,
-        const llm_graph_attn_fn & build_attn_fn = nullptr) {
+            int       il) {
     ggml_context * ctx0 = gctx.ctx0;
     ggml_cgraph  * gf   = gctx.gf;
 
@@ -3860,8 +3843,7 @@ static ggml_tensor * build_attn_iswa_impl(
     ggml_tensor * k = use_kv_cur ? k_cur : mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_fn ? build_attn_fn(q, k, v) :
-        gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
+    ggml_tensor * cur = gctx.build_attn_mha(q, k, v, kq_b, kq_mask, kv_rows, sinks, v_mla, 0, kq_scale, il);
     cur = build_attn_scale_kv_output(ctx0, mctx_cur, cur, il);
     gctx.cb(cur, "kqv_out", il);
 
@@ -4486,34 +4468,7 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
     ggml_set_input(inp->self_rel_pos_swa);
     ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
 
-    // the views are made once per graph: each view of a host input is a separate upload
-    for (const auto & chunk : chunks) {
-        inp->chunks_attn_mask.push_back(build_chunk_view(inp->get_attn()->self_attn_mask.raw, 1, chunk));
-        inp->chunks_rel_pos.push_back(build_chunk_view(inp->self_rel_pos, 1, chunk));
-    }
-
     return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
-}
-
-ggml_tensor * llm_graph_context::build_kq_mask_rel(
-        ggml_tensor * mask,
-        ggml_tensor * rel_pos,
-        ggml_tensor * rel_bias,
-        int           il) const {
-    // [n_head, n_kv, n_tokens] -> [n_kv, n_tokens/n_stream, n_head, n_stream]
-    ggml_tensor * kq_b = ggml_get_rows(ctx0, rel_bias, rel_pos);
-    kq_b = ggml_reshape_4d(ctx0, kq_b, rel_bias->ne[0], mask->ne[0], mask->ne[1], mask->ne[3]);
-    kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
-    cb(kq_b, "kq_b", il);
-
-    // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
-    ggml_tensor * kq_mask = ggml_add(ctx0, kq_b, mask->type == GGML_TYPE_F32 ? mask : ggml_cast(ctx0, mask, GGML_TYPE_F32));
-    if (cparams.flash_attn) {
-        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
-    }
-    cb(kq_mask, "kq_mask_rel_pos", il);
-
-    return kq_mask;
 }
 
 ggml_tensor * llm_graph_context::build_attn(
@@ -4524,7 +4479,7 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * q_cur,
         ggml_tensor * k_cur,
         ggml_tensor * v_cur,
-        ggml_tensor * rel_bias,
+        ggml_tensor * kq_b,
         ggml_tensor * sinks,
             float     kq_scale,
             int       il) const {
@@ -4538,22 +4493,18 @@ ggml_tensor * llm_graph_context::build_attn(
     //       needs a kv_rows flash attention with a per-head mask (CUDA has none)
     GGML_ASSERT(attn_mask.rows == nullptr);
 
-    if (is_swa) {
-        ggml_tensor * kq_mask = build_kq_mask_rel(attn_mask.raw, inp->self_rel_pos_swa, rel_bias, il);
-
-        return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il);
+    // a mask per head, in the dense layout of the input mask, which flash attention takes in F16
+    ggml_tensor * kq_mask = attn_mask.raw;
+    if (kq_mask->type != GGML_TYPE_F32) {
+        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F32);
     }
+    kq_mask = ggml_add(ctx0, kq_b, kq_mask);
+    if (cparams.flash_attn) {
+        kq_mask = ggml_cast(ctx0, kq_mask, GGML_TYPE_F16);
+    }
+    cb(kq_mask, "kq_mask_rel_pos", il);
 
-    // the mask of a full-attention layer has n_kv x n_head values per token: build it and attend one token chunk at a time
-    const llm_graph_attn_fn build_attn_chunks = [&](ggml_tensor * q, ggml_tensor * k, ggml_tensor * v) {
-        return build_chunked([&](size_t ic, const llm_graph_chunk & chunk) {
-            ggml_tensor * kq_mask = build_kq_mask_rel(inp->chunks_attn_mask[ic], inp->chunks_rel_pos[ic], build_chunk_view(rel_bias, 2, chunk), il);
-
-            return build_attn_mha(build_chunk_view(q, 2, chunk), k, v, nullptr, kq_mask, nullptr, sinks, nullptr, 0, kq_scale, il);
-        });
-    };
-
-    return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, nullptr, nullptr, sinks, nullptr, kq_scale, il, build_attn_chunks);
+    return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur, nullptr, kq_mask, nullptr, sinks, nullptr, kq_scale, il);
 }
 
 void llm_graph_context::build_dense_out(
