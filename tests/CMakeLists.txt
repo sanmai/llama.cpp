@@ -258,11 +258,12 @@ set_tests_properties(test-generate-models PROPERTIES
 )
 
 # the sparse attention of large ubatches runs in token chunks, small chunks cover it with the dummy models
+# the archs with token chunks (llama_model::graph_nodes_per_chunk)
 llama_test(
     test-llama-archs
     NAME test-llama-archs-chunk
     LABEL main
-    ARGS --chunk 24 -d 0.3
+    ARGS --chunk 24 -d 0.3 -a qwen4exp
 )
 
 # Target model for test-speculative-rejection-sampling

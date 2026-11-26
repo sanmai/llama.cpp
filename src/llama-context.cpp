@@ -441,17 +441,14 @@ llama_context::llama_context(
 
     {
         // LLAMA_GRAPH_CHUNK: the tokens of a chunk of a full ubatch, 0 = no chunks
-        // LLAMA_GRAPH_CHUNK_CONST=1: the same chunk count for every ubatch, see llama_cparams::chunks_const
-        const char * LLAMA_GRAPH_CHUNK       = getenv("LLAMA_GRAPH_CHUNK");
-        const char * LLAMA_GRAPH_CHUNK_CONST = getenv("LLAMA_GRAPH_CHUNK_CONST");
+        const char * LLAMA_GRAPH_CHUNK = getenv("LLAMA_GRAPH_CHUNK");
 
         const uint32_t n_chunk_tokens = LLAMA_GRAPH_CHUNK && *LLAMA_GRAPH_CHUNK ? std::max(0, atoi(LLAMA_GRAPH_CHUNK)) : LLM_GRAPH_CHUNK_TOKENS;
 
-        cparams.n_chunks     = model.graph_nodes_per_chunk() > 0 ? llm_graph_n_chunks(cparams, n_chunk_tokens) : 1;
-        cparams.chunks_const = LLAMA_GRAPH_CHUNK_CONST && atoi(LLAMA_GRAPH_CHUNK_CONST) != 0;
+        cparams.n_chunks = model.graph_nodes_per_chunk() > 0 ? llm_graph_n_chunks(cparams, n_chunk_tokens) : 1;
 
         if (cparams.n_chunks > 1) {
-            LLAMA_LOG_INFO("%s: token chunks of a ubatch: %u%s\n", __func__, cparams.n_chunks, cparams.chunks_const ? ", for every ubatch" : "");
+            LLAMA_LOG_INFO("%s: token chunks of a ubatch: %u\n", __func__, cparams.n_chunks);
         }
     }
 

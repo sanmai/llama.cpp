@@ -178,8 +178,7 @@ static void usage(char ** argv) {
     LOG("  -v <N>                   Set log verbosity level\n");
     LOG("  -b, --backend <backend>  Run only on the given backend device\n");
     LOG("  --kv-shift               Check K-shift against a decode at the shifted positions (CPU only)\n");
-    LOG("  --chunk <n>              Check that token chunks of n tokens (LLAMA_GRAPH_CHUNK) match the graph without chunks,\n");
-    LOG("                           with and without LLAMA_GRAPH_CHUNK_CONST\n");
+    LOG("  --chunk <n>              Check that token chunks of n tokens (LLAMA_GRAPH_CHUNK) match the graph without chunks\n");
     LOG("  -h, --help               Show this help message\n\n");
     LOG("Examples:\n");
     LOG("  %s\n", argv[0]);
@@ -1985,20 +1984,17 @@ static int test_kv_shift(const std::string & arch_filter, const size_t seed, con
     return n_failed == 0 ? 0 : 1;
 }
 
-// the logits of all tokens, with token chunks of n_chunk tokens ("0": no chunks) and LLAMA_GRAPH_CHUNK_CONST chunks_const
+// the logits of all tokens, with token chunks of n_chunk tokens ("0": no chunks)
 // batches of n_ubatch/2, n_ubatch, n_ubatch/2 - 2 and 2 tokens: chunks of different sizes, a last chunk that overlaps
-// the previous one, and a batch with fewer tokens than chunks
-static std::vector<float> get_logits_chunk(llama_model * model, const llama_context_params & ctx_params, const std::vector<llama_token> & tokens,
-        const char * n_chunk, const char * chunks_const) {
+// the previous one, and a batch in one chunk
+static std::vector<float> get_logits_chunk(llama_model * model, const llama_context_params & ctx_params, const std::vector<llama_token> & tokens, const char * n_chunk) {
     const uint32_t n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
     const uint32_t n_ubatch = ctx_params.n_ubatch;
 
     // the context reads the chunk size when it is created
     common_set_env("LLAMA_GRAPH_CHUNK", n_chunk);
-    common_set_env("LLAMA_GRAPH_CHUNK_CONST", chunks_const);
     llama_context_ptr lctx(llama_init_from_model(model, ctx_params));
     common_set_env("LLAMA_GRAPH_CHUNK", "");
-    common_set_env("LLAMA_GRAPH_CHUNK_CONST", "");
     if (!lctx) {
         throw std::runtime_error("failed to create llama context");
     }
@@ -2052,7 +2048,7 @@ static int test_chunk(const std::string & arch_filter, const size_t seed, const 
     size_t n_tests  = 0;
     size_t n_failed = 0;
     for (const llm_arch & arch : llama_arch_all()) {
-        if (!arch_matches(arch_filter, arch) || !arch_supported(arch) || !llama_arch_supports_chunks(arch)) {
+        if (!arch_matches(arch_filter, arch) || !arch_supported(arch)) {
             continue;
         }
 
@@ -2078,12 +2074,10 @@ static int test_chunk(const std::string & arch_filter, const size_t seed, const 
             for (const llama_flash_attn_type fa : { LLAMA_FLASH_ATTN_TYPE_DISABLED, LLAMA_FLASH_ATTN_TYPE_ENABLED }) {
                 ctx_params.flash_attn_type = fa;
 
-                const std::vector<float> logits_ref = get_logits_chunk(model.get(), ctx_params, tokens, "0", "0");
-                for (const char * chunks_const : { "0", "1" }) {
-                    const std::vector<float> logits_chunk = get_logits_chunk(model.get(), ctx_params, tokens, n_chunk, chunks_const);
+                const std::vector<float> logits_ref   = get_logits_chunk(model.get(), ctx_params, tokens, "0");
+                const std::vector<float> logits_chunk = get_logits_chunk(model.get(), ctx_params, tokens, n_chunk);
 
-                    nmse_val = std::max(nmse_val, nmse(logits_ref, logits_chunk));
-                }
+                nmse_val = std::max(nmse_val, nmse(logits_ref, logits_chunk));
             }
             const bool ok = nmse_val <= 1e-7;
             n_failed += ok ? 0 : 1;

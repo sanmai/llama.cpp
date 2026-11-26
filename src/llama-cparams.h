@@ -56,7 +56,6 @@ struct llama_cparams {
     bool moe_random_routing; // benchmark only: random expert ids in the MoE GEMMs
 
     uint32_t n_chunks;       // token chunks of a ubatch (llm_graph_context::build_chunked), fixed for the context; 1 = no chunks
-    bool     chunks_const;   // n_chunks chunks also for a ubatch that fits in one chunk, such as a decode
 
     size_t moe_cache_size;
     float  moe_cache_cpu_share;

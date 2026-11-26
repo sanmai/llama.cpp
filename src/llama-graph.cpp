@@ -1735,12 +1735,13 @@ uint32_t llm_graph_n_chunks(const llama_cparams & cparams, uint32_t n_chunk_toke
 // the tokens of a ubatch in cparams.n_chunks chunks of the same size, so the count of chunks does not depend on the batch
 // the last chunk starts earlier if the tokens do not divide evenly: it computes some rows of the previous chunk again
 // no chunk is larger than a chunk of a full ubatch, so the graph of a full ubatch is the worst case for the memory
-// one chunk with all the tokens if the tokens fit in one chunk, unless cparams.chunks_const
+// one chunk with all the tokens if the tokens fit in one chunk, such as a decode: n_chunks chunks there repeat
+// the work of the chunk for each chunk (a decode at 145k tokens: -67% with 8 chunks)
 static std::vector<llm_graph_chunk> get_chunks(const llama_cparams & cparams, int64_t n_tokens) {
     const int64_t n_chunks    = cparams.n_chunks;
     const int64_t n_chunk_max = (cparams.n_ubatch + n_chunks - 1)/n_chunks;
 
-    if (n_chunks <= 1 || (!cparams.chunks_const && n_tokens <= n_chunk_max)) {
+    if (n_tokens <= n_chunk_max) {
         return { { 0, n_tokens } };
     }
 
