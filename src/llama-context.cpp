@@ -439,6 +439,19 @@ llama_context::llama_context(
         }
     }
 
+    {
+        // LLAMA_GRAPH_CHUNK: the tokens of a chunk of a full ubatch, 0 = no chunks
+        const char * LLAMA_GRAPH_CHUNK = getenv("LLAMA_GRAPH_CHUNK");
+
+        const uint32_t n_chunk_tokens = LLAMA_GRAPH_CHUNK && *LLAMA_GRAPH_CHUNK ? std::max(0, atoi(LLAMA_GRAPH_CHUNK)) : LLM_GRAPH_CHUNK_TOKENS;
+
+        cparams.n_chunks = model.graph_nodes_per_chunk() > 0 ? llm_graph_n_chunks(cparams, n_chunk_tokens) : 1;
+
+        if (cparams.n_chunks > 1) {
+            LLAMA_LOG_INFO("%s: token chunks of a ubatch: %u\n", __func__, cparams.n_chunks);
+        }
+    }
+
     LLAMA_LOG_INFO("%s: n_seq_max             = %u\n",   __func__, cparams.n_seq_max);
     LLAMA_LOG_INFO("%s: n_ctx                 = %u\n",   __func__, cparams.n_ctx);
     LLAMA_LOG_INFO("%s: n_ctx_seq             = %u\n",   __func__, cparams.n_ctx_seq);
@@ -2914,6 +2927,11 @@ uint32_t llama_context::graph_max_nodes() const {
     // which the per-tensor estimates above do not cover for models with few tensors per layer
     if (cparams.moe_cache_size > 0) {
         res += 32u*model.hparams.n_layer_all;
+    }
+
+    // llm_graph_context::build_chunked: each token chunk of a layer has its own nodes
+    if (cparams.n_chunks > 1) {
+        res += model.layers.size()*cparams.n_chunks*model.graph_nodes_per_chunk();
     }
 
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling
