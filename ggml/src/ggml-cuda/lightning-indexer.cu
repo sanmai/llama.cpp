@@ -1,5 +1,7 @@
 #include "common.cuh"
 #include "lightning-indexer.cuh"
+#include "argsort.cuh"
+#include "top-k.cuh"
 #include "fattn-common.cuh"
 #include "convert.cuh"
 #include "mma.cuh"
@@ -622,6 +624,42 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_F32)
             GGML_ABORT("fatal error");
         }
+    } else if (n_embd == 128 && n_head == 16) {
+        if ((turing_mma_available(cc) || amd_mfma_available(cc) || amd_wmma_available(cc)) && k->type != GGML_TYPE_F32 && k->type != GGML_TYPE_BF16) {
+            constexpr int K_VECS_PER_BLOCK = 32;
+            constexpr int WARPS_PER_BLOCK  = 4;
+
+            dim3 block(ggml_cuda_info().devices[device].warp_size, WARPS_PER_BLOCK);
+            int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
+            dim3 grid(num_kv_blocks, n_batch, n_stream);
+
+            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_mma, 128, 16, k, GGML_TYPE_F16)
+            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_mma, 128, 16, k, GGML_TYPE_Q4_0)
+            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_mma, 128, 16, k, GGML_TYPE_Q4_1)
+            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_mma, 128, 16, k, GGML_TYPE_Q5_0)
+            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_mma, 128, 16, k, GGML_TYPE_Q5_1)
+            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_mma, 128, 16, k, GGML_TYPE_Q8_0)
+            GGML_ABORT("fatal error");
+        } else {
+            // use vector kernel
+            constexpr int K_VECS_PER_WARP = 8;
+            constexpr int WARPS_PER_BLOCK = 8;
+            constexpr int K_VECS_PER_BLOCK = K_VECS_PER_WARP * WARPS_PER_BLOCK;
+
+            dim3 block(32, WARPS_PER_BLOCK);
+            int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
+            dim3 grid(num_kv_blocks, n_batch, n_stream);
+
+            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 16, k, GGML_TYPE_F16)
+            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 16, k, GGML_TYPE_Q4_0)
+            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 16, k, GGML_TYPE_Q4_1)
+            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 16, k, GGML_TYPE_Q5_0)
+            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 16, k, GGML_TYPE_Q5_1)
+            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 16, k, GGML_TYPE_Q8_0)
+            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 16, k, GGML_TYPE_BF16)
+            LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 16, k, GGML_TYPE_F32)
+            GGML_ABORT("fatal error");
+        }
     } else if (n_embd == 128 && n_head == 4 && n_batch >= LIGHTNING_INDEXER_TILE_TOKENS) {
         // too few heads for a wmma tile, the tile kernel shares the keys across the tokens
         constexpr int WARPS_PER_BLOCK = 8;
@@ -665,6 +703,96 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
     }
 }
 
+// a pick with a -inf score is dead, set it to n_kv
+static __global__ void lightning_indexer_top_k_dead_kernel(
+        const float * __restrict__ score, int * __restrict__ picks, const int n_kv, const int top_k, const int64_t n_picks) {
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n_picks) {
+        return;
+    }
+
+    const int64_t row = i / top_k;
+    if (score[row*n_kv + picks[i]] == -INFINITY) {
+        picks[i] = n_kv;
+    }
+}
+
+void ggml_cuda_lightning_indexer_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * w = dst->src[2]; // weights
+    const ggml_tensor * m = dst->src[3]; // mask
+
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t n_batch  = q->ne[2];
+    const int64_t n_stream = q->ne[3];
+    const int64_t n_kv     = k->ne[2];
+    const int64_t top_k    = dst->ne[0];
+
+    // score and select a chunk of tokens at a time, the scores of one chunk are the only temporary
+    const int64_t chunk_tokens = ggml_cuda_chunk_nrows(n_kv*sizeof(float), n_batch);
+
+    ggml_cuda_pool_alloc<float> score_alloc(ctx.pool(), n_kv*chunk_tokens);
+
+    for (int64_t s = 0; s < n_stream; ++s) {
+        for (int64_t t0 = 0; t0 < n_batch; t0 += chunk_tokens) {
+            const int64_t n_tokens = std::min(chunk_tokens, n_batch - t0);
+
+            ggml_tensor q_chunk = *q;
+            q_chunk.ne[2] = n_tokens;
+            q_chunk.ne[3] = 1;
+            q_chunk.data  = (char *) q->data + t0*q->nb[2] + s*q->nb[3];
+
+            ggml_tensor k_chunk = *k;
+            k_chunk.ne[3] = 1;
+            k_chunk.data  = (char *) k->data + s*k->nb[3];
+
+            ggml_tensor w_chunk = *w;
+            w_chunk.ne[1] = n_tokens;
+            w_chunk.ne[3] = 1;
+            w_chunk.data  = (char *) w->data + t0*w->nb[1] + s*w->nb[3];
+
+            ggml_tensor m_chunk = *m;
+            m_chunk.ne[1] = n_tokens;
+            m_chunk.ne[3] = 1;
+            m_chunk.data  = (char *) m->data + t0*m->nb[1] + (s%m->ne[3])*m->nb[3];
+
+            ggml_tensor score = {};
+            score.type   = GGML_TYPE_F32;
+            score.ne[0]  = n_kv;
+            score.ne[1]  = n_tokens;
+            score.ne[2]  = 1;
+            score.ne[3]  = 1;
+            score.nb[0]  = sizeof(float);
+            score.nb[1]  = score.nb[0]*n_kv;
+            score.nb[2]  = score.nb[1]*n_tokens;
+            score.nb[3]  = score.nb[2];
+            score.data   = score_alloc.get();
+            score.src[0] = &q_chunk;
+            score.src[1] = &k_chunk;
+            score.src[2] = &w_chunk;
+            score.src[3] = &m_chunk;
+
+            ggml_cuda_lightning_indexer(ctx, &score);
+
+            ggml_tensor picks = *dst;
+            picks.ne[1]  = n_tokens;
+            picks.ne[3]  = 1;
+            picks.data   = (char *) dst->data + t0*dst->nb[1] + s*dst->nb[3];
+            picks.src[0] = &score;
+
+            ggml_cuda_op_top_k(ctx, &picks);
+
+            const int64_t n_picks    = top_k*n_tokens;
+            const int     block_size = 256;
+            lightning_indexer_top_k_dead_kernel<<<(n_picks + block_size - 1)/block_size, block_size, 0, ctx.stream()>>>(
+                (const float *) score.data, (int *) picks.data, n_kv, top_k, n_picks);
+        }
+    }
+}
+
 bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst) {
     GGML_UNUSED(device);
 
@@ -688,7 +816,7 @@ bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst) 
         return false;
     }
 
-    if (neq1 != 64 && neq1 != 32 && neq1 != 4) {
+    if (neq1 != 64 && neq1 != 32 && neq1 != 16 && neq1 != 4) {
         return false;
     }
 

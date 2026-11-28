@@ -14,6 +14,7 @@ struct llama_cparams {
     uint32_t n_ubatch;
     uint32_t n_seq_max;
     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
+    bool     rs_replay;       // roll back by replaying kept tokens instead of keeping n_rs_seq snapshots
     uint32_t n_outputs_max;   // max outputs supported by the context
     uint32_t n_outputs_max_per_seq;
     int32_t  n_threads;       // number of threads to use for generation
@@ -49,6 +50,8 @@ struct llama_cparams {
     bool auto_fkvr;
     bool fused_kv_idxs;      // sparse attention: flash attention reads the selected cells, no selection mask (ggml_flash_attn_ext_set_kv_idxs)
     bool auto_fkvi;
+    bool fused_indexer_top_k; // sparse attention: the indexer returns the top-k picks, no score tensor (ggml_lightning_indexer_top_k)
+    bool auto_fitk;
     bool no_perf;
     bool op_offload;
     bool kv_unified;
