@@ -864,7 +864,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel_idxs(
         // write the chunk into its rows of the joined list (a concat chain copies the list once per chunk);
         // finish this chunk before the next one starts, so the allocator reuses the score
         if (!sel_idx) {
-            sel_idx = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, cells->ne[0], n_tokens);
+            // a graph leaf would be allocated from the start of the graph, in every QSA layer at once;
+            // the copy of a zero-stride view of the first row is a node, and every chunk overwrites its rows
+            sel_idx = ggml_cont(ctx0, ggml_view_2d(ctx0, cells, cells->ne[0], n_tokens, 0, 0));
         }
         sel_idx = ggml_set_2d_inplace(ctx0, sel_idx, cells, sel_idx->nb[1], t0*sel_idx->nb[1]);
         ggml_build_forward_expand(gf, sel_idx);
